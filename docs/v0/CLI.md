@@ -1,0 +1,671 @@
+# Alder v0 CLI
+
+The CLI is organized around the project-driving workflow, not the storage
+model. Alder itself stores no leader or writer role; repository skills may
+assign those roles above the CLI.
+
+Every command supports the global `--json` flag. Human-readable output is the
+default; JSON is the only structured output format in v0.
+
+With `--json`, standard output contains exactly one JSON document. This applies
+to reads, successful mutations, and expected failures. A failure still returns
+a nonzero process status. JSON output contains no tables, color, progress
+indicators, or surrounding prose.
+
+Each result carries a command-specific schema identifier. Field names and
+types are stable, absent values are explicit `null`, and arrays with meaningful
+order are deterministic. Mutation results include their durable IDs, event ID,
+and resulting head. Errors use stable codes and structured context rather than
+requiring a caller to interpret prose.
+
+For example:
+
+```text
+$ alder start hm-9a1 --json
+{"schema":"alder.start.v0","head":4212,"work_id":"hm-9a1","attempt_id":"hm-9a1-attempt-1","event_id":"01K..."}
+```
+
+Examples below illustrate intent; detailed JSON schemas remain to be frozen by
+paper replay.
+
+The examples assume the repository prefix `hm`. Work IDs use that prefix;
+attempt and question IDs extend their work ID, while handoff IDs extend only
+the repository prefix because they exist before admission.
+
+## Initialization
+
+### `alder init --prefix <prefix> [--remote <remote>] [--ref <ref>]`
+
+Create or verify `.alder/config.json`:
+
+```text
+$ alder init --prefix hm
+initialized .alder/config.json · origin refs/heads/alder
+```
+
+`origin` and `refs/heads/alder` are the default store remote and ref. Explicit
+store arguments may select different values.
+
+`init` is idempotent. Repeating it with compatible prefix and store arguments:
+
+- verifies the manifest and any existing log;
+- preserves the manifest byte-for-byte, including observer edits;
+- appends no event;
+- creates no additional commit;
+- reports success as already initialized.
+
+If the manifest is absent but the selected ref already contains a compatible
+Alder log, `init` may create the manifest and adopt it. A conflicting prefix,
+remote, ref, schema, malformed manifest, or incompatible existing log changes
+nothing and returns `config_conflict`.
+
+The prefix becomes immutable after the first work item or handoff is appended.
+Changing observer entries does not append an event. `init` also supports
+`--json`.
+
+## Concurrent writes
+
+Each mutation internally reads a log head, validates against that head's
+projection, and conditionally appends to it. If another writer advances the
+log first, the command changes nothing and returns a structured head-conflict
+error. Ordinary mutations are not retried against the new state; the caller
+rereads and decides again.
+
+The expected head is not a public command argument. V0 has no `--if-head`
+option. A change already present when the command begins is part of the state
+against which the command is validated. `add handoff` alone may automatically
+retry after a conflict because its uniquely identified submission is inert.
+
+Every ordinary named read and mutation first establishes the current shared
+head. If that fails, the command returns `store_unavailable`; it does not
+present the local projection as current.
+
+## Orientation
+
+### `alder status [--with <changes>]`
+
+The default context pack:
+
+```text
+$ alder status
+head 4211 · observations refreshed 38s ago
+
+attention
+  hm-2b7  attempt hm-2b7-attempt-1 absent; last progress 3h ago
+  hm-8c3  question hm-8c3-question-1 answered; still blocked
+
+handoffs
+  hm-handoff-f27  Frame index v2  specs/frame-index-v2.md
+
+in flight
+  hm-4f2  hm-4f2-attempt-1  tmux:box-17/alder-hm-4f2-attempt-1  present  checks 2/3
+
+ready
+  hm-9a1  priority 80
+  hm-2b7  priority 60
+
+waiting on human
+  hm-3bwm-question-1  ARM lane: ship masked digest or wait for AA-6?
+```
+
+`status` shows observation times and command failures. Alder does not derive a
+stale-attempt classification; the caller judges elapsed time. A failed refresh
+produces `unknown` rather than presenting an older observation as current.
+
+With a structured graph change:
+
+```text
+$ alder status --with replan.json
+hypothetical · based on head 4211 · replan.json · not written
+...
+```
+
+The hypothetical durable state is combined with the current external
+observations. Nothing is appended, and the hypothetical change is not written
+to the local projection. Ordinary head synchronization may first rebuild a
+out-of-date projection.
+
+### `alder next [--with <changes>]`
+
+Print actionable work in priority order:
+
+```text
+$ alder next
+hm-9a1  Film projector seek  priority 80
+```
+
+`next` is a query, not an automatic scheduling decision.
+
+```text
+$ alder next --with replan.json
+hypothetical · based on head 4211 · replan.json · not written
+$build-index  Build frame index  priority 90
+```
+
+`--with` accepts the same structured document as `add work --from` or
+`edit work --from`; `--with -` reads it from standard input. Alder validates
+the document, applies it to an in-memory projection, and then runs the ordinary
+query.
+
+New work is shown by its input-local name because hypothetical queries do not
+allocate durable IDs. Invalid changes are rejected under the same rules as a
+real append. A later mutating command rereads and revalidates the current
+head. `--with` also composes with `--json`.
+
+### `alder show <id>`
+
+Show current state and compact history for a handoff, work item, attempt, or
+question.
+
+## Handoffs
+
+### `alder add handoff`
+
+Submit an asynchronous handoff without waiting for the driving agent:
+
+```text
+$ alder add handoff \
+    --title "Frame index v2" \
+    --ref specs/frame-index-v2.md \
+    --note "Scoped in the side session; integrate behind hm-9a1"
+hm-handoff-f27  submitted
+```
+
+Submission changes no work or dependency state. The command completes once the
+handoff is durably appended; the driving agent may be busy.
+
+Repository-tuned handoff skills should call this only after an explicit human
+request such as "handoff to leader." Even if an agent submits one
+unexpectedly, it cannot become actionable work without an explicit
+`add work --from-handoff`.
+
+`add handoff` does not accept work-shaping fields such as priority,
+dependencies, or checks. Those are admission decisions made if the handoff is
+admitted. The handoff's note may convey urgency or other context without
+affecting scheduling.
+
+Submitted handoffs appear in `alder status`; `alder show <handoff>` provides
+their detail. There is no separate handoff command namespace.
+
+### `alder add work --from-handoff <handoff>`
+
+A writer admits the handoff:
+
+```text
+$ alder add work --from-handoff hm-handoff-f27 \
+    --priority 70 \
+    --requires hm-9a1 \
+    --check report:"findings documented"
+hm-a22  integrated from hm-handoff-f27
+```
+
+The handoff's title and reference become the defaults for the new work.
+Integration atomically creates the work and changes the handoff from
+`submitted` to `integrated`. Failed validation changes nothing.
+
+There is no decline command or additional handoff state in v0. An
+unintegrated handoff remains visible.
+
+## Admission and editing
+
+`add` always requires an explicit resource name. V0 supports `work` and
+`handoff`; it never infers a handoff from omitted work fields.
+
+### `alder add work`
+
+```text
+$ alder add work \
+    --title "Film projector seek" \
+    --spec specs/film-projector-seek.md \
+    --priority 80 \
+    --requires hm-a15 \
+    --check tests:"seek tests pass" \
+    --check review:"change is approved"
+hm-9a1
+```
+
+Running `add work` is the admission decision. There is no `propose` command in
+v0.
+
+Alder does not authorize one writer over another. Repository skills should
+reserve `add work` for the agent responsible for admission and direct workers
+and side sessions to `add handoff`. This is workflow policy rather than a
+durable Alder role.
+
+To admit several related items atomically:
+
+```text
+$ alder add work --from new-work.json
+build-index     hm-b11
+validate-index  hm-b12
+```
+
+The JSON document contains an `add` array. Each entry may have a `local` name
+that other entries use as `$name`; Alder allocates real work IDs before
+validation and prints the resulting mapping. `--from -` reads the same format
+from standard input.
+
+Every item is admitted or none is. An `edit` section is rejected by
+`add work --from`; mixed graph changes use the structured `edit work` form.
+
+`edit` always requires an explicit resource name. Alder does not infer
+`work` or `attempt` from an ID, even though their ID formats differ. Only
+those two resources support `edit` in v0.
+
+### `alder edit work [<work>]`
+
+Edits title, spec, priority, dependencies, check definitions, or work state.
+
+Dependency and check edits are rejected while an attempt is active. Edits
+that would create a dependency cycle are rejected.
+
+```text
+$ alder edit work hm-9a1 --add-requires hm-a22 \
+    --why "seek now depends on rebuilt frame index"
+```
+
+Blocking is also a work edit:
+
+```text
+$ alder edit work hm-9a1 --block \
+    --why "release credentials are not available"
+```
+
+There is no separate block object or condition language. If another Alder
+work item is the prerequisite, use `--add-requires` instead.
+
+Blocking work with an active attempt prevents a later start but does not stop
+the existing external execution. The repository skill may leave that
+execution waiting. To terminate it and leave the work blocked, block the work
+first, stop the external execution through its native system, and then record
+the attempt's end with `alder edit attempt --end`. Blocking first makes the
+sequence safe if the caller crashes between mutations: another attempt cannot
+start.
+
+Opening blocked work is explicit:
+
+```text
+$ alder edit work hm-9a1 --unblock \
+    --why "release credentials were installed"
+```
+
+`--unblock` is rejected while the work has an unanswered question.
+
+For an atomic create-and-rewire operation, omit the work argument and provide
+a graph-change document:
+
+```text
+$ alder edit work --from replan.json
+build-index     hm-b11  added
+validate-index  hm-b12  added
+hm-9a1                   edited
+hm-2b7                   edited
+```
+
+```json
+{
+  "why": "Split frame-index work before seek continues",
+  "add": [
+    {
+      "local": "build-index",
+      "title": "Build frame index",
+      "priority": 90
+    },
+    {
+      "local": "validate-index",
+      "title": "Validate frame index",
+      "requires": ["$build-index"]
+    }
+  ],
+  "edit": [
+    {
+      "id": "hm-9a1",
+      "add_requires": ["$validate-index"],
+      "remove_requires": ["hm-a15"]
+    },
+    {
+      "id": "hm-2b7",
+      "priority": 40
+    }
+  ]
+}
+```
+
+In this form, `edit work` means editing the work graph, so the document may
+contain both additions and edits. This avoids a separate `apply`, `batch`, or
+`transaction` command. The document has no durable state of its own. Its
+top-level `why` records one reason for the complete change and is required
+when the document contains edits. `edit work --from` requires at least one
+edit operation; an additions-only document belongs to `add work --from`.
+
+The CLI allocates IDs, resolves local references, applies every operation to a
+temporary projection, and validates the final graph. It then appends one
+`work.changed` event in one Git commit. No intermediate state is observable.
+If any operation is invalid, none is applied.
+
+To inspect the resulting frontier before appending, use the `--with` form of
+`alder status` or `alder next`. The eventual mutating invocation validates
+again against the then-current head.
+
+Dependency or check changes to work with an active attempt reject the entire
+document. The atomic boundary covers Alder state only; it cannot stop or
+rewrite external executions.
+
+### `alder reopen <work>`
+
+```text
+$ alder reopen hm-9a1 --why "merged implementation regressed frame zero"
+```
+
+Reopening keeps the same work identity and preserves its attempts. If it would
+invalidate downstream work with an active attempt, Alder rejects the reopen
+and returns those attempts. The caller must resolve them first; there is no
+confirmation or override flag.
+
+## Attempts
+
+### `alder start <work>`
+
+```text
+$ alder start hm-9a1 \
+    --meta engine=opus-5 \
+    --meta requested_host=box-a
+hm-9a1-attempt-1
+```
+
+The command:
+
+1. validates that the work is ready;
+2. appends `attempt.started`;
+3. commits and pushes it;
+4. returns the attempt ID.
+
+A repository-tuned skill then launches the worker, stamps it with
+`hm-9a1-attempt-1`, and attaches the resulting external handle with
+`alder edit attempt`. This wrapper owns choices such as engine, host, and cloud
+allocation. Alder records those choices as metadata but does not interpret
+them.
+
+A second `start` is rejected while an active attempt exists.
+
+### `alder edit attempt <attempt>`
+
+```text
+$ alder edit attempt hm-9a1-attempt-1 \
+    --handle tmux:nimbus-box-17/alder-hm-9a1-attempt-1 \
+    --meta host=nimbus:box-17 \
+    --meta toolchain=rustc-1.91-zzz
+```
+
+`--handle` attaches one external handle to the attempt. A handle is
+`<kind>:<opaque-value>`; its kind selects a configured observation command and
+the rest is opaque to Alder.
+
+Used by the launch skill or reconciler after locating an external execution by
+attempt ID. An unknown handle kind is accepted and preserved, but cannot be
+refreshed until a matching observation command is configured.
+
+Attaching a handle is a one-way transition: the attempt must not already have
+one, and the handle cannot later be replaced or cleared. Alder records the
+edit as `attempt.bound`. This is a strict field-specific rule of
+`edit attempt`, not a separate command.
+
+Attempt metadata is open ended. Repository skills define useful conventions;
+Alder never gates core behavior on metadata keys.
+
+```text
+$ alder edit attempt hm-9a1-attempt-1 \
+    --check tests=satisfied \
+    --evidence "CI run 4212-a" \
+    --meta pr=github:owner/repo/pull/171 \
+    --note "PR 171 opened"
+```
+
+Attempt edits record meaningful milestones. They are not expected on every
+poll. An edit to an ended attempt is rejected.
+
+When several checks need different evidence, repeat the command or provide
+one evidence value per check in the eventual structured CLI.
+
+Ending a non-successful attempt is also an attempt edit:
+
+```text
+$ alder edit attempt hm-9a1-attempt-1 \
+    --end failed \
+    --why "worker exited before producing a patch"
+```
+
+End outcomes:
+
+- `failed`
+- `cancelled`
+- `lost`
+- `not-started`
+
+`--end` changes only the attempt. Ordinarily its work remains open; work
+already blocked while the attempt was active remains blocked. There are no
+`--block` or `--drop` attempt-edit flags.
+
+Ending the durable Alder attempt rejects later progress edits. It does not
+terminate the external execution. When the handle may still be live, the
+repository skill must stop it through its native system and confirm that
+result before recording `--end`. A new `start` remains rejected until the old
+attempt is durably ended.
+
+## Completion and dropping
+
+### `alder finish <work>`
+
+```text
+$ alder finish hm-9a1 --attempt hm-9a1-attempt-1
+```
+
+Ordinary completion requires every declared check for that attempt to be
+satisfied. V0 has no optional or non-gating check type.
+
+Work completed outside Alder uses:
+
+```text
+$ alder finish hm-9a1 --external --evidence "PR 171 merged"
+```
+
+External completion is explicit because it bypasses the ordinary attempt
+contract.
+
+### `alder drop <work>`
+
+```text
+$ alder drop hm-9a1 \
+    --attempt hm-9a1-attempt-1 \
+    --outcome cancelled \
+    --why "spike showed the approach cannot work"
+```
+
+Dropped work does not satisfy dependencies. A successful drop reports affected
+downstream work. If dropping the item would invalidate downstream work with an
+active attempt, Alder rejects the drop and returns those attempts; the caller
+must resolve them first.
+
+If the work has an active attempt, `--attempt` must name it and `--outcome`
+must be one of `failed`, `cancelled`, `lost`, or `not-started`. The drop ends
+that attempt and drops the work in one append. If there is no active attempt,
+both flags are omitted.
+
+`drop` does not terminate an external execution. The repository skill must
+stop and confirm any live execution before dropping work with its active
+attempt.
+
+## Questions
+
+### `alder ask <work>`
+
+```text
+$ alder ask hm-3bwm \
+    "Ship masked digest now, or wait for AA-6?"
+hm-3bwm-question-1
+```
+
+Asking atomically records the question and blocks the work. V0 has no
+standalone or informational questions.
+
+### `alder answer <question>`
+
+```text
+$ alder answer hm-3bwm-question-1 \
+    "Ship masked digest; AA-6 is not a gate."
+```
+
+The answer is durable but does not unblock the work. The driving agent reviews
+it, adjusts the spec, dependencies, or checks if needed, and explicitly
+unblocks it through `alder edit work`. An answer can arrive while that agent is
+busy or being replaced. The invoking environment supplies the best-effort
+actor identity recorded on the event; Alder does not use it for authorization.
+
+Answering an already answered question records a revision while retaining the
+prior answer.
+
+## Repair
+
+### `alder refresh`
+
+Run configured observation commands without appending:
+
+```json
+{
+  "schema": "alder.config.v0",
+  "prefix": "hm",
+  "store": {
+    "remote": "origin",
+    "ref": "refs/heads/alder"
+  },
+  "observers": [
+    {
+      "observer": "nimbus",
+      "list": "nimbus ls --json | jq '[.boxes[] | {value: .name, attempt_id: .labels.alder_attempt, metadata: {state: .state, estimated_cost: .estimated_cost}}]'"
+    }
+  ]
+}
+```
+
+The entries come from `.alder/config.json`. `observer` becomes the handle kind.
+`list` defines its own external scope and must print one complete normalized
+JSON array. Alder runs it through a fixed shell wrapper with pipefail enabled.
+The default timeout is 20 seconds per execution, followed by at most three
+retries. The first valid result wins.
+
+```text
+$ alder refresh
+observed 7 handles: 5 present, 1 absent, 1 unknown
+unbound:
+  nimbus:box-22  present  state=running  estimated_cost=31.70
+```
+
+An exit-zero, valid array is a complete snapshot. Returned values are present;
+omitted durable handles of that kind are absent. After four failed executions,
+the kind is unknown and failed output cannot establish absence. Timeouts
+terminate the complete shell pipeline.
+
+The inventory includes unbound objects, which is how leaked cloud boxes or
+sessions become visible. Removing an observation command does not invalidate
+existing handles. They remain replayable but have no fresh observation.
+
+### `alder reconcile`
+
+Refresh by default, compare durable attempts with the observed inventory, and
+propose repairs:
+
+```text
+$ alder reconcile
+hm-2b7-attempt-1  recorded active, observed absent
+  suggested: alder edit attempt hm-2b7-attempt-1 --end lost
+
+hm-9a1-attempt-1  recorded starting
+  found: tmux:nimbus-box-17/alder-hm-9a1-attempt-1
+  suggested: alder edit attempt hm-9a1-attempt-1 --handle tmux:nimbus-box-17/alder-hm-9a1-attempt-1
+
+hm-6e3-attempt-2  recorded active, observation unknown
+  no destructive action suggested
+
+nimbus:box-22  present, no associated attempt
+  attention: unclaimed environment handle
+```
+
+Reconcile does not treat `unknown` as absent. It is durably read-only: it
+refreshes local observations and prints findings and suggested ordinary
+commands, but never appends an event or acts on a provider. A caller performs
+any accepted repair separately.
+
+Use `alder reconcile --no-refresh` to compare against the current local
+inventory.
+
+## Diagnostics
+
+Diagnostics live under `alder debug` so the ordinary workflow remains small.
+
+### `alder debug log`
+
+Read-only commands:
+
+- `alder debug log head`
+- `alder debug log tail`
+- `alder debug log show <seq>`
+- `alder debug log verify`
+
+There is no generic append command.
+
+### `alder debug db`
+
+- `alder debug db rebuild`
+- `alder debug db verify`
+
+### `alder debug query`
+
+`alder debug query '<sql>'` runs a read-only SQLite query for debugging and
+development. It is not part of the stable agent contract; automation uses the
+named reads and `--json`.
+
+### `alder debug observations [<kind>] [--run]`
+
+Without a kind, list configured and durably referenced observation kinds with
+their latest refresh result, object count, executions, duration, and
+freshness. Kinds referenced by handles but lacking configuration are shown as
+`unconfigured`.
+
+With a kind, show its configured command, effective shell, timeout and retry
+settings, latest normalized snapshot, validation error, and bounded stderr.
+
+`--run` executes that kind alone and shows every execution plus the normalized
+result. It is diagnostic: it does not update observation tables. Use
+`alder refresh` to store observations.
+
+All forms support `--json`.
+
+## Normal iteration
+
+```text
+$ alder status
+$ alder reconcile
+# Status includes submitted handoffs; admit them before selecting more work.
+$ alder next
+$ alder start hm-9a1 --meta engine=opus-5 --meta requested_host=box-a
+hm-9a1-attempt-1
+
+# The repository skill launches the worker, then:
+$ alder edit attempt hm-9a1-attempt-1 \
+    --handle tmux:nimbus-box-17/alder-hm-9a1-attempt-1 \
+    --meta host=nimbus:box-17
+```
+
+Later:
+
+```text
+$ alder edit attempt hm-9a1-attempt-1 \
+    --check tests=satisfied --evidence "CI 4212-a"
+$ alder edit attempt hm-9a1-attempt-1 \
+    --check review=satisfied --evidence "review 171"
+$ alder finish hm-9a1 --attempt hm-9a1-attempt-1
+$ alder status
+```
+
+That loop is the center of Alder. New commands should be judged by whether
+they make it more reliable.
