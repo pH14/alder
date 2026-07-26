@@ -20,7 +20,11 @@ Given admitted work with dependencies and checks:
 Have two writers validate ordinary mutations against the same log head and
 attempt to append them concurrently.
 
+- each writer must obtain that head from the configured remote rather than
+  trusting a local branch or remote-tracking ref;
 - exactly one append may advance that head;
+- the winning append is not durable until its event commit has been pushed to
+  the remote ref;
 - the loser must receive a structured head conflict and change nothing;
 - the losing mutation must not be replayed automatically against the new
   state;
@@ -33,6 +37,12 @@ may be reconsidered automatically and must not be duplicated.
 
 The expected head must remain internal to each command. No mutation accepts a
 public `--if-head`, and Alder exposes no leader takeover or generation.
+
+Run the protocol against a bare Git remote in automated tests and perform a
+smoke test against a private GitHub repository. GitHub must be reached through
+the configured Git remote, without requiring a provider-specific API. The
+dedicated ref must accept direct fast-forward pushes and reject history
+rewrites.
 
 ### A3. Crash before launch
 

@@ -71,6 +71,13 @@ log first, the command changes nothing and returns a structured head-conflict
 error. Ordinary mutations are not retried against the new state; the caller
 rereads and decides again.
 
+The head comes from the configured remote ref, not a local branch or
+remote-tracking ref. Every ordinary read and mutation contacts that remote;
+the implementation fetches the ref when its objects are not already
+available. A mutation succeeds only after its event commit has been pushed as
+a normal fast-forward update. GitHub may host the remote, but Alder uses
+standard Git transport and requires no GitHub API integration.
+
 The expected head is not a public command argument. V0 has no `--if-head`
 option. A change already present when the command begins is part of the state
 against which the command is validated. `add handoff` alone may automatically

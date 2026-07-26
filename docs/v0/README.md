@@ -242,6 +242,18 @@ observation commands. The prefix becomes immutable after the first work item
 or handoff is appended; later commands verify it against the log. Observer
 configuration may change without appending an event.
 
+The configured remote ref is authoritative, not a local branch or
+remote-tracking ref. The intended v0 deployment keeps that ref in a private
+GitHub repository, but Alder reaches it through standard Git transport rather
+than the GitHub API. Every ordinary read and mutation queries the remote head
+and fetches its objects when they are not already local. A mutation is durable
+only after its event commit is successfully pushed to that ref; creating the
+commit locally is only preparation for the append.
+
+The dedicated ref must allow authenticated direct fast-forward pushes. It
+should reject force pushes and deletion, and it cannot require a pull request
+for each event. Git authentication and authorization remain outside Alder.
+
 `alder init --prefix <prefix>` creates or verifies this configuration. It is
 idempotent: rerunning it with compatible identity and store arguments
 preserves the existing file and observers, ensures the same usable state, and
@@ -254,7 +266,9 @@ The initial storage contract is deliberately narrow:
 - one logical mutation is one event and one Git commit;
 - a work-change event may contain many operations, all applied or rejected
   together;
+- reads establish the current head from the configured remote;
 - appends use an expected remote head;
+- a successful remote push is the append's durability point;
 - every event has a client-generated ID, making unknown append outcomes
   resolvable;
 - on a head conflict, the client asks the caller to reread and reconsider the

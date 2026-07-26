@@ -500,11 +500,18 @@ in history. V0 does not create replacement-question chains.
 
 Alder stores no leader, generation, lease, or writer role. For each mutation:
 
-1. the caller reads log head `H`;
+1. the caller queries the configured remote ref and reads log head `H`;
 2. Alder validates the command against the projection for `H`;
-3. the store conditionally appends the event with expected head `H`.
+3. the store creates an event commit whose parent is `H`;
+4. the store pushes that commit to the remote ref as a normal fast-forward
+   update.
 
-If another writer advances the log before step 3, the append changes nothing
+The successful remote update is the durability point. A local event commit
+that has not been pushed is not part of the Alder log. The Git implementation
+uses the configured remote's standard Git transport; GitHub may host that
+remote, but Alder does not use a GitHub-specific API.
+
+If another writer advances the log before step 4, the append changes nothing
 and returns a head conflict. Ordinary mutations are not reapplied to the new
 head; the caller must reread and decide again. Submission of a uniquely
 identified, inert handoff is the only automatic reconsideration in v0.
@@ -516,9 +523,11 @@ one agent the leader role, but that role has no representation or enforcement
 inside Alder.
 
 Every ordinary read and mutation must first establish the current shared-log
-head. Failure returns `store_unavailable`; a matching local projection is not
-silently treated as current. Observation-command failure is narrower and
-produces `unknown` only for that observation kind.
+head from the configured remote, even when a local branch, remote-tracking
+ref, or SQLite projection appears current. Failure returns
+`store_unavailable`; local state is not silently treated as current.
+Observation-command failure is narrower and produces `unknown` only for that
+observation kind.
 
 ## Observed state
 
