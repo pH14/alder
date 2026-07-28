@@ -797,7 +797,7 @@ mod tests {
     fn overlapping_opens_each_leave_the_schema_whole() {
         // Opening drops and recreates every view, so two opens that overlap
         // must not interleave: one would find a view the other had already
-        // recreated and fail. A foreman and its workers all read at once, so
+        // recreated and fail. A leader and its workers all read at once, so
         // this is the ordinary case, not a corner.
         let temporary = TempDir::new().unwrap();
         let projection = Projection::new(temporary.path().join("state.db"));
