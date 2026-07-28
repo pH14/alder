@@ -86,6 +86,7 @@ impl ProjectState {
                         submitted_seq: seq,
                         work_id: None,
                         integrated_seq: None,
+                        withdrawn_seq: None,
                     },
                 );
             }
@@ -97,7 +98,10 @@ impl ProjectState {
                 if handoff.state != HandoffState::Submitted {
                     return Err(AlderError::with_context(
                         "invalid_transition",
-                        format!("handoff `{handoff_id}` is already integrated"),
+                        format!(
+                            "handoff `{handoff_id}` cannot be integrated from {:?}",
+                            handoff.state
+                        ),
                         json!({"handoff_id": handoff_id, "state": handoff.state}),
                     ));
                 }
@@ -107,6 +111,26 @@ impl ProjectState {
                 handoff.work_id = Some(work.id.clone());
                 handoff.integrated_seq = Some(seq);
                 self.validate_graph()?;
+            }
+            EventPayload::HandoffWithdrawn { handoff_id, why } => {
+                require_text("withdraw reason", why)?;
+                let handoff = self
+                    .handoffs
+                    .get(handoff_id)
+                    .ok_or_else(|| AlderError::not_found("handoff", handoff_id))?;
+                if handoff.state != HandoffState::Submitted {
+                    return Err(AlderError::with_context(
+                        "invalid_transition",
+                        format!(
+                            "handoff `{handoff_id}` cannot be withdrawn from {:?}",
+                            handoff.state
+                        ),
+                        json!({"handoff_id": handoff_id, "state": handoff.state}),
+                    ));
+                }
+                let handoff = self.handoffs.get_mut(handoff_id).expect("checked above");
+                handoff.state = HandoffState::Withdrawn;
+                handoff.withdrawn_seq = Some(seq);
             }
             EventPayload::WorkChanged { operations, .. } => {
                 if operations.is_empty() {
@@ -1207,6 +1231,146 @@ mod tests {
     }
 
     #[test]
+    fn withdrawn_handoffs_fold_to_a_terminal_state_and_reject_further_transitions() {
+        let mut state = ProjectState::default();
+        state
+            .apply(&event(
+                1,
+                EventPayload::HandoffSubmitted {
+                    handoff: HandoffDefinition {
+                        id: "hm-handoff-one".to_owned(),
+                        title: "handoff".to_owned(),
+                        artifact_ref: "branch".to_owned(),
+                        note: None,
+                    },
+                },
+            ))
+            .unwrap();
+        let withdrawal = EventPayload::HandoffWithdrawn {
+            handoff_id: "hm-handoff-one".to_owned(),
+            why: "superseded".to_owned(),
+        };
+        state.apply(&event(2, withdrawal.clone())).unwrap();
+        assert_eq!(
+            state.handoffs["hm-handoff-one"].state,
+            HandoffState::Withdrawn
+        );
+        assert_eq!(state.handoffs["hm-handoff-one"].withdrawn_seq, Some(2));
+
+        // Rejection: a withdrawn handoff cannot be withdrawn again.
+        assert_eq!(
+            state.apply(&event(3, withdrawal)).unwrap_err().code,
+            "invalid_transition"
+        );
+
+        // Rejection: a withdrawn handoff cannot be integrated.
+        let integration = EventPayload::HandoffIntegrated {
+            handoff_id: "hm-handoff-one".to_owned(),
+            work: WorkDefinition {
+                id: "hm-work".to_owned(),
+                title: "work".to_owned(),
+                spec: None,
+                priority: 0,
+                requires: Vec::new(),
+                checks: Vec::new(),
+            },
+        };
+        assert_eq!(
+            state.apply(&event(4, integration)).unwrap_err().code,
+            "invalid_transition"
+        );
+
+        // Rejection: withdrawing an already-integrated handoff.
+        let mut integrated_state = ProjectState::default();
+        integrated_state
+            .apply(&event(
+                1,
+                EventPayload::HandoffSubmitted {
+                    handoff: HandoffDefinition {
+                        id: "hm-handoff-two".to_owned(),
+                        title: "handoff".to_owned(),
+                        artifact_ref: "branch".to_owned(),
+                        note: None,
+                    },
+                },
+            ))
+            .unwrap();
+        integrated_state
+            .apply(&event(
+                2,
+                EventPayload::HandoffIntegrated {
+                    handoff_id: "hm-handoff-two".to_owned(),
+                    work: WorkDefinition {
+                        id: "hm-work-two".to_owned(),
+                        title: "work".to_owned(),
+                        spec: None,
+                        priority: 0,
+                        requires: Vec::new(),
+                        checks: Vec::new(),
+                    },
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            integrated_state
+                .apply(&event(
+                    3,
+                    EventPayload::HandoffWithdrawn {
+                        handoff_id: "hm-handoff-two".to_owned(),
+                        why: "too late".to_owned(),
+                    },
+                ))
+                .unwrap_err()
+                .code,
+            "invalid_transition"
+        );
+
+        // Rejection: unknown handoff.
+        assert_eq!(
+            ProjectState::default()
+                .apply(&event(
+                    1,
+                    EventPayload::HandoffWithdrawn {
+                        handoff_id: "hm-handoff-missing".to_owned(),
+                        why: "reason".to_owned(),
+                    },
+                ))
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+
+        // Rejection: an empty reason.
+        let mut blank_reason_state = ProjectState::default();
+        blank_reason_state
+            .apply(&event(
+                1,
+                EventPayload::HandoffSubmitted {
+                    handoff: HandoffDefinition {
+                        id: "hm-handoff-three".to_owned(),
+                        title: "handoff".to_owned(),
+                        artifact_ref: "branch".to_owned(),
+                        note: None,
+                    },
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            blank_reason_state
+                .apply(&event(
+                    2,
+                    EventPayload::HandoffWithdrawn {
+                        handoff_id: "hm-handoff-three".to_owned(),
+                        why: "   ".to_owned(),
+                    },
+                ))
+                .unwrap_err()
+                .code,
+            "validation_failed"
+        );
+    }
+
+    #[test]
     fn active_attempt_freezes_every_dependency_and_check_edit() {
         let mut state = ProjectState::default();
         state
@@ -1832,6 +1996,7 @@ mod tests {
                 submitted_seq: 3,
                 work_id: None,
                 integrated_seq: None,
+                withdrawn_seq: None,
             },
         );
         assert!(state.validate_prefix("hm").is_err());

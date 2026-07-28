@@ -260,6 +260,8 @@ pub struct HandoffArgs {
 pub enum HandoffCommand {
     /// Submit an asynchronous handoff for later admission.
     Add(HandoffAddArgs),
+    /// Retire a submitted handoff without admitting it.
+    Withdraw(HandoffWithdrawArgs),
 }
 
 #[derive(Debug, Args)]
@@ -270,6 +272,13 @@ pub struct HandoffAddArgs {
     pub artifact_ref: String,
     #[arg(long)]
     pub note: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct HandoffWithdrawArgs {
+    pub handoff: String,
+    #[arg(long)]
+    pub why: String,
 }
 
 #[derive(Debug, Args)]

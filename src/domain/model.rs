@@ -47,6 +47,8 @@ pub enum EventPayload {
         handoff_id: String,
         work: WorkDefinition,
     },
+    #[serde(rename = "handoff.withdrawn")]
+    HandoffWithdrawn { handoff_id: String, why: String },
     #[serde(rename = "work.changed")]
     WorkChanged {
         why: Option<String>,
@@ -121,6 +123,7 @@ impl EventPayload {
         match self {
             Self::HandoffSubmitted { .. } => "handoff.submitted",
             Self::HandoffIntegrated { .. } => "handoff.integrated",
+            Self::HandoffWithdrawn { .. } => "handoff.withdrawn",
             Self::WorkChanged { .. } => "work.changed",
             Self::WorkFinished { .. } => "work.finished",
             Self::WorkDropped { .. } => "work.dropped",
@@ -145,6 +148,7 @@ impl EventPayload {
         match self {
             Self::HandoffSubmitted { handoff } => handoff.id == id,
             Self::HandoffIntegrated { handoff_id, work } => handoff_id == id || work.id == id,
+            Self::HandoffWithdrawn { handoff_id, .. } => handoff_id == id,
             Self::WorkChanged { operations, .. } => operations.iter().any(|operation| {
                 operation.id() == id
                     || operation
@@ -195,6 +199,7 @@ pub struct HandoffDefinition {
 pub enum HandoffState {
     Submitted,
     Integrated,
+    Withdrawn,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +213,7 @@ pub struct Handoff {
     pub submitted_seq: u64,
     pub work_id: Option<String>,
     pub integrated_seq: Option<u64>,
+    pub withdrawn_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -625,6 +631,14 @@ mod tests {
                 },
                 "handoff.integrated",
                 vec!["handoff", "work"],
+            ),
+            (
+                EventPayload::HandoffWithdrawn {
+                    handoff_id: "handoff".to_owned(),
+                    why: "reason".to_owned(),
+                },
+                "handoff.withdrawn",
+                vec!["handoff"],
             ),
             (
                 EventPayload::WorkChanged {

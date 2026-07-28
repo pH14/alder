@@ -88,10 +88,13 @@ Alder provides a small asynchronous inbox for side sessions:
   or dependencies;
 - the driving agent drains submitted handoffs before selecting more work;
 - `alder work add --handoff` atomically creates admitted work and marks the
-  handoff `integrated`.
+  handoff `integrated`;
+- `alder handoff withdraw` retires a submitted handoff without admitting it,
+  marking it `withdrawn`.
 
-These are the only two handoff states. If integration cannot validate, the
-handoff remains submitted and visible.
+These are the only three handoff states, and `integrated` and `withdrawn` are
+both terminal. If integration cannot validate, the handoff remains submitted
+and visible.
 
 Submission is intentionally weaker than admission. A repository-tuned handoff
 skill should invoke it only after an explicit human request such as "handoff

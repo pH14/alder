@@ -183,6 +183,17 @@ impl<S: Log> Ledger<S> {
         Ok((result, id))
     }
 
+    pub fn withdraw_handoff(&self, handoff_id: &str, why: String) -> Result<AppendResult> {
+        let snapshot = self.snapshot()?;
+        self.append_payload(
+            &snapshot,
+            EventPayload::HandoffWithdrawn {
+                handoff_id: handoff_id.to_owned(),
+                why,
+            },
+        )
+    }
+
     pub fn add_handoff(
         &self,
         title: String,
@@ -1020,6 +1031,36 @@ mod tests {
                 vec![],
                 vec![],
             )
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_transition");
+    }
+
+    #[test]
+    fn withdrawing_a_handoff_retires_it_and_frees_nothing_to_integrate() {
+        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
+        let (_, handoff) = ledger
+            .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
+            .unwrap();
+
+        let result = ledger
+            .withdraw_handoff(&handoff, "superseded by a follow-up".to_owned())
+            .unwrap();
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(
+            snapshot.state.handoffs[&handoff].state,
+            crate::domain::HandoffState::Withdrawn
+        );
+        assert_eq!(result.event.payload.type_name(), "handoff.withdrawn");
+
+        // Rejection: an already-withdrawn handoff cannot be integrated.
+        let error = ledger
+            .integrate_handoff(&handoff, None, None, 0, vec![], vec![])
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_transition");
+
+        // Rejection: an already-withdrawn handoff cannot be withdrawn again.
+        let error = ledger
+            .withdraw_handoff(&handoff, "again".to_owned())
             .unwrap_err();
         assert_eq!(error.code, "invalid_transition");
     }

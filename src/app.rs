@@ -105,6 +105,18 @@ impl App {
                         format!("{id}  submitted"),
                     ))
                 }
+                HandoffCommand::Withdraw(args) => {
+                    require_reason("--why", Some(&args.why))?;
+                    let result = context
+                        .ledger
+                        .withdraw_handoff(&args.handoff, args.why.clone())?;
+                    Ok(mutation_output(
+                        "alder.handoff.withdraw.v0",
+                        &result,
+                        json!({"handoff_id": args.handoff, "state": "withdrawn"}),
+                        format!("{}  withdrawn", args.handoff),
+                    ))
+                }
             },
             Command::Loop(args) => loop_command(&context, &args.command),
             Command::Pass(args) => match &args.command {

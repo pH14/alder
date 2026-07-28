@@ -732,6 +732,89 @@ fn work_state_verbs_replace_the_removed_edit_flags() {
 }
 
 #[test]
+fn handoff_withdraw_retires_a_submission_and_status_stops_listing_it() {
+    let project = TestProject::new();
+
+    let handoff = project.success(&[
+        "handoff",
+        "add",
+        "--title",
+        "Side work",
+        "--ref",
+        "branch:side",
+    ]);
+    let handoff_id = string(&handoff, "handoff_id");
+    let status = project.success(&["status"]);
+    assert_eq!(status["handoffs"][0]["id"], handoff_id);
+
+    // An empty reason is rejected before anything is appended.
+    assert_eq!(
+        project.failure(&["handoff", "withdraw", &handoff_id, "--why", "   "])["code"],
+        "validation_failed"
+    );
+
+    let withdrawn = project.success(&[
+        "handoff",
+        "withdraw",
+        &handoff_id,
+        "--why",
+        "superseded by a follow-up handoff",
+    ]);
+    assert_eq!(withdrawn["schema"], "alder.handoff.withdraw.v0");
+    assert_eq!(withdrawn["handoff_id"], handoff_id);
+    assert_eq!(withdrawn["state"], "withdrawn");
+
+    // Status-filter: a withdrawn handoff is no longer an inbox entry.
+    let status = project.success(&["status"]);
+    assert!(status["handoffs"].as_array().unwrap().is_empty());
+    assert!(!project.human(&["status"]).contains(&handoff_id));
+
+    // `show` still renders it, now terminal.
+    let shown = project.success(&["show", &handoff_id]);
+    assert_eq!(shown["current"]["state"], "withdrawn");
+
+    // Rejection: a withdrawn handoff cannot be withdrawn again.
+    assert_eq!(
+        project.failure(&["handoff", "withdraw", &handoff_id, "--why", "again"])["code"],
+        "invalid_transition"
+    );
+
+    // Rejection: a withdrawn handoff cannot be integrated.
+    assert_eq!(
+        project.failure(&["work", "add", "--handoff", &handoff_id])["code"],
+        "invalid_transition"
+    );
+
+    // Rejection: withdrawing an unknown handoff.
+    assert_eq!(
+        project.failure(&[
+            "handoff",
+            "withdraw",
+            "hm-handoff-missing",
+            "--why",
+            "reason"
+        ])["code"],
+        "not_found"
+    );
+
+    // Rejection: withdrawing an already-integrated handoff.
+    let integrated_handoff = project.success(&[
+        "handoff",
+        "add",
+        "--title",
+        "Integrated work",
+        "--ref",
+        "branch:other",
+    ]);
+    let integrated_id = string(&integrated_handoff, "handoff_id");
+    project.success(&["work", "add", "--handoff", &integrated_id]);
+    assert_eq!(
+        project.failure(&["handoff", "withdraw", &integrated_id, "--why", "too late"])["code"],
+        "invalid_transition"
+    );
+}
+
+#[test]
 fn terminal_work_strands_its_questions_until_it_is_reopened() {
     let project = TestProject::new();
     let work = string(

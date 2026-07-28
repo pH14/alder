@@ -67,6 +67,7 @@ The initial event types are:
 
 - `handoff.submitted`
 - `handoff.integrated`
+- `handoff.withdrawn`
 - `work.changed`
 - `work.finished`
 - `work.dropped`
@@ -187,10 +188,11 @@ multi-step scenario language.
 ## Handoffs
 
 A handoff is a durable asynchronous message for later admission. It is not
-work and has exactly two states:
+work and has exactly three states:
 
 - `submitted`
 - `integrated`
+- `withdrawn`
 
 | Field | Meaning |
 | --- | --- |
@@ -198,10 +200,11 @@ work and has exactly two states:
 | `title` | Short description |
 | `ref` | Spec, branch, report, commit, URL, or other artifact reference |
 | `note` | Optional context for the admitting agent |
-| `state` | `submitted` or `integrated` |
+| `state` | `submitted`, `integrated`, or `withdrawn` |
 | `submitted_seq` | Inbox arrival |
 | `work_id` | Work created by integration |
 | `integrated_seq` | Integration event |
+| `withdrawn_seq` | Withdrawal event |
 
 `handoff.submitted` changes no work, dependency, readiness, or attempt state.
 It is the asynchronous side-channel write in v0. Its public operation is
@@ -220,8 +223,16 @@ and changes the handoff to `integrated`. Its public operation is
 
 An integrated handoff cannot be integrated again. If its proposed work is
 invalid—for example, it introduces a dependency cycle—the append is rejected
-and the handoff remains submitted. There is no declined or deleted state in
-v0.
+and the handoff remains submitted.
+
+`handoff.withdrawn` retires a submitted handoff without admitting it. Its
+public operation is `alder handoff withdraw <handoff> --why <reason>`, and it
+requires a non-empty reason the same way `work.dropped` and `work.reopened`
+do. Only a `submitted` handoff can be withdrawn; withdrawing an already
+`integrated` or already `withdrawn` handoff is rejected as an
+`invalid_transition`. Withdrawal is terminal — v0 has no un-withdraw — and it
+changes no work, dependency, readiness, or attempt state, the same as
+submission.
 
 Repository skills should submit a handoff only after an explicit human
 instruction. This is an operational permission boundary, not a claim that
