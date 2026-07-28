@@ -3,7 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -205,11 +207,20 @@ impl Projection {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(&self.path)?;
+        let mut connection = Connection::open(&self.path)?;
+        // Foreign keys are a connection setting, so they are set outside the
+        // transaction that follows.
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        reset_if_schema_changed(&connection)?;
-        create_schema(&connection)?;
+        // Opening drops and recreates every view, so two processes opening at
+        // once would otherwise interleave those statements and one would find
+        // a view the other had already recreated. One writer at a time makes
+        // the whole setup a single step; the busy timeout makes the second
+        // wait for it rather than fail.
+        let setup = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        reset_if_schema_changed(&setup)?;
+        create_schema(&setup)?;
+        setup.commit()?;
         Ok(connection)
     }
 }
@@ -766,7 +777,11 @@ fn upsert_run(transaction: &Transaction<'_>, run: &ObservationRun) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use chrono::Utc;
     use tempfile::TempDir;
@@ -777,6 +792,49 @@ mod tests {
         WorkState,
     };
     use alder_log::MemoryLog as MemoryStore;
+
+    #[test]
+    fn overlapping_opens_each_leave_the_schema_whole() {
+        // Opening drops and recreates every view, so two opens that overlap
+        // must not interleave: one would find a view the other had already
+        // recreated and fail. A foreman and its workers all read at once, so
+        // this is the ordinary case, not a corner.
+        let temporary = TempDir::new().unwrap();
+        let projection = Projection::new(temporary.path().join("state.db"));
+        // One count: a barrier expecting more openers than there are would
+        // hang rather than fail.
+        let openers = 16;
+        let barrier = Arc::new(Barrier::new(openers));
+        let opens: Vec<_> = (0..openers)
+            .map(|_| {
+                let projection = projection.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    // Every opener runs each round together, and none leaves
+                    // early on failure, so the rounds stay aligned and the
+                    // last one is as contended as the first.
+                    let mut failure = None;
+                    for _ in 0..10 {
+                        barrier.wait();
+                        if let Err(error) = projection.connection() {
+                            failure.get_or_insert(error);
+                        }
+                    }
+                    failure
+                })
+            })
+            .collect();
+        for open in opens {
+            if let Some(error) = open.join().unwrap() {
+                panic!("an overlapping open failed: {error:?}");
+            }
+        }
+        // The views the last open left behind still answer.
+        let connection = projection.connection().unwrap();
+        connection
+            .query_row("SELECT count(*) FROM ready", [], |row| row.get::<_, u64>(0))
+            .unwrap();
+    }
 
     #[test]
     fn rebuild_preserves_observations() {
