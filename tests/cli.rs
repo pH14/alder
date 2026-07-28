@@ -669,12 +669,130 @@ fn work_state_verbs_replace_the_removed_edit_flags() {
         "approach cannot work",
     ]);
     assert_eq!(dropped["schema"], "alder.work.drop.v0");
+    // The question was answered before the drop, so nothing is stranded.
+    assert!(dropped["stranded_questions"].as_array().unwrap().is_empty());
     let reopened = project.success(&["work", "reopen", &work, "--why", "requirement stands"]);
     assert_eq!(reopened["schema"], "alder.work.reopen.v0");
     assert_eq!(
         project.success(&["show", &work])["current"]["state"],
         "open"
     );
+}
+
+#[test]
+fn terminal_work_strands_its_questions_until_it_is_reopened() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&["work", "add", "--title", "Ship the digest"]),
+        "work_id",
+    );
+    let question = string(
+        &project.success(&["work", "ask", &work, "Masked digest, or wait for AA-6?"]),
+        "question_id",
+    );
+
+    // While the work is live the question is a decision someone owes.
+    let status = project.success(&["status"]);
+    assert_eq!(status["waiting_on_human"][0]["id"], question);
+    assert_eq!(status["questions"][0]["stranded"], Value::Null);
+    assert!(project.human(&["status"]).contains(&question));
+    assert_eq!(
+        project.success(&["debug", "query", "SELECT count(*) AS n FROM questions_open"])["result"]
+            ["rows"][0]["n"],
+        1
+    );
+
+    // Dropping the work strands it, and the drop says so at decision time.
+    let dropped = project.success(&["work", "drop", &work, "--why", "requirement withdrawn"]);
+    assert_eq!(dropped["stranded_questions"][0], question);
+    let status = project.success(&["status"]);
+    assert!(status["waiting_on_human"].as_array().unwrap().is_empty());
+    assert_eq!(status["questions"][0]["stranded"], "work dropped");
+    assert!(!project.human(&["status"]).contains(&question));
+    assert_eq!(
+        project.success(&["debug", "query", "SELECT count(*) AS n FROM questions_open"])["result"]
+            ["rows"][0]["n"],
+        0
+    );
+
+    // The question itself is never hidden; `show` renders the derived state.
+    let shown = project.success(&["show", &question]);
+    assert_eq!(shown["kind"], "question");
+    assert_eq!(shown["current"]["stranded"], "work dropped");
+    assert!(project.human(&["show", &question]).contains("stranded"));
+
+    // Reopening is the whole round trip: no repair event, and the question is
+    // actionable again because visibility was never stored.
+    project.success(&["work", "reopen", &work, "--why", "requirement stands"]);
+    let status = project.success(&["status"]);
+    assert_eq!(status["waiting_on_human"][0]["id"], question);
+    assert_eq!(
+        project.success(&["show", &question])["current"]["stranded"],
+        Value::Null
+    );
+
+    // A late ruling on a stranded question is still recorded.
+    project.success(&["work", "drop", &work, "--why", "withdrawn again"]);
+    project.success(&["question", "answer", &question, "masked digest"]);
+    let shown = project.success(&["show", &question]);
+    assert_eq!(shown["current"]["answer"], "masked digest");
+    assert_eq!(shown["current"]["stranded"], "work dropped");
+}
+
+#[test]
+fn terminal_transitions_report_the_questions_they_strand() {
+    let project = TestProject::new();
+    let dropped_work = string(
+        &project.success(&["work", "add", "--title", "Drop me"]),
+        "work_id",
+    );
+    let dropped_question = string(
+        &project.success(&["work", "ask", &dropped_work, "Which lane?"]),
+        "question_id",
+    );
+    let human = project.human(&["work", "drop", &dropped_work, "--why", "superseded"]);
+    assert!(
+        human.contains(&format!("also strands {dropped_question}")),
+        "{human}"
+    );
+
+    // External completion strands too: the work leaves `blocked` for `done`
+    // without the question ever being answered.
+    let finished_work = string(
+        &project.success(&["work", "add", "--title", "Finish me"]),
+        "work_id",
+    );
+    let finished_question = string(
+        &project.success(&["work", "ask", &finished_work, "Which digest?"]),
+        "question_id",
+    );
+    let finished = project.success(&[
+        "work",
+        "finish",
+        &finished_work,
+        "--external",
+        "--evidence",
+        "PR 171 merged",
+    ]);
+    assert_eq!(finished["stranded_questions"][0], finished_question);
+    assert_eq!(
+        project.success(&["show", &finished_question])["current"]["stranded"],
+        "work done"
+    );
+    assert!(
+        project.success(&["status"])["waiting_on_human"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Work with nothing outstanding strands nothing and says nothing.
+    let quiet = string(
+        &project.success(&["work", "add", "--title", "Quiet"]),
+        "work_id",
+    );
+    let human = project.human(&["work", "drop", &quiet, "--why", "not needed"]);
+    assert_eq!(human.trim(), format!("{quiet}  dropped"));
 }
 
 #[test]

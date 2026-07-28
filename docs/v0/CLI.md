@@ -167,6 +167,14 @@ waiting on human
 stale-attempt classification; the caller judges elapsed time. A failed refresh
 produces `unknown` rather than presenting an older observation as current.
 
+`waiting on human` lists the unanswered questions someone can still act on.
+A question whose work has since been dropped or finished is stranded and is
+omitted from that list in both human and `--json` output; nobody is waiting on
+a decision about a requirement that no longer stands. Stranded questions are
+not hidden — `show` renders them, and reopening the work returns them to the
+list. The `--json` `questions` array carries every question with a derived
+`stranded` field.
+
 The `loop` section reports the loop's desired state and its two interesting
 passes: whether it is paused and why, the desired engine, whether a rotation is
 pending, the open pass, and the last ended pass with its outcome, the first
@@ -540,7 +548,8 @@ $ alder work finish hm-9a1 --external --evidence "PR 171 merged"
 ```
 
 External completion is explicit because it bypasses the ordinary attempt
-contract.
+contract. It is also the way blocked work is finished, so a completion can
+leave a question behind; the result names any question it strands.
 
 ### `alder work drop <work>`
 
@@ -549,10 +558,12 @@ $ alder work drop hm-9a1 \
     --attempt hm-9a1-attempt-1 \
     --outcome cancelled \
     --why "spike showed the approach cannot work"
+hm-9a1  dropped · affects hm-2b7 · also strands hm-9a1-question-1
 ```
 
 Dropped work does not satisfy dependencies. A successful drop reports affected
-downstream work. If dropping the item would invalidate downstream work with an
+downstream work and any unanswered question it strands, so both consequences
+are visible at decision time rather than afterwards. If dropping the item would invalidate downstream work with an
 active attempt, Alder rejects the drop and returns those attempts; the caller
 must resolve them first.
 
@@ -594,7 +605,10 @@ is busy or being replaced. The invoking environment supplies the best-effort
 actor identity recorded on the event; Alder does not use it for authorization.
 
 Answering an already answered question records a revision while retaining the
-prior answer.
+prior answer. A stranded question — one whose work has since been dropped or
+finished — can still be answered; a late ruling is harmless and worth keeping.
+`show <question>` reports the derived visibility, `"stranded": "work dropped"`,
+alongside the question's full history.
 
 ## The loop
 

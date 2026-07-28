@@ -17,7 +17,7 @@ use crate::{
     domain::{
         AppendResult, AttemptOutcome, ChangeMode, CheckDefinition, CheckStatus, CheckUpdate, Event,
         EventPayload, GraphChangeDocument, Ledger, NullableString, PassOutcome, PassTrigger,
-        ProjectState, Snapshot, WorkStateChange, prepare_change,
+        ProjectState, Question, Snapshot, WorkStateChange, prepare_change,
     },
     error::{AlderError, Result},
     observer,
@@ -224,6 +224,7 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
                     "--evidence is accepted only with --external",
                 ));
             }
+            let stranded = context.snapshot.state.unanswered_questions(&args.work);
             let result = context.ledger.finish(
                 &args.work,
                 args.attempt.clone(),
@@ -237,11 +238,13 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
                     "work_id": args.work,
                     "attempt_id": args.attempt,
                     "external": args.external,
+                    "stranded_questions": stranded,
                 }),
-                format!("{}  done", args.work),
+                format!("{}  done{}", args.work, stranded_note(&stranded)),
             ))
         }
         WorkCommand::Drop(args) => {
+            let stranded = context.snapshot.state.unanswered_questions(&args.work);
             let result = context.ledger.drop_work(
                 &args.work,
                 args.attempt.clone(),
@@ -257,15 +260,17 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
                     "attempt_id": args.attempt,
                     "outcome": args.outcome.map(|outcome| format_outcome(outcome.into())),
                     "affected_downstream": downstream,
+                    "stranded_questions": stranded,
                 }),
                 format!(
-                    "{}  dropped{}",
+                    "{}  dropped{}{}",
                     args.work,
                     if downstream.is_empty() {
                         String::new()
                     } else {
                         format!(" · affects {}", downstream.join(", "))
-                    }
+                    },
+                    stranded_note(&stranded),
                 ),
             ))
         }
@@ -658,11 +663,17 @@ fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
     let ready: Vec<_> = state.ready().into_iter().cloned().collect();
     let mut all_questions: Vec<_> = state.questions.values().cloned().collect();
     all_questions.sort_by_key(|question| question.asked_seq);
+    // Stranded questions are excluded: their work is done or dropped, so
+    // nobody is waiting on the answer. They stay visible through `show`.
     let questions: Vec<_> = all_questions
         .iter()
-        .filter(|question| question.answer.is_none())
+        .filter(|question| question.answer.is_none() && state.stranded(question).is_none())
         .cloned()
         .collect();
+    let rendered_questions = all_questions
+        .iter()
+        .map(|question| question_value(&state, question))
+        .collect::<Result<Vec<_>>>()?;
     let answered_blocked: Vec<_> = all_questions
         .iter()
         .filter(|question| {
@@ -707,7 +718,7 @@ fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
         "in_flight": in_flight,
         "ready": ready,
         "waiting_on_human": questions,
-        "questions": all_questions,
+        "questions": rendered_questions,
         "blocked": blocked,
         "recent_events": recent_events,
     });
@@ -1001,7 +1012,7 @@ fn show(context: &Context, id: &str) -> Result<Output> {
         } else if let Some(value) = context.snapshot.state.questions.get(id) {
             (
                 "question",
-                serde_json::to_value(value)?,
+                question_value(&context.snapshot.state, value)?,
                 BTreeSet::from([id.to_owned()]),
             )
         } else if let Some(value) = context.snapshot.state.handoffs.get(id) {
@@ -1395,6 +1406,31 @@ fn mutation_output(
     object.insert("revision".to_owned(), json!(result.head.revision()));
     object.insert("event_id".to_owned(), json!(result.event.id));
     Output::new(Value::Object(object), human)
+}
+
+/// A question rendered with its derived visibility. `stranded` is not stored;
+/// it is read back out of the work's current state every time, which is what
+/// makes `work reopen` restore the question with no repair event.
+fn question_value(state: &ProjectState, question: &Question) -> Result<Value> {
+    let mut value = serde_json::to_value(question)?;
+    let stranded = state
+        .stranded(question)
+        .map(|work_state| format!("work {}", work_state.as_str()));
+    if let Value::Object(object) = &mut value {
+        object.insert("stranded".to_owned(), json!(stranded));
+    }
+    Ok(value)
+}
+
+/// A terminal transition strands the work's unanswered questions. Naming them
+/// in the result puts that consequence in front of the caller at the moment of
+/// the decision, rather than leaving it to be noticed later.
+fn stranded_note(questions: &[String]) -> String {
+    if questions.is_empty() {
+        String::new()
+    } else {
+        format!(" · also strands {}", questions.join(", "))
+    }
 }
 
 fn event_summary(event: &Event) -> Value {

@@ -407,7 +407,9 @@ fn create_schema(connection: &Connection) -> Result<()> {
             SELECT * FROM work_current WHERE state = 'blocked';
         DROP VIEW IF EXISTS questions_open;
         CREATE VIEW questions_open AS
-            SELECT * FROM questions WHERE answer IS NULL;
+            SELECT q.*
+            FROM questions q JOIN work_current w ON w.id = q.work_id
+            WHERE q.answer IS NULL AND w.state NOT IN ('done', 'dropped');
         DROP VIEW IF EXISTS pass_open;
         CREATE VIEW pass_open AS
             SELECT * FROM passes WHERE state = 'open';

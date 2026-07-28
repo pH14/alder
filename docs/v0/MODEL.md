@@ -514,6 +514,24 @@ answer arrive while the driving agent is busy or being replaced.
 An answer may be revised. The latest answer is current; earlier answers remain
 in history. V0 does not create replacement-question chains.
 
+### Stranded questions
+
+A question is actionable only while its work is in a non-terminal state. When
+the work becomes `done` or `dropped`, its unanswered questions are **stranded**:
+there is no longer a requirement to decide about, so they stop appearing under
+`status`'s waiting-on-human list. They are not hidden. `show` renders every
+question, stranded or not, with its complete history.
+
+Stranding is derived from the current work state, never stored. There is no
+event kind, flag, or repair step for it, which is what makes reopening correct
+for free: `work reopen` returns the work to `open` and its unanswered questions
+become actionable again in the same fold.
+
+Answering a stranded question remains legal. Recording a late ruling is
+harmless, and answers already support revision. `work drop` and `work finish`
+report the questions they strand, so a caller sees that consequence when
+deciding rather than discovering it afterwards.
+
 ## Passes
 
 A pass is one run of the driving loop. Work is to an attempt what the loop is
@@ -710,6 +728,10 @@ Work is **ready** when:
 - its state is `open`;
 - it has no active attempt;
 - every dependency is `done`.
+
+A question is **stranded** when it is unanswered and its work is `done` or
+`dropped`. `questions_open` excludes stranded questions for the same reason
+`status` does: an open question is one someone can still act on.
 
 Alder exposes event and observation times but derives no stale-attempt
 predicate. Deciding whether an attempt has stopped moving belongs to the
