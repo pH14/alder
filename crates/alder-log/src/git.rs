@@ -618,11 +618,14 @@ fn parse_batch(stdout: &[u8], paths: &[String]) -> Result<Vec<Vec<u8>>, LogError
         let size = blob_size(&header).ok_or_else(|| LogError::InvalidLog {
             message: format!("record `{path}` is unreadable: {header}"),
         })?;
-        if rest.len() < size + 1 {
+        // The body and the newline behind it. A size too large to add to is
+        // one no stream can satisfy, so it is short like any other.
+        let claimed = size.checked_add(1).ok_or_else(truncated)?;
+        if rest.len() < claimed {
             return Err(truncated());
         }
         bodies.push(rest[..size].to_vec());
-        rest = &rest[size + 1..];
+        rest = &rest[claimed..];
     }
     Ok(bodies)
 }
@@ -778,9 +781,13 @@ mod tests {
         // of object than the blobs a record has to be.
         assert!(unreadable(b"aaa missing\n").contains("events/0.json"));
         assert!(unreadable(b"aaa tree 4\n1234\n").contains("events/0.json"));
-        // A stream that stops early is not silently short.
+        // A stream that stops early is not silently short, and a size no
+        // stream could satisfy is short rather than a panic.
         assert!(unreadable(b"").contains("events/0.json"));
         assert!(unreadable(b"aaa blob 9\n{}\n").contains("events/0.json"));
+        assert!(
+            unreadable(format!("aaa blob {}\n", usize::MAX).as_bytes()).contains("events/0.json")
+        );
         // Two headers, one body: the second record has nothing behind it.
         let mut stdout = b"aaa blob 2\n{}\n".to_vec();
         stdout.extend_from_slice(b"bbb blob 2\n");
