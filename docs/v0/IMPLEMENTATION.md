@@ -52,3 +52,16 @@ documents intentionally leave open.
   all features. Mutation runs must have no unexplained survivors; equivalent
   mutations are removed through clearer code or narrowly documented
   exclusions rather than broad file or module skips.
+- The loop is mutation-tested as one surface, because its two halves are only
+  correct together: the fold's pass and loop arms, `open_pass`,
+  `last_ended_pass`, `LoopControl`'s pending rules and the `loop` section
+  `status` reports, in the `alder` crate; `decide`, `loop_state`, and `driver`
+  in `alderd`. Both halves run with no survivors and no exclusions. What that
+  buys is specific: a decision the driver reaches by a path no test walks —
+  a diagnostic nobody reads, a match guard that catches more than it names, a
+  hash that varies without being FNV — is exactly what a mutation exposes and
+  an ordinary suite does not.
+- The driver's fake world refuses to answer more than a bounded number of
+  `alder show` polls for one pass. A driver that stopped waiting between polls
+  would otherwise hang the suite instead of failing it, which reports as a
+  timeout rather than as the caught mutation it is.
