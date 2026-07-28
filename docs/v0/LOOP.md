@@ -216,6 +216,18 @@ the driver's politeness. It does not override `loop pause`, and it cannot open
 a second pass while one is open. A nudge changes *when* the next pass runs,
 never *what* it does.
 
+## Workers
+
+A project may run the leader as a foreman that dispatches implementation to
+worker sessions — one work item per worker, each in its own git worktree and
+tmux session, stamped with its attempt ID and bound to the attempt through
+the ordinary handle. This is entirely process layer: Alder stores attempts,
+handles, questions, and observations exactly as before, the tmux observer
+lists worker sessions like any other observed object, and `reconcile`
+catches dead ones with the same rules. No Alder mechanism knows the word
+"worker". See `PASS.md`, `WORKER.md`, and `scripts/worker-spawn.sh` in the
+repository for the process itself.
+
 ## The trigger-message contract
 
 A wake records why it fired: `log`, `observations`, `due`, or `manual`. The
