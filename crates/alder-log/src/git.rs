@@ -133,6 +133,12 @@ impl GitLog {
     /// force-updated from the remote immediately before every read and is
     /// never consulted on its own, so it cannot stand in for the remote. The
     /// digest keeps two logs in one repository on separate refs.
+    ///
+    /// Every reader of one log shares this name — worktrees of a repository
+    /// share its refs — so concurrent reads race to update it. Git waits out
+    /// a held ref lock rather than failing (`core.filesRefLockTimeout`, 100ms
+    /// by default), and whichever revision wins is authoritative either way,
+    /// so the race has no loser.
     fn anchor(&self) -> String {
         format!(
             "refs/alder-log/{:016x}",
@@ -349,7 +355,15 @@ impl GitLog {
             return;
         }
         // Write and rename so a concurrent reader sees one whole revision.
-        let temporary = directory.join(format!("records.json.{}.tmp", std::process::id()));
+        // The name is unique per writer, including between threads, so two
+        // writers cannot interleave into one temporary file and rename the
+        // mixture over the cache.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let temporary = directory.join(format!(
+            "records.json.{}-{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         if fs::write(&temporary, &bytes).is_err() || fs::rename(&temporary, &path).is_err() {
             let _ = fs::remove_file(&temporary);
         }

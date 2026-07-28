@@ -365,6 +365,8 @@ mod tests {
         let root = root.canonicalize().unwrap();
         assert_eq!(project.root, root);
         assert_eq!(project.state_db(), root.join(".alder/state.db"));
+        // Both derived stores sit beside the manifest, wherever it was found.
+        assert_eq!(project.store_cache(), root.join(".alder/cache"));
         assert_eq!(project.config.prefix, "hm");
         assert_eq!(project.config.store.remote, "origin");
         assert_eq!(project.config.store.reference, "refs/heads/alder");
