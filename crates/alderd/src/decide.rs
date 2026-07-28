@@ -723,7 +723,12 @@ mod tests {
         assert!(!pass_timed_out(&config, at(0), at(59)));
         assert!(pass_timed_out(&config, at(0), at(60)));
 
+        // FNV-1a, pinned to its published 64-bit vectors: both the basis and
+        // the mixing step are fixed, so a hash that merely varies with its
+        // input is not enough to pass.
         assert_eq!(content_hash(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(content_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(content_hash(b"foobar"), 0x8594_4171_f739_67e8);
         assert_eq!(content_hash(b"one"), content_hash(b"one"));
         assert_ne!(content_hash(b"one"), content_hash(b"two"));
     }

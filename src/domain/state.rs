@@ -1851,6 +1851,37 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_keeps_the_reason_it_was_ended_for_and_drops_a_blank_one() {
+        let ended_with = |why: Option<&str>| {
+            let mut state = ProjectState::default();
+            state.apply(&event(1, wake("hm-pass-1"))).unwrap();
+            state
+                .apply(&event(
+                    2,
+                    EventPayload::PassEnded {
+                        pass_id: "hm-pass-1".to_owned(),
+                        outcome: crate::domain::PassOutcome::Timeout,
+                        report: None,
+                        wake_at: None,
+                        rotate: false,
+                        why: why.map(ToOwned::to_owned),
+                    },
+                ))
+                .unwrap();
+            state.passes["hm-pass-1"].why.clone()
+        };
+
+        // A pass the driver had to close itself leaves no report, so the
+        // reason it records is the only account of what happened.
+        assert_eq!(
+            ended_with(Some("the pass exceeded its time budget")),
+            Some("the pass exceeded its time budget".to_owned())
+        );
+        assert_eq!(ended_with(Some("   ")), None);
+        assert_eq!(ended_with(None), None);
+    }
+
+    #[test]
     fn a_wake_consumes_the_rotation_that_precedes_it() {
         let mut state = ProjectState::default();
         assert!(!state.loop_control.rotate_pending());
