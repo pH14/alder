@@ -228,6 +228,15 @@ catches dead ones with the same rules. No Alder mechanism knows the word
 "worker". See `PASS.md`, `WORKER.md`, and `scripts/worker-spawn.sh` in the
 repository for the process itself.
 
+The spawn is checked end to end by `scripts/tests/verify-goal-mode.sh`, which
+runs the real script against a throwaway repository, log and tmux server and
+asserts that the goal a live session receives carries the item's title, spec,
+checks and gates. Its sandbox must never reach the machine's own tmux server,
+so the teardown that enforces that — one session, by exact name, only after
+proving the sandbox server holds nothing else — lives in
+`scripts/tests/tmux-sandbox.sh` and is itself tested by
+`scripts/tests/test-teardown-guard.sh`.
+
 Two conventions in that process are worth naming here because they show up
 in the log rather than in the repository. A worker records an up-tier
 consult as `consulted` metadata on its own attempt, and a dispatch records
