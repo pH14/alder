@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 struct TestProject {
-    _temporary: TempDir,
+    temporary: TempDir,
     work: PathBuf,
 }
 
@@ -24,10 +24,7 @@ impl TestProject {
         );
         git(temporary.path(), &["init", "--quiet", path(&work)]);
         git(&work, &["remote", "add", "origin", path(&remote)]);
-        let project = Self {
-            _temporary: temporary,
-            work,
-        };
+        let project = Self { temporary, work };
         let initialized = project.success(&["init", "--prefix", "hm"]);
         assert_eq!(initialized["schema"], "alder.init.v0");
         project
@@ -86,6 +83,61 @@ impl TestProject {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap()
+    }
+
+    /// Run `arguments` with a `git` that records every call, and return the
+    /// output alongside those calls in order. The shim is a real program first
+    /// on the child's PATH, so it sees exactly the Git processes the command
+    /// spawns; it then hands off to the inherited PATH, so it counts the work
+    /// without doing any.
+    fn counted(&self, arguments: &[&str]) -> (Value, Vec<String>) {
+        let shim = self.temporary.path().join("shim");
+        let calls = self.temporary.path().join("git-calls");
+        fs::create_dir_all(&shim).unwrap();
+        fs::write(
+            shim.join("git"),
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"$ALDER_GIT_CALLS\"\n\
+             PATH=\"$ALDER_INHERITED_PATH\" exec git \"$@\"\n",
+        )
+        .unwrap();
+        let mode = ProcessCommand::new("chmod")
+            .args(["+x", path(&shim.join("git"))])
+            .status()
+            .unwrap();
+        assert!(mode.success());
+        let _ = fs::remove_file(&calls);
+
+        let inherited = std::env::var("PATH").unwrap();
+        let output = self
+            .command()
+            .args(arguments)
+            .arg("--json")
+            .env("PATH", format!("{}:{inherited}", path(&shim)))
+            .env("ALDER_INHERITED_PATH", &inherited)
+            .env("ALDER_GIT_CALLS", &calls)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let recorded = fs::read_to_string(&calls)
+            .unwrap_or_default()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect();
+        (serde_json::from_slice(&output.stdout).unwrap(), recorded)
+    }
+
+    /// Discard the record cache, so the next read has to decode event bodies
+    /// again. It is derived data, so nothing else changes.
+    fn forget_cached_records(&self) {
+        let cache = self.work.join(".alder/cache");
+        assert!(cache.is_dir(), "a read should have written {cache:?}");
+        fs::remove_dir_all(cache).unwrap();
     }
 
     fn config(&self, observers: Value) {
@@ -404,7 +456,7 @@ fn unavailable_remote_is_not_replaced_by_local_git_or_sqlite_state() {
     let commit = format!("{revision}^{{commit}}");
     git(&project.work, &["cat-file", "-e", &commit]);
 
-    let unavailable = project._temporary.path().join("unavailable.git");
+    let unavailable = project.temporary.path().join("unavailable.git");
     git(
         &project.work,
         &["remote", "set-url", "origin", path(&unavailable)],
@@ -1177,4 +1229,82 @@ fn refresh_reports_change_without_counting_metadata_churn() {
             .contains("changed since the previous refresh")
     );
     assert_eq!(project.success(&["refresh"])["changed"], false);
+}
+
+/// The Git subcommand of each recorded call, which is what a cost assertion
+/// is about: the revisions in the arguments differ between two logs, the
+/// shape of the work does not.
+fn subcommands(calls: &[String]) -> Vec<&str> {
+    calls
+        .iter()
+        .map(|call| call.split_whitespace().next().unwrap_or_default())
+        .collect()
+}
+
+#[test]
+fn a_read_costs_the_same_few_git_processes_however_long_the_log_is() {
+    let project = TestProject::new();
+    for index in 0..2 {
+        project.success(&["work", "add", "--title", &format!("Short {index}")]);
+    }
+    project.forget_cached_records();
+    let (short, short_calls) = project.counted(&["status"]);
+
+    for index in 0..24 {
+        project.success(&["work", "add", "--title", &format!("Long {index}")]);
+    }
+    project.forget_cached_records();
+    let (long, long_calls) = project.counted(&["status"]);
+
+    // Twelve times the events, read the same way.
+    assert!(long["head"].as_u64().unwrap() > short["head"].as_u64().unwrap() * 10);
+    assert_eq!(subcommands(&short_calls), subcommands(&long_calls));
+    assert!(
+        long_calls.len() <= 5,
+        "a read should cost at most five Git processes, not {long_calls:?}"
+    );
+    // One batch carries every event body, and nothing reads them one at a time.
+    assert_eq!(
+        long_calls
+            .iter()
+            .filter(|call| call.starts_with("cat-file --batch"))
+            .count(),
+        1,
+        "{long_calls:?}"
+    );
+    assert!(
+        !long_calls.iter().any(|call| call.starts_with("show")),
+        "{long_calls:?}"
+    );
+}
+
+#[test]
+fn an_unchanged_head_reads_no_event_bodies() {
+    let project = TestProject::new();
+    project.success(&["work", "add", "--title", "Cached"]);
+    let (first, first_calls) = project.counted(&["status"]);
+    assert!(first_calls.iter().any(|call| call.starts_with("cat-file")));
+
+    // The revision has not moved, so the recorded records still describe it
+    // and no object is touched to prove that.
+    let (repeated, repeated_calls) = project.counted(&["status"]);
+    assert_eq!(repeated["head"], first["head"]);
+    assert_eq!(repeated["revision"], first["revision"]);
+    assert!(
+        !repeated_calls
+            .iter()
+            .any(|call| call.starts_with("cat-file") || call.starts_with("ls-tree")),
+        "{repeated_calls:?}"
+    );
+
+    // A moved head is a different revision, so the bodies are read again
+    // rather than the stale ones being served.
+    project.success(&["work", "add", "--title", "Moved"]);
+    let (moved, moved_calls) = project.counted(&["status"]);
+    assert_ne!(moved["revision"], first["revision"]);
+    assert_eq!(
+        moved["head"].as_u64().unwrap(),
+        first["head"].as_u64().unwrap() + 1
+    );
+    assert!(moved_calls.iter().any(|call| call.starts_with("cat-file")));
 }

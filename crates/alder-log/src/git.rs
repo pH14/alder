@@ -735,6 +735,78 @@ mod tests {
         assert!(serde_json::from_value::<Record>(malformed).is_err());
     }
 
+    fn paths(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("events/{index}.json"))
+            .collect()
+    }
+
+    #[test]
+    fn a_batch_response_is_split_by_the_size_its_header_declares() {
+        // A record body contains newlines, so only the declared size can say
+        // where it ends.
+        let mut stdout = b"aaa blob 4\n{\n}\n\n".to_vec();
+        stdout.extend_from_slice(b"bbb blob 2\n{}\n");
+        assert_eq!(
+            parse_batch(&stdout, &paths(2)).unwrap(),
+            [b"{\n}\n".to_vec(), b"{}".to_vec()]
+        );
+        assert!(parse_batch(b"", &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_batch_response_names_the_record_it_failed_on() {
+        let unreadable = |stdout: &[u8]| match parse_batch(stdout, &paths(1)) {
+            Err(LogError::InvalidLog { message }) => message,
+            other => panic!("expected an invalid log, got {other:?}"),
+        };
+        // Git reports an object it does not have, and answers for other kinds
+        // of object than the blobs a record has to be.
+        assert!(unreadable(b"aaa missing\n").contains("events/0.json"));
+        assert!(unreadable(b"aaa tree 4\n1234\n").contains("events/0.json"));
+        // A stream that stops early is not silently short.
+        assert!(unreadable(b"").contains("events/0.json"));
+        assert!(unreadable(b"aaa blob 9\n{}\n").contains("events/0.json"));
+        // Two headers, one body: the second record has nothing behind it.
+        let mut stdout = b"aaa blob 2\n{}\n".to_vec();
+        stdout.extend_from_slice(b"bbb blob 2\n");
+        assert!(matches!(
+            parse_batch(&stdout, &paths(2)),
+            Err(LogError::InvalidLog { .. })
+        ));
+    }
+
+    #[test]
+    fn only_blob_headers_carry_a_size() {
+        assert_eq!(blob_size("aaa blob 12"), Some(12));
+        assert_eq!(blob_size("aaa blob 0"), Some(0));
+        assert_eq!(blob_size("aaa missing"), None);
+        assert_eq!(blob_size("aaa tree 12"), None);
+        assert_eq!(blob_size("aaa blob twelve"), None);
+        assert_eq!(blob_size("aaa blob"), None);
+        assert_eq!(blob_size(""), None);
+    }
+
+    #[test]
+    fn two_logs_in_one_repository_get_separate_anchor_refs() {
+        let anchor =
+            |remote: &str, reference: &str| GitLog::new("/repository", remote, reference).anchor();
+        assert_ne!(
+            anchor("origin", "refs/heads/log"),
+            anchor("origin", "refs/heads/other")
+        );
+        assert_ne!(
+            anchor("origin", "refs/heads/log"),
+            anchor("upstream", "refs/heads/log")
+        );
+        // The separator keeps a split of the same characters distinct.
+        assert_ne!(anchor("ab", "c"), anchor("a", "bc"));
+        assert_eq!(
+            anchor("origin", "refs/heads/log"),
+            anchor("origin", "refs/heads/log")
+        );
+    }
+
     #[test]
     fn only_full_object_ids_are_accepted_as_git_revisions() {
         assert!(is_object_id(&"a".repeat(40)));
