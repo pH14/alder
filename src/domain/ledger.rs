@@ -15,6 +15,8 @@ use super::{
     WorkDefinition, WorkOperation, WorkState,
 };
 
+const ID_ALLOCATION_ATTEMPTS: usize = 16;
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub head: Head,
@@ -59,7 +61,7 @@ impl<S: Store> Ledger<S> {
         payload: EventPayload,
     ) -> Result<AppendResult> {
         let draft = self.draft(payload);
-        let candidate = draft.materialize(snapshot.head.seq + 1);
+        let candidate = draft.materialize(snapshot.head.seq.saturating_add(1));
         let mut state = snapshot.state.clone();
         state.apply(&candidate)?;
         state.validate_prefix(&self.prefix)?;
@@ -90,7 +92,7 @@ impl<S: Store> Ledger<S> {
         checks: Vec<super::CheckDefinition>,
     ) -> Result<(AppendResult, String)> {
         let snapshot = self.snapshot()?;
-        let id = self.new_work_id(&snapshot.state);
+        let id = self.new_work_id(&snapshot.state)?;
         let operation = WorkOperation::Add {
             work: WorkDefinition {
                 id: id.clone(),
@@ -126,14 +128,7 @@ impl<S: Store> Ledger<S> {
             .handoffs
             .get(handoff_id)
             .ok_or_else(|| AlderError::not_found("handoff", handoff_id))?;
-        if handoff.state != super::HandoffState::Submitted {
-            return Err(AlderError::with_context(
-                "invalid_transition",
-                format!("handoff `{handoff_id}` is already integrated"),
-                json!({"handoff_id": handoff_id, "work_id": handoff.work_id}),
-            ));
-        }
-        let id = self.new_work_id(&snapshot.state);
+        let id = self.new_work_id(&snapshot.state)?;
         let work = WorkDefinition {
             id: id.clone(),
             title: title.unwrap_or_else(|| handoff.title.clone()),
@@ -159,7 +154,7 @@ impl<S: Store> Ledger<S> {
         note: Option<String>,
     ) -> Result<(AppendResult, String)> {
         let initial = self.snapshot()?;
-        let id = self.new_handoff_id(&initial.state);
+        let id = self.new_handoff_id(&initial.state)?;
         let draft = self.draft(EventPayload::HandoffSubmitted {
             handoff: HandoffDefinition {
                 id: id.clone(),
@@ -170,7 +165,7 @@ impl<S: Store> Ledger<S> {
         });
         let mut snapshot = initial;
         for _ in 0..16 {
-            let candidate = draft.materialize(snapshot.head.seq + 1);
+            let candidate = draft.materialize(snapshot.head.seq.saturating_add(1));
             let mut state = snapshot.state.clone();
             state.apply(&candidate)?;
             match self.store.append(&snapshot.head, &draft) {
@@ -240,7 +235,7 @@ impl<S: Store> Ledger<S> {
             .values()
             .filter(|attempt| attempt.work_id == work_id)
             .count()
-            + 1;
+            .saturating_add(1);
         let id = format!("{work_id}-attempt-{ordinal}");
         let result = self.append_payload(
             &snapshot,
@@ -368,7 +363,7 @@ impl<S: Store> Ledger<S> {
             .values()
             .filter(|question| question.work_id == work_id)
             .count()
-            + 1;
+            .saturating_add(1);
         let id = format!("{work_id}-question-{ordinal}");
         let result = self.append_payload(
             &snapshot,
@@ -404,24 +399,26 @@ impl<S: Store> Ledger<S> {
         }
     }
 
-    fn new_work_id(&self, state: &ProjectState) -> String {
-        loop {
+    fn new_work_id(&self, state: &ProjectState) -> Result<String> {
+        for _ in 0..ID_ALLOCATION_ATTEMPTS {
             let token = random_token();
             let id = format!("{}-{token}", self.prefix);
             if !state.work.contains_key(&id) {
-                return id;
+                return Ok(id);
             }
         }
+        Err(id_allocation_error("work"))
     }
 
-    fn new_handoff_id(&self, state: &ProjectState) -> String {
-        loop {
+    fn new_handoff_id(&self, state: &ProjectState) -> Result<String> {
+        for _ in 0..ID_ALLOCATION_ATTEMPTS {
             let token = random_token();
             let id = format!("{}-handoff-{token}", self.prefix);
             if !state.handoffs.contains_key(&id) {
-                return id;
+                return Ok(id);
             }
         }
+        Err(id_allocation_error("handoff"))
     }
 
     pub fn allocate_change(
@@ -431,17 +428,34 @@ impl<S: Store> Ledger<S> {
         mode: super::ChangeMode,
     ) -> Result<PreparedChange> {
         let mut allocated = Vec::new();
-        super::prepare_change(&snapshot.state, document, mode, |_, _| {
-            loop {
+        for _ in &document.add {
+            let mut candidate = None;
+            for _ in 0..ID_ALLOCATION_ATTEMPTS {
                 let token = random_token();
                 let id = format!("{}-{token}", self.prefix);
-                if !snapshot.state.work.contains_key(&id) && !allocated.contains(&id) {
-                    allocated.push(id.clone());
-                    break id;
+                if work_id_available(&snapshot.state, &allocated, &id) {
+                    candidate = Some(id);
+                    break;
                 }
             }
+            allocated.push(candidate.ok_or_else(|| id_allocation_error("work"))?);
+        }
+        super::prepare_change(&snapshot.state, document, mode, |index, _| {
+            allocated[index].clone()
         })
     }
+}
+
+fn id_allocation_error(kind: &str) -> AlderError {
+    AlderError::with_context(
+        "id_allocation_failed",
+        format!("could not allocate a unique {kind} ID"),
+        json!({"kind": kind, "attempts": ID_ALLOCATION_ATTEMPTS}),
+    )
+}
+
+fn work_id_available(state: &ProjectState, allocated: &[String], id: &str) -> bool {
+    !state.work.contains_key(id) && !allocated.iter().any(|candidate| candidate == id)
 }
 
 fn random_token() -> String {
@@ -456,11 +470,75 @@ fn random_token() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::domain::{
         ChangeMode, CheckDefinition, CheckStatus, EditWorkInput, GraphChangeDocument,
     };
-    use crate::store::MemoryStore;
+    use crate::store::{AppendResult, MemoryStore, Store};
+
+    #[derive(Debug, Clone, Copy)]
+    enum ConflictBehavior {
+        Once,
+        CommitThenReport,
+        Always,
+        OtherError,
+    }
+
+    #[derive(Debug)]
+    struct ConflictStore {
+        inner: MemoryStore,
+        behavior: ConflictBehavior,
+        append_calls: Mutex<usize>,
+    }
+
+    impl ConflictStore {
+        fn new(behavior: ConflictBehavior) -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                behavior,
+                append_calls: Mutex::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            *self.append_calls.lock().unwrap()
+        }
+
+        fn conflict() -> AlderError {
+            AlderError::with_context("head_conflict", "simulated conflict", json!({}))
+        }
+    }
+
+    impl Store for ConflictStore {
+        fn current_head(&self) -> Result<Head> {
+            self.inner.current_head()
+        }
+
+        fn read_events(&self, head: &Head) -> Result<Vec<Event>> {
+            self.inner.read_events(head)
+        }
+
+        fn append(&self, expected: &Head, draft: &EventDraft) -> Result<AppendResult> {
+            let mut calls = self.append_calls.lock().unwrap();
+            *calls += 1;
+            let call = *calls;
+            drop(calls);
+            match (self.behavior, call) {
+                (ConflictBehavior::Once, 1) => Err(Self::conflict()),
+                (ConflictBehavior::CommitThenReport, 1) => {
+                    self.inner.append(expected, draft)?;
+                    Err(Self::conflict())
+                }
+                (ConflictBehavior::Always, _) => Err(Self::conflict()),
+                (ConflictBehavior::OtherError, _) => {
+                    Err(AlderError::new("store_unavailable", "simulated outage"))
+                }
+                _ => self.inner.append(expected, draft),
+            }
+        }
+    }
 
     #[test]
     fn attempts_consume_ordinals_and_late_updates_are_rejected() {
@@ -644,5 +722,152 @@ mod tests {
             EventPayload::WorkFinished { external, .. } => assert!(*external),
             _ => panic!("expected external work finish"),
         }
+    }
+
+    #[test]
+    fn starts_report_every_unmet_dependency_and_questions_are_per_work() {
+        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
+        let (_, prerequisite) = ledger
+            .add_work("prerequisite".to_owned(), None, 0, vec![], vec![])
+            .unwrap();
+        let (_, dependent) = ledger
+            .add_work(
+                "dependent".to_owned(),
+                None,
+                0,
+                vec![prerequisite.clone()],
+                vec![],
+            )
+            .unwrap();
+
+        let error = ledger.start(&dependent, BTreeMap::new()).unwrap_err();
+        assert_eq!(error.code, "work_not_ready");
+        assert_eq!(
+            error.context["unmet_dependencies"],
+            json!([prerequisite.clone()])
+        );
+
+        let (_, first) = ledger.ask(&dependent, "first?".to_owned()).unwrap();
+        let (_, second) = ledger.ask(&dependent, "second?".to_owned()).unwrap();
+        let (_, other) = ledger.ask(&prerequisite, "other?".to_owned()).unwrap();
+        assert_eq!(first, format!("{dependent}-question-1"));
+        assert_eq!(second, format!("{dependent}-question-2"));
+        assert_eq!(other, format!("{prerequisite}-question-1"));
+        assert_eq!(
+            ledger
+                .ask("hm-missing", "missing?".to_owned())
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+    }
+
+    #[test]
+    fn handoff_submission_retries_only_head_conflicts_and_recovers_ambiguity() {
+        let retry = Ledger::new(
+            ConflictStore::new(ConflictBehavior::Once),
+            "hm",
+            "side-channel",
+        );
+        let (result, id) = retry
+            .add_handoff(
+                "candidate".to_owned(),
+                "branch:topic".to_owned(),
+                Some("ready".to_owned()),
+            )
+            .unwrap();
+        assert_eq!(retry.store().calls(), 2);
+        assert_eq!(result.head.seq, 1);
+        assert!(id.starts_with("hm-handoff-"));
+        assert_eq!(id.len(), "hm-handoff-".len() + 6);
+        assert_eq!(result.event.actor, "side-channel");
+        assert_eq!(result.event.schema, "alder.event.v0");
+
+        let ambiguous = Ledger::new(
+            ConflictStore::new(ConflictBehavior::CommitThenReport),
+            "hm",
+            "side-channel",
+        );
+        let (result, id) = ambiguous
+            .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
+            .unwrap();
+        assert_eq!(ambiguous.store().calls(), 1);
+        assert_eq!(result.event.id, ambiguous.snapshot().unwrap().events[0].id);
+        assert_eq!(
+            ambiguous.snapshot().unwrap().state.handoffs[&id].artifact_ref,
+            "branch:topic"
+        );
+
+        let unavailable = Ledger::new(
+            ConflictStore::new(ConflictBehavior::OtherError),
+            "hm",
+            "side-channel",
+        );
+        assert_eq!(
+            unavailable
+                .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
+                .unwrap_err()
+                .code,
+            "store_unavailable"
+        );
+
+        let exhausted = Ledger::new(
+            ConflictStore::new(ConflictBehavior::Always),
+            "hm",
+            "side-channel",
+        );
+        let error = exhausted
+            .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
+            .unwrap_err();
+        assert_eq!(error.code, "head_conflict");
+        assert_eq!(exhausted.store().calls(), 16);
+    }
+
+    #[test]
+    fn integration_uses_handoff_defaults_and_is_single_use() {
+        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
+        let (_, handoff) = ledger
+            .add_handoff(
+                "candidate".to_owned(),
+                "branch:topic".to_owned(),
+                Some("ready".to_owned()),
+            )
+            .unwrap();
+        let (_, work) = ledger
+            .integrate_handoff(&handoff, None, None, 7, vec![], vec![])
+            .unwrap();
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.state.work[&work].title, "candidate");
+        assert_eq!(
+            snapshot.state.work[&work].spec.as_deref(),
+            Some("branch:topic")
+        );
+        assert_eq!(snapshot.state.work[&work].priority, 7);
+
+        let error = ledger
+            .integrate_handoff(
+                &handoff,
+                Some("replacement".to_owned()),
+                Some("new spec".to_owned()),
+                0,
+                vec![],
+                vec![],
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_transition");
+    }
+
+    #[test]
+    fn change_allocation_rejects_both_persisted_and_batch_collisions() {
+        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
+        let (_, persisted) = ledger
+            .add_work("persisted".to_owned(), None, 0, vec![], vec![])
+            .unwrap();
+        let snapshot = ledger.snapshot().unwrap();
+        let allocated = vec!["hm-batch".to_owned()];
+
+        assert!(!work_id_available(&snapshot.state, &allocated, &persisted));
+        assert!(!work_id_available(&snapshot.state, &allocated, "hm-batch"));
+        assert!(work_id_available(&snapshot.state, &allocated, "hm-unused"));
     }
 }

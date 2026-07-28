@@ -175,7 +175,7 @@ impl Projection {
         }
         let connection = Connection::open_with_flags(
             &self.path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            OpenFlags::SQLITE_OPEN_READ_ONLY.union(OpenFlags::SQLITE_OPEN_NO_MUTEX),
         )?;
         let mut statement = connection.prepare(sql)?;
         if !statement.readonly() {
@@ -650,11 +650,19 @@ fn upsert_run(transaction: &Transaction<'_>, run: &ObservationRun) -> Result<()>
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use chrono::Utc;
     use tempfile::TempDir;
 
     use super::*;
-    use crate::domain::{EventPayload, HandoffDefinition};
+    use crate::{
+        domain::{
+            CheckDefinition, CheckStatus, CheckUpdate, EventPayload, HandoffDefinition, Ledger,
+            WorkState,
+        },
+        store::MemoryStore,
+    };
 
     #[test]
     fn rebuild_preserves_observations() {
@@ -706,5 +714,208 @@ mod tests {
             )
             .unwrap();
         assert_eq!(projection.observations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn projection_round_trips_the_complete_fold_and_observation_state() {
+        let ledger = Ledger::new(MemoryStore::new(), "hm", "tester");
+        let (_, work_id) = ledger
+            .add_work(
+                "Build".to_owned(),
+                Some("Specification".to_owned()),
+                42,
+                Vec::new(),
+                vec![CheckDefinition {
+                    key: "test".to_owned(),
+                    description: "tests pass".to_owned(),
+                }],
+            )
+            .unwrap();
+        let (_, attempt_id) = ledger.start(&work_id, BTreeMap::new()).unwrap();
+        ledger
+            .bind_attempt(&attempt_id, "tmux:one".to_owned(), BTreeMap::new())
+            .unwrap();
+        ledger
+            .update_attempt(
+                &attempt_id,
+                BTreeMap::from([("engine".to_owned(), json!("opus"))]),
+                Some("working".to_owned()),
+                vec![CheckUpdate {
+                    key: "test".to_owned(),
+                    status: CheckStatus::Satisfied,
+                    evidence: "CI 42".to_owned(),
+                }],
+            )
+            .unwrap();
+        let (_, question_id) = ledger.ask(&work_id, "Ship?".to_owned()).unwrap();
+        ledger.answer(&question_id, "Yes".to_owned()).unwrap();
+        let snapshot = ledger.snapshot().unwrap();
+
+        let temporary = TempDir::new().unwrap();
+        let projection = Projection::new(temporary.path().join("state.db"));
+        projection
+            .rebuild(&snapshot.head, &snapshot.events, &snapshot.state)
+            .unwrap();
+
+        let verified = projection.verify(&snapshot.head, &snapshot.state).unwrap();
+        assert_eq!(verified["valid"], true);
+        assert_eq!(verified["head"], 6);
+        assert_eq!(verified["work_rows"], 1);
+        assert_eq!(verified["attempt_rows"], 1);
+
+        let event_rows = projection
+            .raw_query("SELECT seq, type FROM events ORDER BY seq")
+            .unwrap();
+        assert_eq!(event_rows["rows"].as_array().unwrap().len(), 6);
+        assert_eq!(event_rows["rows"][0]["type"], "work.changed");
+        assert_eq!(event_rows["rows"][5]["type"], "question.answered");
+        let question_rows = projection
+            .raw_query(
+                "SELECT q.answer, count(a.seq) AS answers
+                 FROM questions q JOIN question_answers a ON a.question_id = q.id
+                 GROUP BY q.id",
+            )
+            .unwrap();
+        assert_eq!(question_rows["rows"][0]["answer"], "Yes");
+        assert_eq!(question_rows["rows"][0]["answers"], 1);
+
+        let handle = ObservedHandle {
+            handle: "tmux:one".to_owned(),
+            attempt_id: Some(attempt_id),
+            status: ObservationStatus::Absent,
+            metadata: json!({"state": "gone"}),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            detail: Some("not found".to_owned()),
+        };
+        let run = ObservationRun {
+            kind: "tmux".to_owned(),
+            success: false,
+            executions: 4,
+            duration_ms: 20,
+            stderr: "failed".to_owned(),
+            validation_error: Some("bad output".to_owned()),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            object_count: 1,
+        };
+        replace_observation_kind(&projection, "tmux", &[handle], &run).unwrap();
+        let observed = projection.observations().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].status, ObservationStatus::Absent);
+        assert_eq!(observed[0].metadata, json!({"state": "gone"}));
+        let runs = projection.observation_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].success);
+        assert_eq!(runs[0].executions, 4);
+        assert_eq!(
+            projection.observation_run("tmux").unwrap().unwrap().stderr,
+            "failed"
+        );
+        assert!(projection.observation_run("other").unwrap().is_none());
+
+        assert!(
+            projection
+                .raw_query("DELETE FROM work_current")
+                .unwrap_err()
+                .code
+                == "read_only_query"
+        );
+    }
+
+    #[test]
+    fn verification_detects_each_projection_mismatch() {
+        let ledger = Ledger::new(MemoryStore::new(), "hm", "tester");
+        let (_, work_id) = ledger
+            .add_work("Build".to_owned(), None, 0, Vec::new(), Vec::new())
+            .unwrap();
+        ledger.start(&work_id, BTreeMap::new()).unwrap();
+        let snapshot = ledger.snapshot().unwrap();
+        let temporary = TempDir::new().unwrap();
+        let projection = Projection::new(temporary.path().join("state.db"));
+
+        projection
+            .rebuild(&snapshot.head, &snapshot.events, &snapshot.state)
+            .unwrap();
+        let wrong_head = Head {
+            revision: Some("other".to_owned()),
+            seq: snapshot.head.seq,
+        };
+        assert_eq!(
+            projection
+                .verify(&wrong_head, &snapshot.state)
+                .unwrap_err()
+                .code,
+            "projection_mismatch"
+        );
+
+        projection
+            .connection()
+            .unwrap()
+            .execute("DELETE FROM work_current", [])
+            .unwrap();
+        assert_eq!(
+            projection
+                .verify(&snapshot.head, &snapshot.state)
+                .unwrap_err()
+                .code,
+            "projection_mismatch"
+        );
+
+        projection
+            .rebuild(&snapshot.head, &snapshot.events, &snapshot.state)
+            .unwrap();
+        projection
+            .connection()
+            .unwrap()
+            .execute("DELETE FROM attempts", [])
+            .unwrap();
+        assert_eq!(
+            projection
+                .verify(&snapshot.head, &snapshot.state)
+                .unwrap_err()
+                .code,
+            "projection_mismatch"
+        );
+    }
+
+    #[test]
+    fn projection_helpers_cover_empty_corrupt_and_scalar_values() {
+        let temporary = TempDir::new().unwrap();
+        let projection = Projection::new(temporary.path().join("state.db"));
+        let connection = projection.connection().unwrap();
+        assert_eq!(represented_head(&connection).unwrap(), None);
+        connection
+            .execute(
+                "INSERT INTO projection_meta(key, value) VALUES ('revision', 'one')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            represented_head(&connection).unwrap_err().code,
+            "database_error"
+        );
+
+        assert_eq!(enum_json(WorkState::Open).unwrap(), "open");
+        assert_eq!(parse_status("present"), ObservationStatus::Present);
+        assert_eq!(parse_status("absent"), ObservationStatus::Absent);
+        assert_eq!(parse_status("anything"), ObservationStatus::Unknown);
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0x00, 0x0f, 0xff]), "000fff");
+
+        let missing = Projection::new(temporary.path().join("missing.db"));
+        assert_eq!(
+            missing.raw_query("SELECT 1").unwrap_err().code,
+            "database_missing"
+        );
+    }
+
+    #[test]
+    fn sync_rebuilds_only_when_the_represented_head_changes() {
+        let temporary = TempDir::new().unwrap();
+        let projection = Projection::new(temporary.path().join("state.db"));
+        let head = Head::empty();
+        let state = ProjectState::default();
+
+        assert!(projection.sync(&head, &[], &state).unwrap());
+        assert!(!projection.sync(&head, &[], &state).unwrap());
     }
 }

@@ -122,7 +122,7 @@ impl GitStore {
         )?;
         let mut paths: Vec<_> = String::from_utf8_lossy(&output.stdout)
             .lines()
-            .filter(|path| path.starts_with("events/") && path.ends_with(".json"))
+            .filter(|path| is_event_path(path))
             .map(ToOwned::to_owned)
             .collect();
         paths.sort();
@@ -330,6 +330,10 @@ impl Store for GitStore {
             }),
         ))
     }
+}
+
+fn is_event_path(path: &str) -> bool {
+    path.starts_with("events/") && path.ends_with(".json")
 }
 
 fn validate_events(events: &[Event]) -> Result<()> {
@@ -616,5 +620,61 @@ mod tests {
         assert_eq!(remote_head, winning_append.head);
         assert_eq!(remote_events.len(), 1);
         assert_eq!(remote_events[0].id, winning_append.event.id);
+    }
+
+    #[test]
+    fn event_path_log_and_error_helpers_enforce_exact_boundaries() {
+        assert!(is_event_path("events/00000000000000000001-id.json"));
+        assert!(!is_event_path("other/00000000000000000001-id.json"));
+        assert!(!is_event_path("events/00000000000000000001-id.txt"));
+        assert!(!is_event_path("other/id.txt"));
+
+        let one = draft("one").materialize(1);
+        let two = draft("two").materialize(2);
+        validate_events(&[one.clone(), two.clone()]).unwrap();
+
+        let mut wrong_sequence = two.clone();
+        wrong_sequence.seq = 3;
+        assert_eq!(
+            validate_events(&[one.clone(), wrong_sequence])
+                .unwrap_err()
+                .code,
+            "invalid_log"
+        );
+
+        let mut duplicate = two;
+        duplicate.id = one.id.clone();
+        assert_eq!(
+            validate_events(&[one, duplicate]).unwrap_err().code,
+            "invalid_log"
+        );
+
+        assert_eq!(bounded(b"short"), "short");
+        assert_eq!(bounded(&vec![b'a'; 4096]).chars().count(), 4096);
+        let long = bounded(&vec![b'a'; 4097]);
+        assert_eq!(long.chars().count(), 4097);
+        assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn read_events_rejects_each_invalid_head_shape() {
+        let (_temporary, store) = setup();
+        let error = store
+            .read_events(&Head {
+                revision: None,
+                seq: 1,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_head");
+
+        let empty = store.current_head().unwrap();
+        let first = store.append(&empty, &draft("one")).unwrap();
+        let error = store
+            .read_events(&Head {
+                revision: first.head.revision,
+                seq: 0,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_head");
     }
 }

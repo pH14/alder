@@ -109,4 +109,40 @@ mod tests {
         assert_eq!(first.event.seq, second.event.seq);
         assert_eq!(store.current_head().unwrap().seq, 1);
     }
+
+    #[test]
+    fn heads_and_prefix_reads_preserve_exact_boundaries() {
+        let store = MemoryStore::new();
+        assert_eq!(store.current_head().unwrap(), Head::empty());
+
+        let empty = store.current_head().unwrap();
+        let first = store.append(&empty, &draft("one")).unwrap();
+        let second = store.append(&first.head, &draft("two")).unwrap();
+
+        assert_eq!(
+            first.head,
+            Head {
+                revision: Some("memory-1".to_owned()),
+                seq: 1,
+            }
+        );
+        assert_eq!(
+            second.head,
+            Head {
+                revision: Some("memory-2".to_owned()),
+                seq: 2,
+            }
+        );
+        assert!(store.read_events(&Head::empty()).unwrap().is_empty());
+        assert_eq!(store.read_events(&first.head).unwrap().len(), 1);
+        assert_eq!(store.read_events(&second.head).unwrap().len(), 2);
+
+        let error = store
+            .read_events(&Head {
+                revision: Some("memory-3".to_owned()),
+                seq: 3,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_head");
+    }
 }

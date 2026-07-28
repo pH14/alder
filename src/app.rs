@@ -468,11 +468,6 @@ fn edit_attempt(context: &Context, args: &EditAttemptArgs) -> Result<Output> {
             "edit attempt requires a handle, metadata, note, check, or end outcome",
         ));
     }
-    if args.evidence.is_some() && args.check.is_empty() {
-        return Err(AlderError::validation(
-            "--evidence requires at least one --check",
-        ));
-    }
     let result =
         context
             .ledger
@@ -729,7 +724,7 @@ fn overlay_state(
         &document,
         ChangeMode::Hypothetical,
         |_, local| {
-            next_number += 1;
+            next_number = next_number.saturating_add(1);
             format!(
                 "${}",
                 local
@@ -741,7 +736,7 @@ fn overlay_state(
     let mut state = context.snapshot.state.clone();
     let event = Event {
         id: "hypothetical".to_owned(),
-        seq: context.snapshot.head.seq + 1,
+        seq: context.snapshot.head.seq.saturating_add(1),
         at: chrono::Utc::now(),
         actor: "hypothetical".to_owned(),
         payload: EventPayload::WorkChanged {
@@ -1295,5 +1290,215 @@ impl From<NonSuccessOutcome> for AttemptOutcome {
             NonSuccessOutcome::Lost => Self::Lost,
             NonSuccessOutcome::NotStarted => Self::NotStarted,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blank_add_work_args() -> AddWorkArgs {
+        AddWorkArgs {
+            from: None,
+            from_handoff: None,
+            title: None,
+            spec: None,
+            priority: 0,
+            requires: Vec::new(),
+            check: Vec::new(),
+        }
+    }
+
+    fn blank_edit_work_args() -> EditWorkArgs {
+        EditWorkArgs {
+            work: None,
+            from: None,
+            title: None,
+            spec: None,
+            clear_spec: false,
+            priority: None,
+            add_requires: Vec::new(),
+            remove_requires: Vec::new(),
+            add_check: Vec::new(),
+            remove_check: Vec::new(),
+            block: false,
+            unblock: false,
+            why: None,
+        }
+    }
+
+    #[test]
+    fn bulk_add_rejects_every_direct_work_field() {
+        assert!(ensure_no_direct_work_fields(&blank_add_work_args()).is_ok());
+
+        let mut args = blank_add_work_args();
+        args.from_handoff = Some("hm-handoff-1".to_owned());
+        assert!(ensure_no_direct_work_fields(&args).is_err());
+
+        let mut args = blank_add_work_args();
+        args.title = Some("title".to_owned());
+        assert!(ensure_no_direct_work_fields(&args).is_err());
+
+        let mut args = blank_add_work_args();
+        args.spec = Some("spec".to_owned());
+        assert!(ensure_no_direct_work_fields(&args).is_err());
+
+        let mut args = blank_add_work_args();
+        args.priority = 1;
+        assert!(ensure_no_direct_work_fields(&args).is_err());
+
+        let mut args = blank_add_work_args();
+        args.requires.push("hm-1".to_owned());
+        assert!(ensure_no_direct_work_fields(&args).is_err());
+
+        let mut args = blank_add_work_args();
+        args.check.push("test:passes".to_owned());
+        assert!(ensure_no_direct_work_fields(&args).is_err());
+    }
+
+    #[test]
+    fn edit_field_detection_covers_every_field() {
+        let blank = blank_edit_work_args();
+        assert!(!has_actual_edit_fields(&blank));
+        assert!(!has_single_edit_fields(&blank));
+
+        let mut why_only = blank_edit_work_args();
+        why_only.why = Some("reason".to_owned());
+        assert!(!has_actual_edit_fields(&why_only));
+        assert!(has_single_edit_fields(&why_only));
+
+        let mut cases = Vec::new();
+
+        let mut args = blank_edit_work_args();
+        args.title = Some("title".to_owned());
+        cases.push(args);
+
+        let mut args = blank_edit_work_args();
+        args.spec = Some("spec".to_owned());
+        cases.push(args);
+
+        let mut args = blank_edit_work_args();
+        args.clear_spec = true;
+        cases.push(args);
+
+        let mut args = blank_edit_work_args();
+        args.priority = Some(1);
+        cases.push(args);
+
+        let mut args = blank_edit_work_args();
+        args.add_requires.push("hm-1".to_owned());
+        cases.push(args);
+
+        let mut args = blank_edit_work_args();
+        args.remove_requires.push("hm-1".to_owned());
+        cases.push(args);
+
+        let mut args = blank_edit_work_args();
+        args.add_check.push("test:passes".to_owned());
+        cases.push(args);
+
+        let mut args = blank_edit_work_args();
+        args.remove_check.push("test".to_owned());
+        cases.push(args);
+
+        let mut args = blank_edit_work_args();
+        args.block = true;
+        cases.push(args);
+
+        let mut args = blank_edit_work_args();
+        args.unblock = true;
+        cases.push(args);
+
+        for args in cases {
+            assert!(has_actual_edit_fields(&args));
+            assert!(has_single_edit_fields(&args));
+        }
+    }
+
+    #[test]
+    fn parsers_preserve_structured_values_and_reject_ambiguous_input() {
+        let checks = parse_checks(&["test:the test passes".to_owned()]).unwrap();
+        assert_eq!(
+            checks,
+            vec![CheckDefinition {
+                key: "test".to_owned(),
+                description: "the test passes".to_owned(),
+            }]
+        );
+        assert!(parse_checks(&["test".to_owned()]).is_err());
+
+        let metadata = parse_metadata(&[
+            "count=2".to_owned(),
+            "ready=true".to_owned(),
+            "label=worker".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(metadata["count"], json!(2));
+        assert_eq!(metadata["ready"], json!(true));
+        assert_eq!(metadata["label"], json!("worker"));
+        assert!(parse_metadata(&["=value".to_owned()]).is_err());
+        assert!(parse_metadata(&["missing-separator".to_owned()]).is_err());
+        assert!(parse_metadata(&["key=1".to_owned(), "key=2".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn check_updates_cover_every_status_and_require_evidence() {
+        assert!(parse_check_updates(&[], None).unwrap().is_empty());
+        assert!(parse_check_updates(&["test=pending".to_owned()], None).is_err());
+        assert!(parse_check_updates(&["test=pending".to_owned()], Some(" ")).is_err());
+        assert!(parse_check_updates(&["malformed".to_owned()], Some("proof")).is_err());
+        assert!(parse_check_updates(&["test=unknown".to_owned()], Some("proof")).is_err());
+
+        let updates = parse_check_updates(
+            &[
+                "one=pending".to_owned(),
+                "two=satisfied".to_owned(),
+                "three=failed".to_owned(),
+            ],
+            Some("proof"),
+        )
+        .unwrap();
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[0].key, "one");
+        assert_eq!(updates[0].status, CheckStatus::Pending);
+        assert_eq!(updates[0].evidence, "proof");
+        assert_eq!(updates[1].status, CheckStatus::Satisfied);
+        assert_eq!(updates[2].status, CheckStatus::Failed);
+    }
+
+    #[test]
+    fn human_helpers_render_every_domain_outcome() {
+        let mut lines = vec!["head 1".to_owned()];
+        human_section(&mut lines, "empty", Vec::<String>::new());
+        assert_eq!(lines, vec!["head 1"]);
+        human_section(
+            &mut lines,
+            "items",
+            ["first".to_owned(), "second".to_owned()],
+        );
+        assert_eq!(lines, vec!["head 1", "", "items", "  first", "  second"]);
+
+        assert_eq!(format_outcome(AttemptOutcome::Succeeded), "succeeded");
+        assert_eq!(format_outcome(AttemptOutcome::Failed), "failed");
+        assert_eq!(format_outcome(AttemptOutcome::Cancelled), "cancelled");
+        assert_eq!(format_outcome(AttemptOutcome::Lost), "lost");
+        assert_eq!(format_outcome(AttemptOutcome::NotStarted), "not-started");
+
+        assert_eq!(
+            AttemptOutcome::from(NonSuccessOutcome::Failed),
+            AttemptOutcome::Failed
+        );
+        assert_eq!(
+            AttemptOutcome::from(NonSuccessOutcome::Cancelled),
+            AttemptOutcome::Cancelled
+        );
+        assert_eq!(
+            AttemptOutcome::from(NonSuccessOutcome::Lost),
+            AttemptOutcome::Lost
+        );
+        assert_eq!(
+            AttemptOutcome::from(NonSuccessOutcome::NotStarted),
+            AttemptOutcome::NotStarted
+        );
     }
 }

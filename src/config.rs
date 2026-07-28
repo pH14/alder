@@ -268,3 +268,107 @@ fn git_root(start: &Path) -> Result<PathBuf> {
         String::from_utf8_lossy(&output.stdout).trim(),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn valid_config() -> Config {
+        Config {
+            schema: "alder.config.v0".to_owned(),
+            prefix: "hm".to_owned(),
+            store: StoreConfig {
+                remote: "origin".to_owned(),
+                reference: "refs/heads/alder".to_owned(),
+            },
+            observers: vec![ObserverConfig {
+                observer: "tmux".to_owned(),
+                list: "printf '[]'".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn config_validation_checks_each_identity_and_observer_field() {
+        assert!(validate_config(&valid_config()).is_ok());
+
+        let mut config = valid_config();
+        config.schema = "alder.config.v1".to_owned();
+        assert!(validate_config(&config).is_err());
+
+        let mut config = valid_config();
+        config.prefix = "Not Valid".to_owned();
+        assert!(validate_config(&config).is_err());
+
+        let mut config = valid_config();
+        config.store.remote = " ".to_owned();
+        assert!(validate_config(&config).is_err());
+
+        let mut config = valid_config();
+        config.store.reference = String::new();
+        assert!(validate_config(&config).is_err());
+
+        let mut config = valid_config();
+        config.observers[0].observer = "Not Valid".to_owned();
+        assert!(validate_config(&config).is_err());
+
+        let mut config = valid_config();
+        config.observers[0].list = " ".to_owned();
+        assert!(validate_config(&config).is_err());
+
+        let mut config = valid_config();
+        config.observers.push(config.observers[0].clone());
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn name_validation_accepts_only_the_manifest_name_grammar() {
+        for valid in ["a", "hm", "tmux-2", "a1-b2"] {
+            assert!(validate_name("field", valid).is_ok(), "{valid}");
+        }
+        for invalid in ["", "-hm", "hm-", "Upper", "has space", "a_b"] {
+            assert!(validate_name("field", invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn discovery_walks_to_the_project_root_and_rejects_invalid_manifests() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("project");
+        let child = root.join("one/two");
+        fs::create_dir_all(root.join(".alder")).unwrap();
+        fs::create_dir_all(&child).unwrap();
+        let mut bytes = serde_json::to_vec_pretty(&valid_config()).unwrap();
+        bytes.push(b'\n');
+        fs::write(root.join(".alder/config.json"), bytes).unwrap();
+
+        let project = Project::discover(&child).unwrap();
+        let root = root.canonicalize().unwrap();
+        assert_eq!(project.root, root);
+        assert_eq!(project.state_db(), root.join(".alder/state.db"));
+        assert_eq!(project.config.prefix, "hm");
+        assert_eq!(project.config.store.remote, "origin");
+        assert_eq!(project.config.store.reference, "refs/heads/alder");
+
+        fs::write(root.join(".alder/config.json"), b"{}").unwrap();
+        let error = Project::discover(&child).unwrap_err();
+        assert_eq!(error.code, "config_invalid");
+    }
+
+    #[test]
+    fn initialization_does_not_treat_other_read_errors_as_a_missing_manifest() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("project");
+        fs::create_dir_all(root.join(".alder/config.json")).unwrap();
+        let output = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        let error = initialize(&root, "hm", "missing-remote", "refs/heads/alder").unwrap_err();
+        assert_eq!(error.code, "io_error");
+    }
+}

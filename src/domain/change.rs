@@ -41,7 +41,11 @@ pub struct EditWorkInput {
     pub id: String,
     #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "super::model::nullable_string_change"
+    )]
     pub spec: Option<NullableString>,
     #[serde(default)]
     pub priority: Option<i64>,
@@ -229,4 +233,176 @@ where
         operations,
         mappings,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn document(value: serde_json::Value) -> GraphChangeDocument {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn prepare(value: serde_json::Value, mode: ChangeMode) -> Result<PreparedChange> {
+        prepare_change(
+            &ProjectState::default(),
+            &document(value),
+            mode,
+            |index, _| format!("hm-{index}"),
+        )
+    }
+
+    #[test]
+    fn change_modes_enforce_their_distinct_surfaces() {
+        assert_eq!(
+            prepare(json!({}), ChangeMode::Hypothetical)
+                .unwrap_err()
+                .message,
+            "a graph change must contain at least one operation"
+        );
+        assert_eq!(
+            prepare(
+                json!({
+                    "why": "edit",
+                    "edit": [{"id": "hm-one", "title": "changed"}]
+                }),
+                ChangeMode::AddOnly,
+            )
+            .unwrap_err()
+            .message,
+            "add work --from does not accept an edit section"
+        );
+        assert_eq!(
+            prepare(json!({"add": [{"title": "new"}]}), ChangeMode::Edit)
+                .unwrap_err()
+                .message,
+            "edit work --from requires at least one edit"
+        );
+        assert_eq!(
+            prepare(
+                json!({"edit": [{"id": "hm-one", "title": "changed"}]}),
+                ChangeMode::Hypothetical,
+            )
+            .unwrap_err()
+            .message,
+            "a graph change containing edits requires `why`"
+        );
+        assert_eq!(
+            prepare(
+                json!({
+                    "why": " ",
+                    "edit": [{"id": "hm-one", "title": "changed"}]
+                }),
+                ChangeMode::Hypothetical,
+            )
+            .unwrap_err()
+            .message,
+            "a graph change containing edits requires `why`"
+        );
+    }
+
+    #[test]
+    fn local_names_and_references_are_unambiguous() {
+        for local in ["", "$reserved", "has space"] {
+            assert!(
+                prepare(
+                    json!({"add": [{"local": local, "title": "new"}]}),
+                    ChangeMode::AddOnly,
+                )
+                .is_err(),
+                "{local}"
+            );
+        }
+        assert!(
+            prepare(
+                json!({
+                    "add": [
+                        {"local": "same", "title": "one"},
+                        {"local": "same", "title": "two"}
+                    ]
+                }),
+                ChangeMode::AddOnly,
+            )
+            .is_err()
+        );
+        assert!(
+            prepare(
+                json!({
+                    "add": [{"title": "new", "requires": ["$missing"]}]
+                }),
+                ChangeMode::AddOnly,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn successful_changes_resolve_locals_and_reject_ambiguous_edits() {
+        let prepared = prepare(
+            json!({
+                "why": "split",
+                "add": [
+                    {"local": "first", "title": "first"},
+                    {"title": "second", "requires": ["$first"]}
+                ]
+            }),
+            ChangeMode::AddOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.mappings,
+            vec![
+                ("first".to_owned(), "hm-0".to_owned()),
+                ("new-2".to_owned(), "hm-1".to_owned()),
+            ]
+        );
+        match &prepared.operations[1] {
+            WorkOperation::Add { work } => {
+                assert_eq!(work.id, "hm-1");
+                assert_eq!(work.requires, vec!["hm-0"]);
+            }
+            WorkOperation::Edit { .. } => panic!("expected add"),
+        }
+
+        assert!(
+            prepare(
+                json!({
+                    "why": "duplicate",
+                    "edit": [
+                        {"id": "hm-one", "title": "one"},
+                        {"id": "hm-one", "title": "two"}
+                    ]
+                }),
+                ChangeMode::Hypothetical,
+            )
+            .is_err()
+        );
+        assert!(
+            prepare(
+                json!({
+                    "why": "contradiction",
+                    "edit": [{"id": "hm-one", "block": true, "unblock": true}]
+                }),
+                ChangeMode::Hypothetical,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn change_documents_distinguish_omitted_and_cleared_specs() {
+        let omitted = document(json!({
+            "why": "leave it",
+            "edit": [{"id": "hm-one"}]
+        }));
+        assert!(omitted.edit[0].spec.is_none());
+
+        let cleared = document(json!({
+            "why": "clear it",
+            "edit": [{"id": "hm-one", "spec": null}]
+        }));
+        assert!(matches!(cleared.edit[0].spec, Some(NullableString(None))));
+    }
 }

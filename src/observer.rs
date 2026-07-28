@@ -8,6 +8,7 @@ use std::{
 };
 
 use chrono::Utc;
+use rustix::process::{Pid, Signal, kill_process_group};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use wait_timeout::ChildExt;
@@ -181,7 +182,7 @@ fn execute_once(
             json!({"shell": "/bin/bash -o pipefail -c"}),
         )
     })?;
-    let pid = child.id() as i32;
+    let process_group = Pid::from_child(&child);
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let stdout_reader = thread::spawn(move || read_all(stdout));
@@ -189,11 +190,9 @@ fn execute_once(
     let (status, timed_out) = match child.wait_timeout(timeout)? {
         Some(status) => (status, false),
         None => {
-            // The shell is its own process-group leader. Killing the negative
-            // PID terminates the complete configured pipeline.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
+            // The shell is its own process-group leader, so terminate the
+            // complete configured pipeline rather than only the shell.
+            handle_kill_result(kill_process_group(process_group, Signal::KILL))?;
             (child.wait()?, true)
         }
     };
@@ -253,6 +252,13 @@ fn execute_once(
             },
             None,
         )),
+    }
+}
+
+fn handle_kill_result(result: rustix::io::Result<()>) -> Result<()> {
+    match result {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(error) => Err(std::io::Error::from(error).into()),
     }
 }
 
@@ -597,10 +603,54 @@ pub fn reconcile(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use tempfile::TempDir;
 
     use super::*;
-    use crate::projection::Projection;
+    use crate::{
+        domain::{Attempt, AttemptState},
+        projection::Projection,
+    };
+
+    fn attempt(id: &str, state: AttemptState, handle: Option<&str>) -> Attempt {
+        Attempt {
+            id: id.to_owned(),
+            work_id: format!("{id}-work"),
+            state,
+            outcome: None,
+            handle: handle.map(ToOwned::to_owned),
+            metadata: BTreeMap::new(),
+            note: None,
+            started_seq: 1,
+            bound_seq: handle.map(|_| 2),
+            updated_seq: 2,
+            ended_seq: (state == AttemptState::Ended).then_some(3),
+            checks: BTreeMap::new(),
+        }
+    }
+
+    fn observation(
+        handle: &str,
+        attempt_id: Option<&str>,
+        status: ObservationStatus,
+    ) -> ObservedHandle {
+        ObservedHandle {
+            handle: handle.to_owned(),
+            attempt_id: attempt_id.map(ToOwned::to_owned),
+            status,
+            metadata: json!({"source": "test"}),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            detail: None,
+        }
+    }
+
+    fn finding_kinds(findings: &[ReconcileFinding]) -> Vec<&str> {
+        findings
+            .iter()
+            .map(|finding| finding.kind.as_str())
+            .collect()
+    }
 
     #[test]
     fn retries_invalid_results_and_accepts_first_valid_snapshot() {
@@ -670,6 +720,272 @@ mod tests {
                 .executions
                 .iter()
                 .all(|execution| execution.timed_out)
+        );
+    }
+
+    #[test]
+    fn refresh_counts_bound_unbound_absent_and_unknown_handles() {
+        let temporary = TempDir::new().unwrap();
+        let projection = Projection::new(temporary.path().join("state.db"));
+        let mut state = ProjectState::default();
+        state.attempts.insert(
+            "attempt-one".to_owned(),
+            attempt("attempt-one", AttemptState::Active, Some("tmux:missing")),
+        );
+        state.attempts.insert(
+            "attempt-two".to_owned(),
+            attempt("attempt-two", AttemptState::Active, Some("nimbus:other")),
+        );
+        let success = ObserverConfig {
+            observer: "tmux".to_owned(),
+            list: "printf '[{\"value\":\"extra\"}]'".to_owned(),
+        };
+        let refreshed = refresh(&projection, &[success], &state).unwrap();
+        assert_eq!(refreshed.present, 1);
+        assert_eq!(refreshed.absent, 1);
+        assert_eq!(refreshed.unknown, 0);
+        assert_eq!(refreshed.unbound.len(), 1);
+        assert_eq!(refreshed.unbound[0].handle, "tmux:extra");
+        let handles = projection.observations().unwrap();
+        assert!(handles.iter().any(|handle| {
+            handle.handle == "tmux:missing" && handle.status == ObservationStatus::Absent
+        }));
+        assert!(!handles.iter().any(|handle| handle.handle == "nimbus:other"));
+
+        let nimbus = ObserverConfig {
+            observer: "nimbus".to_owned(),
+            list: "printf '[{\"value\":\"other\"}]'".to_owned(),
+        };
+        refresh(&projection, &[nimbus], &state).unwrap();
+        let failed = ObserverConfig {
+            observer: "tmux".to_owned(),
+            list: "exit 1".to_owned(),
+        };
+        let refreshed = refresh(&projection, &[failed], &state).unwrap();
+        assert_eq!(refreshed.present, 1);
+        assert_eq!(refreshed.absent, 0);
+        assert_eq!(refreshed.unknown, 2);
+        let handles = projection.observations().unwrap();
+        assert!(handles.iter().any(|handle| {
+            handle.handle == "nimbus:other" && handle.status == ObservationStatus::Present
+        }));
+    }
+
+    #[test]
+    fn output_validation_and_bounding_cover_exact_boundaries() {
+        assert!(validate_output(br#"[{"value":"one","metadata":{}}]"#).is_ok());
+        let stamped = validate_output(br#"[{"value":"one","attempt_id":"attempt-one"}]"#).unwrap();
+        assert_eq!(stamped[0].attempt_id.as_deref(), Some("attempt-one"));
+        for invalid in [
+            br#"not json"#.as_slice(),
+            br#"[{"value":""}]"#.as_slice(),
+            br#"[{"value":"one","metadata":[]}]"#.as_slice(),
+            br#"[{"value":"one"},{"value":"one"}]"#.as_slice(),
+            br#"[{"value":"one","attempt_id":"a"},{"value":"two","attempt_id":"a"}]"#.as_slice(),
+        ] {
+            assert!(validate_output(invalid).is_err());
+        }
+
+        assert_eq!(bounded(b"", 0), "");
+        assert_eq!(bounded(b"a", 0), "…");
+        assert_eq!(bounded(b"abc", 3), "abc");
+        assert_eq!(bounded(b"abcd", 3), "abc…");
+        assert_eq!(bounded(&[0xff, b'a'], 1), "�…");
+
+        assert!(handle_kill_result(Ok(())).is_ok());
+        assert!(handle_kill_result(Err(rustix::io::Errno::SRCH)).is_ok());
+        assert!(handle_kill_result(Err(rustix::io::Errno::PERM)).is_err());
+    }
+
+    #[test]
+    fn reconciliation_classifies_bound_attempt_states() {
+        let configured = BTreeSet::from(["tmux".to_owned()]);
+        let known = configured.clone();
+
+        let mut state = ProjectState::default();
+        state.attempts.insert(
+            "active".to_owned(),
+            attempt("active", AttemptState::Active, Some("tmux:active")),
+        );
+        assert_eq!(
+            finding_kinds(&reconcile(
+                &state,
+                &[observation(
+                    "tmux:active",
+                    Some("active"),
+                    ObservationStatus::Present
+                )],
+                &configured,
+                &known,
+            )),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            finding_kinds(&reconcile(
+                &state,
+                &[observation(
+                    "tmux:active",
+                    Some("other"),
+                    ObservationStatus::Present
+                )],
+                &configured,
+                &known,
+            )),
+            vec!["identity_mismatch"]
+        );
+        let missing = reconcile(
+            &state,
+            &[observation(
+                "tmux:active",
+                Some("active"),
+                ObservationStatus::Absent,
+            )],
+            &configured,
+            &known,
+        );
+        assert_eq!(finding_kinds(&missing), vec!["missing"]);
+        assert!(missing[0].suggested_command.is_some());
+        let unknown = reconcile(
+            &state,
+            &[observation(
+                "tmux:active",
+                Some("active"),
+                ObservationStatus::Unknown,
+            )],
+            &configured,
+            &known,
+        );
+        assert_eq!(finding_kinds(&unknown), vec!["observation_unknown"]);
+        assert!(unknown[0].suggested_command.is_none());
+        assert_eq!(
+            finding_kinds(&reconcile(&state, &[], &configured, &known)),
+            vec!["observation_unknown"]
+        );
+
+        let mut ended = ProjectState::default();
+        ended.attempts.insert(
+            "ended".to_owned(),
+            attempt("ended", AttemptState::Ended, Some("tmux:ended")),
+        );
+        assert_eq!(
+            finding_kinds(&reconcile(
+                &ended,
+                &[observation(
+                    "tmux:ended",
+                    Some("ended"),
+                    ObservationStatus::Present
+                )],
+                &configured,
+                &known,
+            )),
+            vec!["orphan"]
+        );
+        for status in [ObservationStatus::Absent, ObservationStatus::Unknown] {
+            assert!(
+                reconcile(
+                    &ended,
+                    &[observation("tmux:ended", Some("ended"), status)],
+                    &configured,
+                    &known,
+                )
+                .is_empty()
+            );
+        }
+        assert!(reconcile(&ended, &[], &configured, &known).is_empty());
+
+        assert_eq!(
+            finding_kinds(&reconcile(&state, &[], &BTreeSet::new(), &BTreeSet::new(),)),
+            vec!["unconfigured"]
+        );
+        assert!(reconcile(&ended, &[], &BTreeSet::new(), &BTreeSet::new(),).is_empty());
+    }
+
+    #[test]
+    fn reconciliation_classifies_unbound_and_unclaimed_objects() {
+        let configured = BTreeSet::from(["tmux".to_owned()]);
+        let known = configured.clone();
+        let mut state = ProjectState::default();
+        state.attempts.insert(
+            "active".to_owned(),
+            attempt("active", AttemptState::Starting, None),
+        );
+
+        let bindable = reconcile(
+            &state,
+            &[
+                observation("tmux:worker", Some("active"), ObservationStatus::Present),
+                observation("tmux:extra", None, ObservationStatus::Present),
+            ],
+            &configured,
+            &known,
+        );
+        assert_eq!(finding_kinds(&bindable), vec!["unclaimed", "bindable"]);
+        assert!(
+            bindable
+                .iter()
+                .find(|finding| finding.kind == "bindable")
+                .unwrap()
+                .suggested_command
+                .is_some()
+        );
+        assert_eq!(
+            finding_kinds(&reconcile(
+                &state,
+                &[observation(
+                    "tmux:absent",
+                    Some("active"),
+                    ObservationStatus::Absent,
+                )],
+                &configured,
+                &known,
+            )),
+            vec!["not_started"]
+        );
+
+        assert_eq!(
+            finding_kinds(&reconcile(&state, &[], &configured, &known)),
+            vec!["not_started"]
+        );
+        assert_eq!(
+            finding_kinds(&reconcile(&state, &[], &configured, &BTreeSet::new(),)),
+            vec!["unbound"]
+        );
+        assert_eq!(
+            finding_kinds(&reconcile(
+                &ProjectState::default(),
+                &[observation("tmux:extra", None, ObservationStatus::Present)],
+                &configured,
+                &known,
+            )),
+            vec!["unclaimed"]
+        );
+
+        let mut ended = ProjectState::default();
+        ended.attempts.insert(
+            "ended".to_owned(),
+            attempt("ended", AttemptState::Ended, None),
+        );
+        assert_eq!(
+            finding_kinds(&reconcile(
+                &ended,
+                &[observation(
+                    "tmux:orphan",
+                    Some("ended"),
+                    ObservationStatus::Present
+                )],
+                &configured,
+                &known,
+            )),
+            vec!["orphan"]
+        );
+        assert!(
+            reconcile(
+                &ProjectState::default(),
+                &[observation("tmux:absent", None, ObservationStatus::Absent)],
+                &configured,
+                &known,
+            )
+            .is_empty()
         );
     }
 }

@@ -35,3 +35,7 @@ documents intentionally leave open.
   attempt transitions in one storage event.
 - Observer diagnostics retain at most 4,096 characters of standard error from
   each execution. Failed standard output is never retained as inventory.
+- `cargo mutants` exercises the complete crate with locked dependencies and
+  all features. Mutation runs must have no unexplained survivors; equivalent
+  mutations are removed through clearer code or narrowly documented
+  exclusions rather than broad file or module skips.

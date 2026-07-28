@@ -868,7 +868,8 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        AttemptDefinition, CheckDefinition, EventPayload, WorkDefinition, WorkOperation,
+        AttemptDefinition, CheckDefinition, CheckUpdate, EventPayload, HandoffDefinition,
+        QuestionDefinition, WorkDefinition, WorkOperation,
     };
 
     fn event(seq: u64, payload: EventPayload) -> Event {
@@ -901,6 +902,20 @@ mod tests {
         }
     }
 
+    fn edit(id: &str) -> WorkOperation {
+        WorkOperation::Edit {
+            id: id.to_owned(),
+            title: None,
+            spec: None,
+            priority: None,
+            add_requires: Vec::new(),
+            remove_requires: Vec::new(),
+            add_checks: Vec::new(),
+            remove_checks: Vec::new(),
+            state_change: None,
+        }
+    }
+
     #[test]
     fn readiness_and_attempt_checks_are_folded() {
         let events = vec![
@@ -922,6 +937,15 @@ mod tests {
                 },
             ),
         ];
+        let before_attempt = ProjectState::fold(&events[..1]).unwrap();
+        assert_eq!(
+            before_attempt
+                .ready()
+                .iter()
+                .map(|work| work.id.as_str())
+                .collect::<Vec<_>>(),
+            ["hm-a"]
+        );
         let state = ProjectState::fold(&events).unwrap();
         assert!(state.ready().is_empty());
         assert_eq!(
@@ -967,5 +991,668 @@ mod tests {
         ];
         let state = ProjectState::fold(&events).unwrap();
         assert!(!state.is_ready("hm-b"));
+    }
+
+    #[test]
+    fn fold_rejects_malformed_envelopes_before_changing_state() {
+        let payload = EventPayload::WorkChanged {
+            why: None,
+            operations: vec![add("hm-a", &[], &[])],
+        };
+        let mut wrong_sequence = event(2, payload.clone());
+        assert_eq!(
+            ProjectState::fold(&[wrong_sequence.clone()])
+                .unwrap_err()
+                .code,
+            "invalid_log"
+        );
+        wrong_sequence.seq = 1;
+        wrong_sequence.schema = "alder.event.v1".to_owned();
+        assert_eq!(
+            ProjectState::fold(&[wrong_sequence]).unwrap_err().code,
+            "invalid_log"
+        );
+        let first = event(1, payload.clone());
+        let mut duplicate = event(2, payload);
+        duplicate.id = first.id.clone();
+        assert_eq!(
+            ProjectState::fold(&[first, duplicate]).unwrap_err().code,
+            "invalid_log"
+        );
+    }
+
+    #[test]
+    fn handoffs_are_integrated_exactly_once() {
+        let mut state = ProjectState::default();
+        state
+            .apply(&event(
+                1,
+                EventPayload::HandoffSubmitted {
+                    handoff: HandoffDefinition {
+                        id: "hm-handoff-one".to_owned(),
+                        title: "handoff".to_owned(),
+                        artifact_ref: "branch".to_owned(),
+                        note: None,
+                    },
+                },
+            ))
+            .unwrap();
+        let integration = EventPayload::HandoffIntegrated {
+            handoff_id: "hm-handoff-one".to_owned(),
+            work: WorkDefinition {
+                id: "hm-work".to_owned(),
+                title: "work".to_owned(),
+                spec: None,
+                priority: 0,
+                requires: Vec::new(),
+                checks: Vec::new(),
+            },
+        };
+        state.apply(&event(2, integration.clone())).unwrap();
+        assert_eq!(
+            state.handoffs["hm-handoff-one"].state,
+            HandoffState::Integrated
+        );
+        assert_eq!(
+            state.apply(&event(3, integration)).unwrap_err().code,
+            "invalid_transition"
+        );
+    }
+
+    #[test]
+    fn active_attempt_freezes_every_dependency_and_check_edit() {
+        let mut state = ProjectState::default();
+        state
+            .apply(&event(
+                1,
+                EventPayload::WorkChanged {
+                    why: None,
+                    operations: vec![add("hm-a", &[], &["old"]), add("hm-b", &[], &[])],
+                },
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                2,
+                EventPayload::AttemptStarted {
+                    attempt: AttemptDefinition {
+                        id: "hm-a-attempt-1".to_owned(),
+                        work_id: "hm-a".to_owned(),
+                        metadata: BTreeMap::new(),
+                    },
+                },
+            ))
+            .unwrap();
+
+        let mut edits = Vec::new();
+        let mut operation = edit("hm-a");
+        if let WorkOperation::Edit { add_requires, .. } = &mut operation {
+            add_requires.push("hm-b".to_owned());
+        }
+        edits.push(operation);
+        let mut operation = edit("hm-a");
+        if let WorkOperation::Edit {
+            remove_requires, ..
+        } = &mut operation
+        {
+            remove_requires.push("hm-b".to_owned());
+        }
+        edits.push(operation);
+        let mut operation = edit("hm-a");
+        if let WorkOperation::Edit { add_checks, .. } = &mut operation {
+            add_checks.push(CheckDefinition {
+                key: "new".to_owned(),
+                description: "new check".to_owned(),
+            });
+        }
+        edits.push(operation);
+        let mut operation = edit("hm-a");
+        if let WorkOperation::Edit { remove_checks, .. } = &mut operation {
+            remove_checks.push("old".to_owned());
+        }
+        edits.push(operation);
+
+        for operation in edits {
+            let mut candidate = state.clone();
+            let error = candidate
+                .apply(&event(
+                    3,
+                    EventPayload::WorkChanged {
+                        why: Some("change contract".to_owned()),
+                        operations: vec![operation],
+                    },
+                ))
+                .unwrap_err();
+            assert_eq!(error.code, "active_attempt");
+        }
+    }
+
+    #[test]
+    fn work_edits_apply_each_collection_change_without_cross_talk() {
+        let mut state = ProjectState::default();
+        state
+            .apply(&event(
+                1,
+                EventPayload::WorkChanged {
+                    why: None,
+                    operations: vec![
+                        add("hm-a", &[], &[]),
+                        add("hm-b", &["hm-a"], &["old"]),
+                        add("hm-c", &[], &[]),
+                    ],
+                },
+            ))
+            .unwrap();
+        let mut operation = edit("hm-b");
+        if let WorkOperation::Edit {
+            add_requires,
+            remove_requires,
+            add_checks,
+            remove_checks,
+            ..
+        } = &mut operation
+        {
+            add_requires.push("hm-c".to_owned());
+            remove_requires.push("hm-a".to_owned());
+            add_checks.push(CheckDefinition {
+                key: "new".to_owned(),
+                description: "new passes".to_owned(),
+            });
+            remove_checks.push("old".to_owned());
+        }
+        state
+            .apply(&event(
+                2,
+                EventPayload::WorkChanged {
+                    why: Some("update contract".to_owned()),
+                    operations: vec![operation],
+                },
+            ))
+            .unwrap();
+        assert_eq!(state.work["hm-b"].requires, ["hm-c"]);
+        assert_eq!(
+            state.work["hm-b"]
+                .checks
+                .iter()
+                .map(|check| check.key.as_str())
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
+
+        let mut duplicate = edit("hm-b");
+        if let WorkOperation::Edit { add_checks, .. } = &mut duplicate {
+            add_checks.push(CheckDefinition {
+                key: "new".to_owned(),
+                description: "duplicate".to_owned(),
+            });
+        }
+        assert!(
+            state
+                .apply(&event(
+                    3,
+                    EventPayload::WorkChanged {
+                        why: Some("duplicate".to_owned()),
+                        operations: vec![duplicate],
+                    },
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn questions_block_only_their_work_until_answered() {
+        let mut state = ProjectState::default();
+        state
+            .apply(&event(
+                1,
+                EventPayload::WorkChanged {
+                    why: None,
+                    operations: vec![add("hm-a", &[], &[]), add("hm-b", &[], &[])],
+                },
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                2,
+                EventPayload::QuestionAsked {
+                    question: QuestionDefinition {
+                        id: "hm-a-question-1".to_owned(),
+                        work_id: "hm-a".to_owned(),
+                        text: "which?".to_owned(),
+                    },
+                },
+            ))
+            .unwrap();
+
+        let mut unblock_a = edit("hm-a");
+        if let WorkOperation::Edit { state_change, .. } = &mut unblock_a {
+            *state_change = Some(WorkStateChange::Unblock {
+                reason: "try".to_owned(),
+            });
+        }
+        assert_eq!(
+            state
+                .apply(&event(
+                    3,
+                    EventPayload::WorkChanged {
+                        why: Some("try".to_owned()),
+                        operations: vec![unblock_a.clone()],
+                    },
+                ))
+                .unwrap_err()
+                .code,
+            "unanswered_question"
+        );
+
+        let mut block_b = edit("hm-b");
+        if let WorkOperation::Edit { state_change, .. } = &mut block_b {
+            *state_change = Some(WorkStateChange::Block {
+                reason: "pause".to_owned(),
+            });
+        }
+        state
+            .apply(&event(
+                4,
+                EventPayload::WorkChanged {
+                    why: Some("pause".to_owned()),
+                    operations: vec![block_b],
+                },
+            ))
+            .unwrap();
+        let mut unblock_b = edit("hm-b");
+        if let WorkOperation::Edit { state_change, .. } = &mut unblock_b {
+            *state_change = Some(WorkStateChange::Unblock {
+                reason: "resume".to_owned(),
+            });
+        }
+        state
+            .apply(&event(
+                5,
+                EventPayload::WorkChanged {
+                    why: Some("resume".to_owned()),
+                    operations: vec![unblock_b],
+                },
+            ))
+            .unwrap();
+        assert_eq!(state.work["hm-b"].state, WorkState::Open);
+
+        state
+            .apply(&event(
+                6,
+                EventPayload::QuestionAnswered {
+                    question_id: "hm-a-question-1".to_owned(),
+                    answer: "A".to_owned(),
+                },
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                7,
+                EventPayload::WorkChanged {
+                    why: Some("resolved".to_owned()),
+                    operations: vec![unblock_a],
+                },
+            ))
+            .unwrap();
+        assert_eq!(state.work["hm-a"].state, WorkState::Open);
+    }
+
+    #[test]
+    fn an_attempt_update_activates_a_starting_attempt() {
+        let mut state = ProjectState::default();
+        state
+            .apply(&event(
+                1,
+                EventPayload::WorkChanged {
+                    why: None,
+                    operations: vec![add("hm-a", &[], &["test"])],
+                },
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                2,
+                EventPayload::AttemptStarted {
+                    attempt: AttemptDefinition {
+                        id: "hm-a-attempt-1".to_owned(),
+                        work_id: "hm-a".to_owned(),
+                        metadata: BTreeMap::new(),
+                    },
+                },
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                3,
+                EventPayload::AttemptUpdated {
+                    attempt_id: "hm-a-attempt-1".to_owned(),
+                    metadata: BTreeMap::new(),
+                    note: Some("working".to_owned()),
+                    checks: vec![CheckUpdate {
+                        key: "test".to_owned(),
+                        status: CheckStatus::Satisfied,
+                        evidence: "CI".to_owned(),
+                    }],
+                },
+            ))
+            .unwrap();
+        assert_eq!(state.attempts["hm-a-attempt-1"].state, AttemptState::Active);
+        assert_eq!(
+            state.attempts["hm-a-attempt-1"].checks["test"].status,
+            CheckStatus::Satisfied
+        );
+
+        let started = {
+            let mut state = ProjectState::default();
+            state
+                .apply(&event(
+                    1,
+                    EventPayload::WorkChanged {
+                        why: None,
+                        operations: vec![add("hm-a", &[], &["test"])],
+                    },
+                ))
+                .unwrap();
+            state
+                .apply(&event(
+                    2,
+                    EventPayload::AttemptStarted {
+                        attempt: AttemptDefinition {
+                            id: "hm-a-attempt-1".to_owned(),
+                            work_id: "hm-a".to_owned(),
+                            metadata: BTreeMap::new(),
+                        },
+                    },
+                ))
+                .unwrap();
+            state
+        };
+
+        let mut metadata_only = started.clone();
+        metadata_only
+            .apply(&event(
+                3,
+                EventPayload::AttemptUpdated {
+                    attempt_id: "hm-a-attempt-1".to_owned(),
+                    metadata: BTreeMap::from([("engine".to_owned(), json!("opus"))]),
+                    note: None,
+                    checks: vec![],
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            metadata_only.attempts["hm-a-attempt-1"].metadata["engine"],
+            "opus"
+        );
+
+        let mut note_only = started.clone();
+        note_only
+            .apply(&event(
+                3,
+                EventPayload::AttemptUpdated {
+                    attempt_id: "hm-a-attempt-1".to_owned(),
+                    metadata: BTreeMap::new(),
+                    note: Some("working".to_owned()),
+                    checks: vec![],
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            note_only.attempts["hm-a-attempt-1"].note.as_deref(),
+            Some("working")
+        );
+
+        let mut check_only = started.clone();
+        check_only
+            .apply(&event(
+                3,
+                EventPayload::AttemptUpdated {
+                    attempt_id: "hm-a-attempt-1".to_owned(),
+                    metadata: BTreeMap::new(),
+                    note: None,
+                    checks: vec![CheckUpdate {
+                        key: "test".to_owned(),
+                        status: CheckStatus::Failed,
+                        evidence: "CI".to_owned(),
+                    }],
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            check_only.attempts["hm-a-attempt-1"].checks["test"].status,
+            CheckStatus::Failed
+        );
+
+        let mut empty = started;
+        assert_eq!(
+            empty
+                .apply(&event(
+                    3,
+                    EventPayload::AttemptUpdated {
+                        attempt_id: "hm-a-attempt-1".to_owned(),
+                        metadata: BTreeMap::new(),
+                        note: None,
+                        checks: vec![],
+                    },
+                ))
+                .unwrap_err()
+                .message,
+            "an attempt update must change metadata, a note, or a check"
+        );
+    }
+
+    #[test]
+    fn ordinary_finish_requires_every_check_to_be_satisfied() {
+        let mut state = ProjectState::default();
+        state
+            .apply(&event(
+                1,
+                EventPayload::WorkChanged {
+                    why: None,
+                    operations: vec![add("hm-a", &[], &["test"])],
+                },
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                2,
+                EventPayload::AttemptStarted {
+                    attempt: AttemptDefinition {
+                        id: "hm-a-attempt-1".to_owned(),
+                        work_id: "hm-a".to_owned(),
+                        metadata: BTreeMap::new(),
+                    },
+                },
+            ))
+            .unwrap();
+        let finish = EventPayload::WorkFinished {
+            work_id: "hm-a".to_owned(),
+            attempt_id: Some("hm-a-attempt-1".to_owned()),
+            external: false,
+            evidence: None,
+        };
+        assert_eq!(
+            state.apply(&event(3, finish.clone())).unwrap_err().code,
+            "incomplete_checks"
+        );
+        state
+            .apply(&event(
+                3,
+                EventPayload::AttemptUpdated {
+                    attempt_id: "hm-a-attempt-1".to_owned(),
+                    metadata: BTreeMap::new(),
+                    note: None,
+                    checks: vec![CheckUpdate {
+                        key: "test".to_owned(),
+                        status: CheckStatus::Satisfied,
+                        evidence: "CI".to_owned(),
+                    }],
+                },
+            ))
+            .unwrap();
+        state.apply(&event(4, finish)).unwrap();
+        assert_eq!(state.work["hm-a"].state, WorkState::Done);
+    }
+
+    #[test]
+    fn external_finish_rejects_either_form_of_attempt_association() {
+        let mut state = ProjectState::default();
+        state
+            .apply(&event(
+                1,
+                EventPayload::WorkChanged {
+                    why: None,
+                    operations: vec![add("hm-a", &[], &[]), add("hm-b", &[], &[])],
+                },
+            ))
+            .unwrap();
+        assert!(
+            state
+                .apply(&event(
+                    2,
+                    EventPayload::WorkFinished {
+                        work_id: "hm-a".to_owned(),
+                        attempt_id: Some("not-active".to_owned()),
+                        external: true,
+                        evidence: Some("proof".to_owned()),
+                    },
+                ))
+                .is_err()
+        );
+
+        state
+            .apply(&event(
+                3,
+                EventPayload::AttemptStarted {
+                    attempt: AttemptDefinition {
+                        id: "hm-b-attempt-1".to_owned(),
+                        work_id: "hm-b".to_owned(),
+                        metadata: BTreeMap::new(),
+                    },
+                },
+            ))
+            .unwrap();
+        assert!(
+            state
+                .apply(&event(
+                    4,
+                    EventPayload::WorkFinished {
+                        work_id: "hm-b".to_owned(),
+                        attempt_id: None,
+                        external: true,
+                        evidence: Some("proof".to_owned()),
+                    },
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn graph_and_identity_helpers_cover_exact_boundaries() {
+        let mut state = ProjectState::default();
+        assert!(
+            state
+                .apply(&event(
+                    1,
+                    EventPayload::WorkChanged {
+                        why: None,
+                        operations: vec![
+                            add("hm-a", &[], &[]),
+                            add("hm-b", &["hm-a", "hm-a"], &[])
+                        ],
+                    },
+                ))
+                .is_err()
+        );
+
+        state
+            .apply(&event(
+                2,
+                EventPayload::WorkChanged {
+                    why: None,
+                    operations: vec![
+                        add("hm-a", &[], &[]),
+                        add("hm-b", &["hm-a"], &[]),
+                        add("hm-c", &["hm-b"], &[]),
+                        add("hm-unrelated", &[], &[]),
+                    ],
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            state.downstream("hm-a"),
+            vec!["hm-b".to_owned(), "hm-c".to_owned()]
+        );
+        assert!(state.validate_prefix("hm").is_ok());
+        assert!(state.validate_prefix("other").is_err());
+        state.handoffs.insert(
+            "wrong-handoff-one".to_owned(),
+            Handoff {
+                id: "wrong-handoff-one".to_owned(),
+                title: "handoff".to_owned(),
+                artifact_ref: "ref".to_owned(),
+                note: None,
+                state: HandoffState::Submitted,
+                submitted_seq: 3,
+                work_id: None,
+                integrated_seq: None,
+            },
+        );
+        assert!(state.validate_prefix("hm").is_err());
+
+        for invalid in [
+            CheckDefinition {
+                key: String::new(),
+                description: "description".to_owned(),
+            },
+            CheckDefinition {
+                key: "key".to_owned(),
+                description: String::new(),
+            },
+            CheckDefinition {
+                key: "has space".to_owned(),
+                description: "description".to_owned(),
+            },
+            CheckDefinition {
+                key: "has:colon".to_owned(),
+                description: "description".to_owned(),
+            },
+        ] {
+            assert!(validate_check(&invalid).is_err());
+        }
+        assert!(
+            validate_check(&CheckDefinition {
+                key: "tests".to_owned(),
+                description: "tests pass".to_owned(),
+            })
+            .is_ok()
+        );
+
+        assert_eq!(validate_handle("tmux:worker").unwrap(), ("tmux", "worker"));
+        for invalid in ["tmux", "Bad:worker", "tmux:"] {
+            assert!(validate_handle(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn cycle_errors_report_the_actual_cycle() {
+        let mut state = ProjectState::default();
+        let error = state
+            .apply(&event(
+                1,
+                EventPayload::WorkChanged {
+                    why: None,
+                    operations: vec![
+                        add("hm-a", &["hm-c"], &[]),
+                        add("hm-b", &["hm-a"], &[]),
+                        add("hm-c", &["hm-b"], &[]),
+                    ],
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error.context["cycle"],
+            json!(["hm-a", "hm-c", "hm-b", "hm-a"])
+        );
     }
 }

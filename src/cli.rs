@@ -29,28 +29,6 @@ pub enum Command {
     Debug(DebugArgs),
 }
 
-impl Command {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Init(_) => "init",
-            Self::Status(_) => "status",
-            Self::Next(_) => "next",
-            Self::Show(_) => "show",
-            Self::Add(_) => "add",
-            Self::Edit(_) => "edit",
-            Self::Reopen(_) => "reopen",
-            Self::Start(_) => "start",
-            Self::Finish(_) => "finish",
-            Self::Drop(_) => "drop",
-            Self::Ask(_) => "ask",
-            Self::Answer(_) => "answer",
-            Self::Refresh => "refresh",
-            Self::Reconcile(_) => "reconcile",
-            Self::Debug(_) => "debug",
-        }
-    }
-}
-
 #[derive(Debug, Args)]
 pub struct InitArgs {
     #[arg(long)]

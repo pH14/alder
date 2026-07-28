@@ -207,6 +207,11 @@ pub enum WorkOperation {
     Edit {
         id: String,
         title: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "nullable_string_change"
+        )]
         spec: Option<NullableString>,
         priority: Option<i64>,
         add_requires: Vec<String>,
@@ -236,6 +241,34 @@ impl WorkOperation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct NullableString(pub Option<String>);
+
+pub(crate) mod nullable_string_change {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::NullableString;
+
+    pub fn serialize<S>(
+        value: &Option<NullableString>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => value.0.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<Option<NullableString>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer).map(|value| Some(NullableString(value)))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -368,4 +401,261 @@ pub struct QuestionAnswer {
     pub answer: String,
     pub seq: u64,
     pub actor: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::*;
+
+    fn work(id: &str, requires: Vec<String>) -> WorkDefinition {
+        WorkDefinition {
+            id: id.to_owned(),
+            title: "work".to_owned(),
+            spec: None,
+            priority: 0,
+            requires,
+            checks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn heads_and_drafts_materialize_exact_event_data() {
+        assert_eq!(
+            Head::empty(),
+            Head {
+                revision: None,
+                seq: 0,
+            }
+        );
+        let at = Utc::now();
+        let draft = EventDraft {
+            id: "event".to_owned(),
+            at,
+            actor: "actor".to_owned(),
+            payload: EventPayload::WorkReopened {
+                work_id: "hm-one".to_owned(),
+                why: "reason".to_owned(),
+            },
+            schema: "alder.event.v0".to_owned(),
+        };
+        let event = draft.materialize(7);
+        assert_eq!(event.id, "event");
+        assert_eq!(event.seq, 7);
+        assert_eq!(event.at, at);
+        assert_eq!(event.actor, "actor");
+        assert_eq!(event.payload.type_name(), "work.reopened");
+        assert_eq!(event.schema, "alder.event.v0");
+    }
+
+    #[test]
+    fn payload_names_and_references_cover_every_variant() {
+        let cases = vec![
+            (
+                EventPayload::HandoffSubmitted {
+                    handoff: HandoffDefinition {
+                        id: "handoff".to_owned(),
+                        title: "handoff".to_owned(),
+                        artifact_ref: "ref".to_owned(),
+                        note: None,
+                    },
+                },
+                "handoff.submitted",
+                vec!["handoff"],
+            ),
+            (
+                EventPayload::HandoffIntegrated {
+                    handoff_id: "handoff".to_owned(),
+                    work: work("work", Vec::new()),
+                },
+                "handoff.integrated",
+                vec!["handoff", "work"],
+            ),
+            (
+                EventPayload::WorkChanged {
+                    why: Some("reason".to_owned()),
+                    operations: vec![
+                        WorkOperation::Add {
+                            work: work("added", vec!["required".to_owned()]),
+                        },
+                        WorkOperation::Edit {
+                            id: "edited".to_owned(),
+                            title: None,
+                            spec: None,
+                            priority: None,
+                            add_requires: Vec::new(),
+                            remove_requires: Vec::new(),
+                            add_checks: Vec::new(),
+                            remove_checks: Vec::new(),
+                            state_change: None,
+                        },
+                    ],
+                },
+                "work.changed",
+                vec!["added", "required", "edited"],
+            ),
+            (
+                EventPayload::WorkFinished {
+                    work_id: "work".to_owned(),
+                    attempt_id: Some("attempt".to_owned()),
+                    external: false,
+                    evidence: None,
+                },
+                "work.finished",
+                vec!["work", "attempt"],
+            ),
+            (
+                EventPayload::WorkDropped {
+                    work_id: "work".to_owned(),
+                    attempt_id: Some("attempt".to_owned()),
+                    outcome: Some(AttemptOutcome::Failed),
+                    why: "reason".to_owned(),
+                },
+                "work.dropped",
+                vec!["work", "attempt"],
+            ),
+            (
+                EventPayload::WorkReopened {
+                    work_id: "work".to_owned(),
+                    why: "reason".to_owned(),
+                },
+                "work.reopened",
+                vec!["work"],
+            ),
+            (
+                EventPayload::AttemptStarted {
+                    attempt: AttemptDefinition {
+                        id: "attempt".to_owned(),
+                        work_id: "work".to_owned(),
+                        metadata: BTreeMap::new(),
+                    },
+                },
+                "attempt.started",
+                vec!["attempt", "work"],
+            ),
+            (
+                EventPayload::AttemptBound {
+                    attempt_id: "attempt".to_owned(),
+                    handle: "tmux:one".to_owned(),
+                    metadata: BTreeMap::new(),
+                },
+                "attempt.bound",
+                vec!["attempt"],
+            ),
+            (
+                EventPayload::AttemptUpdated {
+                    attempt_id: "attempt".to_owned(),
+                    metadata: BTreeMap::new(),
+                    note: None,
+                    checks: Vec::new(),
+                },
+                "attempt.updated",
+                vec!["attempt"],
+            ),
+            (
+                EventPayload::AttemptEnded {
+                    attempt_id: "attempt".to_owned(),
+                    outcome: AttemptOutcome::Failed,
+                    why: "reason".to_owned(),
+                },
+                "attempt.ended",
+                vec!["attempt"],
+            ),
+            (
+                EventPayload::QuestionAsked {
+                    question: QuestionDefinition {
+                        id: "question".to_owned(),
+                        work_id: "work".to_owned(),
+                        text: "question".to_owned(),
+                    },
+                },
+                "question.asked",
+                vec!["question", "work"],
+            ),
+            (
+                EventPayload::QuestionAnswered {
+                    question_id: "question".to_owned(),
+                    answer: "answer".to_owned(),
+                },
+                "question.answered",
+                vec!["question"],
+            ),
+        ];
+
+        for (payload, type_name, references) in cases {
+            assert_eq!(payload.type_name(), type_name);
+            assert!(!payload.references("unrelated"), "{type_name}");
+            for reference in references {
+                assert!(payload.references(reference), "{type_name}: {reference}");
+            }
+        }
+    }
+
+    #[test]
+    fn operation_accessors_and_outcomes_have_exact_semantics() {
+        let added = WorkOperation::Add {
+            work: work("added", Vec::new()),
+        };
+        assert_eq!(added.id(), "added");
+        assert_eq!(added.definition().unwrap().id, "added");
+
+        let edited = WorkOperation::Edit {
+            id: "edited".to_owned(),
+            title: None,
+            spec: None,
+            priority: None,
+            add_requires: Vec::new(),
+            remove_requires: Vec::new(),
+            add_checks: Vec::new(),
+            remove_checks: Vec::new(),
+            state_change: None,
+        };
+        assert_eq!(edited.id(), "edited");
+        assert!(edited.definition().is_none());
+
+        assert!(!AttemptOutcome::Succeeded.is_non_success());
+        for outcome in [
+            AttemptOutcome::Failed,
+            AttemptOutcome::Cancelled,
+            AttemptOutcome::Lost,
+            AttemptOutcome::NotStarted,
+        ] {
+            assert!(outcome.is_non_success());
+        }
+    }
+
+    #[test]
+    fn work_edit_json_distinguishes_omitted_set_and_cleared_specs() {
+        let operation = |spec| WorkOperation::Edit {
+            id: "edited".to_owned(),
+            title: None,
+            spec,
+            priority: None,
+            add_requires: Vec::new(),
+            remove_requires: Vec::new(),
+            add_checks: Vec::new(),
+            remove_checks: Vec::new(),
+            state_change: None,
+        };
+
+        let omitted = serde_json::to_value(operation(None)).unwrap();
+        assert!(omitted.get("spec").is_none());
+
+        let cleared = serde_json::to_value(operation(Some(NullableString(None)))).unwrap();
+        assert!(cleared.get("spec").unwrap().is_null());
+        let decoded: WorkOperation = serde_json::from_value(cleared).unwrap();
+        match decoded {
+            WorkOperation::Edit {
+                spec: Some(NullableString(None)),
+                ..
+            } => {}
+            _ => panic!("explicit null must survive as a spec clear"),
+        }
+
+        let set =
+            serde_json::to_value(operation(Some(NullableString(Some("new spec".to_owned())))))
+                .unwrap();
+        assert_eq!(set["spec"], "new spec");
+    }
 }

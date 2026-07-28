@@ -144,8 +144,12 @@ fn drive_work_and_preserve_the_completion_contract() {
         &first_id,
     ]);
     let second_id = string(&second, "work_id");
-    let resource_less = project.failure(&["edit", &first_id]);
-    assert_eq!(resource_less["code"], "invalid_command");
+    let resource_less = project.failure(&["edit", "work", &first_id]);
+    assert_eq!(resource_less["code"], "validation_failed");
+    assert_eq!(
+        resource_less["message"],
+        "edit work requires at least one field change"
+    );
 
     let next = project.success(&["next"]);
     assert_eq!(next["work"].as_array().unwrap().len(), 1);
@@ -154,6 +158,9 @@ fn drive_work_and_preserve_the_completion_contract() {
     let started = project.success(&["start", &first_id, "--meta", "engine=opus-5"]);
     let attempt = string(&started, "attempt_id");
     assert!(attempt.ends_with("-attempt-1"));
+    let in_flight = project.success(&["status"]);
+    assert_eq!(in_flight["in_flight"][0]["id"], attempt);
+    assert!(in_flight["ready"].as_array().unwrap().is_empty());
     let duplicate = project.failure(&["start", &first_id]);
     assert_eq!(duplicate["code"], "active_attempt");
     assert_eq!(duplicate["context"]["active_attempt_id"], attempt);
@@ -198,15 +205,39 @@ fn drive_work_and_preserve_the_completion_contract() {
 
     let asked = project.success(&["ask", &second_id, "Ship now?"]);
     let question = string(&asked, "question_id");
+    let waiting = project.success(&["status"]);
+    assert_eq!(waiting["waiting_on_human"][0]["id"], question);
+    assert!(
+        !project
+            .human(&["status"])
+            .contains("answered questions still blocked")
+    );
     project.success(&["answer", &question, "Wait"]);
     project.success(&["answer", &question, "Ship"]);
     let status = project.success(&["status"]);
+    assert!(status["waiting_on_human"].as_array().unwrap().is_empty());
     assert_eq!(status["questions"][0]["answer"], "Ship");
     assert_eq!(
         status["questions"][0]["answers"].as_array().unwrap().len(),
         2
     );
     assert_eq!(status["blocked"][0]["id"], second_id);
+    assert!(
+        project
+            .human(&["status"])
+            .contains("answered questions still blocked")
+    );
+
+    let handoff = project.success(&[
+        "add",
+        "handoff",
+        "--title",
+        "Side work",
+        "--ref",
+        "branch:side",
+    ]);
+    let status = project.success(&["status"]);
+    assert_eq!(status["handoffs"][0]["id"], handoff["handoff_id"]);
 }
 
 #[test]
@@ -276,8 +307,25 @@ fn observations_distinguish_presence_outage_and_missing_configuration() {
     project.config(json!([{"observer": "tmux", "list": command}]));
     let refreshed = project.success(&["refresh"]);
     assert_eq!(refreshed["result"]["present"], 1);
+    assert!(project.human(&["status"]).contains("tmux:worker  present"));
+    let diagnostics = project.success(&["debug", "observations", "tmux"]);
+    assert_eq!(diagnostics["kinds"][0]["configured"], true);
+    assert_eq!(diagnostics["kinds"][0]["command"], command);
+    assert_eq!(diagnostics["kinds"][0]["latest_run"]["kind"], "tmux");
+    let reconciled = project.success(&["reconcile"]);
+    assert_eq!(reconciled["refreshed"], true);
+    assert!(reconciled["refresh_result"].is_object());
     let healthy = project.success(&["reconcile", "--no-refresh"]);
+    assert_eq!(healthy["refreshed"], false);
+    assert!(healthy["refresh_result"].is_null());
     assert!(healthy["findings"].as_array().unwrap().is_empty());
+
+    project.config(json!([]));
+    let unconfigured = project.success(&["status"]);
+    assert_eq!(
+        unconfigured["observations"]["handles"][0]["status"],
+        "unknown"
+    );
 
     project.config(json!([{"observer": "tmux", "list": "exit 7"}]));
     let failed = project.success(&["refresh"]);
@@ -292,6 +340,11 @@ fn observations_distinguish_presence_outage_and_missing_configuration() {
     let outage = project.success(&["reconcile", "--no-refresh"]);
     assert_eq!(outage["findings"][0]["status"], "unknown");
     assert!(outage["findings"][0]["suggested_command"].is_null());
+    assert!(
+        project
+            .human(&["status"])
+            .contains("observation failures: tmux")
+    );
 
     project.config(json!([]));
     let status = project.success(&["status"]);
@@ -308,11 +361,36 @@ fn initialization_is_byte_preserving_and_conflicts_are_structured() {
     let before = fs::read(&manifest).unwrap();
     let repeated = project.success(&["init", "--prefix", "hm"]);
     assert_eq!(repeated["status"], "already_initialized");
+    assert!(
+        project
+            .human(&["init", "--prefix", "hm"])
+            .starts_with("already initialized ")
+    );
     assert_eq!(fs::read(&manifest).unwrap(), before);
 
     let conflict = project.failure(&["init", "--prefix", "other"]);
     assert_eq!(conflict["code"], "config_conflict");
     assert_eq!(fs::read(&manifest).unwrap(), before);
+}
+
+#[test]
+fn refresh_reports_unbound_observed_handles_in_both_outputs() {
+    let project = TestProject::new();
+    project.config(json!([{
+        "observer": "tmux",
+        "list": "printf '%s\\n' '[{\"value\":\"stray\"}]'"
+    }]));
+    assert!(
+        project
+            .human(&["status"])
+            .contains("observations not refreshed")
+    );
+    let refreshed = project.success(&["refresh"]);
+    assert_eq!(refreshed["result"]["present"], 1);
+    assert_eq!(refreshed["result"]["unbound"][0]["handle"], "tmux:stray");
+    let human = project.human(&["refresh"]);
+    assert!(human.contains("unbound:"));
+    assert!(human.contains("tmux:stray"));
 }
 
 #[test]
@@ -351,5 +429,274 @@ fn debug_log_human_output_uses_one_consistent_header() {
     assert_eq!(
         project.human(&["debug", "log", "tail"]),
         format!("{header}\n#1  work.changed  {event_id}\n")
+    );
+}
+
+#[test]
+fn invalid_commands_and_errors_use_the_requested_output_channel() {
+    let mut json_command = Command::cargo_bin("alder").unwrap();
+    let json_output = json_command
+        .args(["not-a-command", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json_output.status.code(), Some(2));
+    assert!(json_output.stderr.is_empty());
+    let json_error: Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(json_error["code"], "invalid_command");
+
+    let mut human_command = Command::cargo_bin("alder").unwrap();
+    let human_output = human_command.args(["not-a-command"]).output().unwrap();
+    assert_eq!(human_output.status.code(), Some(2));
+    assert!(human_output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&human_output.stderr).contains("Usage:"));
+
+    let project = TestProject::new();
+    let validation = project
+        .command()
+        .args(["finish", "missing", "--evidence", "proof"])
+        .output()
+        .unwrap();
+    assert_eq!(validation.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(validation.stderr).unwrap(),
+        "error [validation_failed]: --evidence is accepted only with --external\n"
+    );
+
+    let contextual = project
+        .command()
+        .args(["show", "missing"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(contextual.stderr).unwrap();
+    assert!(stderr.contains("error [not_found]"));
+    assert!(stderr.contains("\"kind\": \"object\""));
+    assert!(stderr.contains("\"id\": \"missing\""));
+}
+
+#[test]
+fn mutually_exclusive_edit_and_finish_arguments_are_all_rejected() {
+    let project = TestProject::new();
+    let added = project.success(&["add", "work", "--title", "work"]);
+    let work = string(&added, "work_id");
+
+    assert_eq!(
+        project.failure(&[
+            "finish",
+            &work,
+            "--external",
+            "--attempt",
+            "not-an-attempt",
+            "--evidence",
+            "proof",
+        ])["code"],
+        "validation_failed"
+    );
+    assert_eq!(
+        project.failure(&["finish", &work, "--evidence", "proof"])["code"],
+        "validation_failed"
+    );
+
+    let document = project.work.join("edit.json");
+    fs::write(
+        &document,
+        serde_json::to_vec(&json!({
+            "why": "change",
+            "edit": [{"id": work, "title": "changed"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        project.failure(&["edit", "work", &work, "--from", path(&document)])["code"],
+        "validation_failed"
+    );
+    assert_eq!(
+        project.failure(&[
+            "edit",
+            "work",
+            "--from",
+            path(&document),
+            "--title",
+            "changed",
+        ])["code"],
+        "validation_failed"
+    );
+    project.success(&["edit", "work", &work, "--spec", "one", "--why", "set spec"]);
+    project.success(&["edit", "work", &work, "--clear-spec", "--why", "clear spec"]);
+    assert!(project.success(&["show", &work])["current"]["spec"].is_null());
+    let conflicting_spec = project.failure(&[
+        "edit",
+        "work",
+        &work,
+        "--title",
+        "changed",
+        "--spec",
+        "one",
+        "--clear-spec",
+        "--why",
+        "reason",
+    ]);
+    assert_eq!(conflicting_spec["code"], "validation_failed");
+    assert_eq!(
+        conflicting_spec["message"],
+        "--spec and --clear-spec cannot be combined"
+    );
+    let blank_why = project.failure(&["edit", "work", &work, "--title", "changed", "--why", " "]);
+    assert_eq!(blank_why["code"], "validation_failed");
+    assert_eq!(blank_why["message"], "edit work requires --why");
+
+    let started = project.success(&["start", &work]);
+    let attempt = string(&started, "attempt_id");
+    for fields in [
+        vec!["--handle", "tmux:one"],
+        vec!["--meta", "engine=opus"],
+        vec!["--check", "test=failed"],
+        vec!["--evidence", "proof"],
+        vec!["--note", "working"],
+    ] {
+        let mut args = vec![
+            "edit",
+            "attempt",
+            attempt.as_str(),
+            "--end",
+            "failed",
+            "--why",
+            "reason",
+        ];
+        args.extend(fields);
+        assert_eq!(project.failure(&args)["code"], "validation_failed");
+    }
+    let missing_why = project.failure(&["edit", "attempt", &attempt, "--end", "failed"]);
+    assert_eq!(missing_why["code"], "validation_failed");
+    assert_eq!(missing_why["message"], "--end requires --why");
+    let blank_why =
+        project.failure(&["edit", "attempt", &attempt, "--end", "failed", "--why", " "]);
+    assert_eq!(blank_why["code"], "validation_failed");
+    assert_eq!(blank_why["message"], "--end requires --why");
+    assert_eq!(
+        project.failure(&["edit", "attempt", &attempt, "--why", "reason"])["code"],
+        "validation_failed"
+    );
+    for fields in [
+        vec!["--check", "test=failed", "--evidence", "proof"],
+        vec!["--evidence", "proof"],
+        vec!["--note", "working"],
+    ] {
+        let mut args = vec!["edit", "attempt", attempt.as_str(), "--handle", "tmux:one"];
+        args.extend(fields);
+        assert_eq!(project.failure(&args)["code"], "validation_failed");
+    }
+    assert_eq!(
+        project.failure(&["edit", "attempt", &attempt])["code"],
+        "validation_failed"
+    );
+}
+
+#[test]
+fn initialization_validates_each_store_field_and_reports_the_remote_head() {
+    let project = TestProject::new();
+    assert_eq!(
+        project.failure(&["init", "--prefix", "hm", "--remote", ""])["code"],
+        "validation_failed"
+    );
+    assert_eq!(
+        project.failure(&["init", "--prefix", "hm", "--ref", ""])["code"],
+        "validation_failed"
+    );
+    assert_eq!(
+        project.failure(&["init", "--prefix", "hm", "--remote", "other"])["code"],
+        "config_conflict"
+    );
+    assert_eq!(
+        project.failure(&["init", "--prefix", "hm", "--ref", "refs/heads/other",])["code"],
+        "config_conflict"
+    );
+
+    project.success(&["add", "work", "--title", "one"]);
+    project.success(&["add", "work", "--title", "two"]);
+    let initialized = project.success(&["init", "--prefix", "hm"]);
+    assert_eq!(initialized["status"], "already_initialized");
+    assert_eq!(initialized["head"], 2);
+}
+
+#[test]
+fn actor_overrides_and_object_history_are_preserved() {
+    let project = TestProject::new();
+    let output = project
+        .command()
+        .env("ALDER_ACTOR", "side-channel")
+        .args(["add", "work", "--title", "one", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let added: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let first = string(&added, "work_id");
+    let second = project.success(&["add", "work", "--title", "two"]);
+    let second = string(&second, "work_id");
+    let first_question = project.success(&["ask", &first, "first question"]);
+    let first_question = string(&first_question, "question_id");
+    project.success(&["ask", &second, "second question"]);
+
+    let shown = project.success(&["show", &first]);
+    assert_eq!(shown["history"][0]["actor"], "side-channel");
+    let ids: Vec<_> = shown["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    let question = project.success(&["show", &first_question]);
+    assert_eq!(question["kind"], "question");
+}
+
+#[test]
+fn hypothetical_ordinals_and_debug_selection_are_exact() {
+    let project = TestProject::new();
+    project.success(&["add", "work", "--title", "root"]);
+    let document = project.work.join("anonymous.json");
+    fs::write(
+        &document,
+        serde_json::to_vec(&json!({
+            "add": [{"title": "one"}, {"title": "two"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let preview = project.success(&["next", "--with", path(&document)]);
+    let hypothetical: Vec<_> = preview["work"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|work| work["id"].as_str().unwrap().starts_with('$'))
+        .collect();
+    assert_eq!(hypothetical[0]["id"], "$new-1");
+    assert_eq!(hypothetical[1]["id"], "$new-2");
+    assert_eq!(hypothetical[0]["opened_seq"], 2);
+
+    let first = project.success(&["debug", "log", "show", "1"]);
+    assert_eq!(first["event"]["seq"], 1);
+    assert_eq!(
+        project.failure(&["debug", "log", "show", "2"])["code"],
+        "not_found"
+    );
+
+    project.config(json!([
+        {"observer": "tmux", "list": "printf '[]'"},
+        {"observer": "nimbus", "list": "printf '[]'"}
+    ]));
+    let selected = project.success(&["debug", "observations", "tmux"]);
+    assert_eq!(selected["kinds"].as_array().unwrap().len(), 1);
+    assert_eq!(selected["kinds"][0]["kind"], "tmux");
+    let run = project.success(&["debug", "observations", "tmux", "--run"]);
+    assert_eq!(run["kind"], "tmux");
+    assert_eq!(run["result"]["kind"], "tmux");
+    assert_eq!(
+        project.failure(&["debug", "observations", "missing"])["code"],
+        "not_found"
+    );
+    assert_eq!(
+        project.failure(&["debug", "observations", "missing", "--run"])["code"],
+        "observer_unconfigured"
     );
 }
