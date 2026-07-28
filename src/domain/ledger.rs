@@ -34,6 +34,10 @@ pub struct Ledger<S> {
     store: S,
     prefix: String,
     actor: String,
+    /// Called once after each confirmed append, and never on failure. The CLI
+    /// installs a hook that touches a local marker file so a co-located
+    /// driver can notice an append without waiting out its poll interval.
+    on_append: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl<S: Log> Ledger<S> {
@@ -42,7 +46,13 @@ impl<S: Log> Ledger<S> {
             store,
             prefix: prefix.into(),
             actor: actor.into(),
+            on_append: None,
         }
+    }
+
+    pub fn with_on_append(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_append = Some(Box::new(hook));
+        self
     }
 
     pub fn store(&self) -> &S {
@@ -88,6 +98,9 @@ impl<S: Log> Ledger<S> {
         let receipt = self
             .store
             .append(&snapshot.head, &super::encode_draft(&draft)?)?;
+        if let Some(hook) = &self.on_append {
+            hook();
+        }
         append_result(receipt)
     }
 

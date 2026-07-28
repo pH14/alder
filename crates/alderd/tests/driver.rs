@@ -37,6 +37,8 @@ struct World {
     polls_until_death: Option<u32>,
     session: Option<String>,
     attached: bool,
+    /// The mtime of the local append marker, `None` when the file is absent.
+    marker: Option<DateTime<Utc>>,
     calls: Vec<String>,
     notices: Vec<String>,
     store_unavailable: bool,
@@ -190,6 +192,10 @@ impl Effects for Fake {
 
     fn read_file(&self, _path: &Path) -> Result<Vec<u8>> {
         Ok(b"pass document".to_vec())
+    }
+
+    fn file_mtime(&self, _path: &Path) -> Option<DateTime<Utc>> {
+        self.world.borrow().marker
     }
 
     fn notify(&self, message: &str) {
@@ -504,6 +510,33 @@ fn a_standing_engine_problem_is_reported_once() {
     let notices = driver.effects().world.borrow().notices.clone();
     assert_eq!(notices.len(), 2);
     assert_eq!(notices[0], notices[1]);
+}
+
+#[test]
+fn a_fresh_marker_cuts_the_wait_short_and_a_missing_one_is_silently_fine() {
+    // With the marker always ahead of the baseline, the driver never sleeps:
+    // it watches the pass to its end without the clock advancing at all.
+    let mut hinted = selected("claude");
+    hinted.polls_until_report = 3;
+    hinted.marker = Some(DateTime::from_timestamp(2_000_000_000, 0).unwrap());
+    let mut driver = Driver::new(Fake::new(hinted), config());
+    let start = driver.effects().now();
+    driver.poll_once().unwrap();
+    assert_eq!(driver.effects().now(), start);
+    let world = driver.effects().world.borrow();
+    assert_eq!(world.last_ended.as_ref().unwrap().1, "ok");
+    drop(world);
+
+    // Without a marker the same pass is watched on the ordinary cadence:
+    // three open polls, each followed by one full 60-second interval.
+    let mut unhinted = selected("claude");
+    unhinted.polls_until_report = 3;
+    let mut driver = Driver::new(Fake::new(unhinted), config());
+    let start = driver.effects().now();
+    driver.poll_once().unwrap();
+    assert_eq!((driver.effects().now() - start).num_seconds(), 180);
+    let world = driver.effects().world.borrow();
+    assert_eq!(world.last_ended.as_ref().unwrap().1, "ok");
 }
 
 #[test]

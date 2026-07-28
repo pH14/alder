@@ -20,6 +20,9 @@ pub struct Config {
     pub tmux_session: String,
     #[serde(default = "default_poll")]
     pub poll_seconds: u64,
+    /// How often to stat the local append marker between full polls.
+    #[serde(default = "default_hint_poll")]
+    pub hint_poll_seconds: u64,
     #[serde(default = "default_debounce")]
     pub debounce_seconds: u64,
     #[serde(default = "default_max_interval")]
@@ -50,6 +53,10 @@ fn default_session() -> String {
 
 fn default_poll() -> u64 {
     60
+}
+
+fn default_hint_poll() -> u64 {
+    1
 }
 
 fn default_debounce() -> u64 {
@@ -108,6 +115,9 @@ impl Config {
         if self.poll_seconds == 0 {
             return Err(DriverError::new("pollSeconds must be positive"));
         }
+        if self.hint_poll_seconds == 0 {
+            return Err(DriverError::new("hintPollSeconds must be positive"));
+        }
         if self.pass_timeout_seconds == 0 {
             return Err(DriverError::new("passTimeoutSeconds must be positive"));
         }
@@ -119,6 +129,10 @@ impl Config {
 
     pub fn poll(&self) -> Duration {
         Duration::from_secs(self.poll_seconds)
+    }
+
+    pub fn hint_poll(&self) -> Duration {
+        Duration::from_secs(self.hint_poll_seconds)
     }
 }
 

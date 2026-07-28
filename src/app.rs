@@ -176,7 +176,12 @@ fn load_context() -> Result<Context> {
     let cwd = env::current_dir()?;
     let project = Project::discover(&cwd)?;
     let actor = actor();
-    let ledger = Ledger::new(project.store(), &project.config.prefix, actor);
+    let marker = project.append_marker();
+    let ledger = Ledger::new(project.store(), &project.config.prefix, actor)
+        // The marker is a hint: a failed touch must never fail the append.
+        .with_on_append(move || {
+            let _ = fs::write(&marker, b"");
+        });
     let snapshot = ledger.snapshot()?;
     let projection = Projection::new(project.state_db());
     projection.sync(&snapshot.head, &snapshot.events, &snapshot.state)?;

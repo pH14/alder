@@ -2,15 +2,19 @@
 //! performs effects through [`Effects`]. It never inspects work, attempts, or
 //! questions, and it never composes a prompt beyond the injection line.
 
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 
 use crate::{
     config::Config,
     decide::{
-        self, Decision, EngineChoice, Notice, Poll, Session, SessionAction, Trigger, content_hash,
-        injection, observable_session, pass_timed_out, resolve_engine, session_action,
+        self, Decision, EngineChoice, Notice, Poll, Session, SessionAction, Trigger, Wait,
+        content_hash, injection, observable_session, pass_timed_out, resolve_engine,
+        session_action,
     },
     effects::Effects,
     error::{DriverError, Result},
@@ -19,6 +23,10 @@ use crate::{
 
 /// Consecutive `store_unavailable` results before the driver says so out loud.
 const OUTAGE_NOTICE_AFTER: u32 = 3;
+
+/// The local append marker the Alder CLI touches after each confirmed append.
+/// Statting it is not a read of the log; it only shortens the driver's sleep.
+const APPEND_MARKER: &str = ".alder/last-append";
 
 pub struct Driver<E: Effects> {
     effects: E,
@@ -55,10 +63,35 @@ impl<E: Effects> Driver<E> {
     /// Run until the process is stopped.
     pub fn run(&mut self) -> ! {
         loop {
+            let baseline = self.effects.now();
             if let Err(error) = self.poll_once() {
                 self.effects.log(&format!("poll failed: {error}"));
             }
-            self.effects.sleep(self.config.poll());
+            self.sleep_between_polls(baseline);
+        }
+    }
+
+    /// Wait out one poll interval in hint-sized slices, statting the local
+    /// append marker between slices. An append on this machine after
+    /// `baseline` cuts the wait short, so a Mac-side append is noticed in
+    /// about `hintPollSeconds` rather than up to `pollSeconds`. A missing or
+    /// stale marker changes nothing: the interval simply runs its course.
+    fn sleep_between_polls(&self, baseline: DateTime<Utc>) {
+        let mut waited = Duration::ZERO;
+        loop {
+            let marker = self.effects.file_mtime(Path::new(APPEND_MARKER));
+            match decide::next_wait(&self.config, waited, baseline, marker) {
+                Wait::Poll(reason) => {
+                    if waited < self.config.poll() {
+                        self.effects.log(&format!("polling early: {reason}"));
+                    }
+                    return;
+                }
+                Wait::Sleep(step) => {
+                    self.effects.sleep(step);
+                    waited += step;
+                }
+            }
         }
     }
 
@@ -302,6 +335,7 @@ impl<E: Effects> Driver<E> {
     fn await_pass(&mut self, pass_id: &str, started_at: DateTime<Utc>, handle: &str) -> Result<()> {
         let own_session = handle == format!("tmux:{}", self.config.tmux_session);
         loop {
+            let baseline = self.effects.now();
             let document = self.effects.alder(&["show", pass_id])?;
             let ended = document
                 .pointer("/current/state")
@@ -341,7 +375,10 @@ impl<E: Effects> Driver<E> {
                 self.effects.notify(&format!("pass {pass_id} timed out"));
                 return Ok(());
             }
-            self.effects.sleep(self.config.poll());
+            // The same hint applies while a pass runs: `pass end` is an
+            // append, so a pass ended on this machine is noticed in about a
+            // second rather than a full poll interval.
+            self.sleep_between_polls(baseline);
         }
     }
 

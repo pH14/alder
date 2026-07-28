@@ -39,6 +39,11 @@ the wake deadline the last pass requested. It runs no Git command of its own:
 the head is already in `status`, and a second view of the store would only be
 another thing that can disagree.
 
+A driver may additionally stat `.alder/last-append`, a marker the CLI touches
+after each confirmed append, to shorten the sleep before its next read. A
+stat is not a read of the log: the marker carries no state, only an mtime,
+and its absence merely means the next read happens on the ordinary schedule.
+
 That list is the contract. A driver that reads the ready frontier to decide
 whether waking is worthwhile has started doing the leader's job, and it will
 be wrong in ways nobody can see, because its reasoning is not in the log.

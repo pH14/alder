@@ -67,6 +67,7 @@ properties of the box, not durable project facts.
 | `passDoc` | required | The pass prompt document. A bootstrap injection points the engine at it, and changing its contents ends the current session era. |
 | `tmuxSession` | `alder-leader` | The tmux session name. It also becomes the pass handle, `tmux:<session>`. |
 | `pollSeconds` | 60 | Poll interval, also the interval used while awaiting a pass. |
+| `hintPollSeconds` | 1 | How often to stat the local append marker between full polls. |
 | `debounceSeconds` | 20 | How long a fire condition must hold before injecting. |
 | `maxIntervalSeconds` | 1800 | Ceiling between passes. It also overrides both deferrals. |
 | `passTimeoutSeconds` | 3600 | How long an open pass may live before the driver ends it as `timeout`. |
@@ -118,6 +119,17 @@ Passes are serialized. Alder rejects a second `loop wake` while one is open, so
 two passes cannot run even if two drivers do. The driver that loses the race
 concedes; the next poll adopts whatever pass is open and resolves it under the
 rules above.
+
+## Local hint
+
+Every confirmed append by the `alder` CLI touches `.alder/last-append`.
+Between full polls — and between `show` polls while a pass runs — the driver
+stats that marker every `hintPollSeconds` and runs its next full poll as soon
+as the mtime moves past its last read, so an append made on this machine is
+noticed in about a second rather than up to `pollSeconds`. The hint has zero
+correctness weight: it only ever causes a status read that would have happened
+anyway, appends from other machines still ride the ordinary poll, and a
+missing or stale marker changes nothing.
 
 ## Deferrals
 

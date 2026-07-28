@@ -134,6 +134,35 @@ pub fn decide(config: &Config, state: &LoopState, poll: &Poll) -> Decision {
     Decision::Fire(triggers)
 }
 
+/// One step of the wait between full polls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// Sleep this long, then ask again.
+    Sleep(std::time::Duration),
+    /// Stop waiting and run the next full poll now.
+    Poll(&'static str),
+}
+
+/// The driver waits out its poll interval in hint-sized slices, statting the
+/// local append marker between slices. The marker is a hint with zero
+/// correctness weight: it only ever cuts the wait short, causing a status
+/// read that would have happened anyway, and a missing marker (`None`) simply
+/// lets the interval run its course.
+pub fn next_wait(
+    config: &Config,
+    waited: std::time::Duration,
+    baseline: DateTime<Utc>,
+    marker: Option<DateTime<Utc>>,
+) -> Wait {
+    if marker.is_some_and(|moved| moved > baseline) {
+        return Wait::Poll("the local append marker moved");
+    }
+    if waited >= config.poll() {
+        return Wait::Poll("the poll interval elapsed");
+    }
+    Wait::Sleep(config.hint_poll().min(config.poll() - waited))
+}
+
 /// Which engine the driver should actually run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineChoice {
@@ -520,6 +549,64 @@ mod tests {
         assert_eq!(
             decide(&config, &open, &held),
             Decision::Idle("a pass is already open")
+        );
+    }
+
+    #[test]
+    fn the_wait_slices_by_the_hint_and_a_moved_marker_cuts_it_short() {
+        use std::time::Duration;
+
+        let config = config_for(&[("claude", "claude")]);
+        let baseline = at(0);
+        let slice = Duration::from_secs(1);
+
+        // A missing marker is silently fine: the interval runs its course,
+        // one hint-sized slice at a time. The default poll is 60 seconds.
+        assert_eq!(
+            next_wait(&config, Duration::ZERO, baseline, None),
+            Wait::Sleep(slice)
+        );
+        assert_eq!(
+            next_wait(&config, Duration::from_secs(59), baseline, None),
+            Wait::Sleep(slice)
+        );
+        assert_eq!(
+            next_wait(&config, Duration::from_secs(60), baseline, None),
+            Wait::Poll("the poll interval elapsed")
+        );
+
+        // A marker at or before the baseline is no signal.
+        assert_eq!(
+            next_wait(&config, Duration::ZERO, baseline, Some(at(0))),
+            Wait::Sleep(slice)
+        );
+        assert_eq!(
+            next_wait(&config, Duration::ZERO, baseline, Some(at(-5))),
+            Wait::Sleep(slice)
+        );
+
+        // A marker past the baseline stops the wait at once, even when the
+        // interval has already elapsed too: the marker reason wins.
+        assert_eq!(
+            next_wait(&config, Duration::ZERO, baseline, Some(at(1))),
+            Wait::Poll("the local append marker moved")
+        );
+        assert_eq!(
+            next_wait(&config, Duration::from_secs(60), baseline, Some(at(1))),
+            Wait::Poll("the local append marker moved")
+        );
+
+        // The final slice never overshoots the interval.
+        let uneven: Config = serde_json::from_value(serde_json::json!({
+            "engines": {"claude": {"cmd": "claude"}},
+            "passDoc": ".alder/PASS.md",
+            "pollSeconds": 10,
+            "hintPollSeconds": 3,
+        }))
+        .expect("a valid config");
+        assert_eq!(
+            next_wait(&uneven, Duration::from_secs(9), baseline, None),
+            Wait::Sleep(Duration::from_secs(1))
         );
     }
 

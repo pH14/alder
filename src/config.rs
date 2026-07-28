@@ -103,6 +103,13 @@ impl Project {
     pub fn state_db(&self) -> PathBuf {
         self.root.join(".alder/state.db")
     }
+
+    /// The local append marker. The CLI touches it after every confirmed
+    /// append so a co-located driver can stat its mtime instead of waiting
+    /// out a full poll interval. It is a hint with zero correctness weight.
+    pub fn append_marker(&self) -> PathBuf {
+        self.root.join(".alder/last-append")
+    }
 }
 
 pub fn initialize(start: &Path, prefix: &str, remote: &str, reference: &str) -> Result<InitResult> {

@@ -31,6 +31,10 @@ pub trait Effects {
     fn tmux_send_keys(&self, session: &str, text: &str) -> Result<()>;
     fn tmux_has_clients(&self, session: &str) -> Result<bool>;
     fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
+    /// The modification time of a file, or `None` if it cannot be statted.
+    /// The driver uses this on the local append marker; absence is not an
+    /// error, it is simply no hint.
+    fn file_mtime(&self, path: &Path) -> Option<DateTime<Utc>>;
     fn notify(&self, message: &str);
     fn sleep(&self, duration: Duration);
     fn log(&self, message: &str);
@@ -154,6 +158,16 @@ impl Effects for Host {
         };
         std::fs::read(&path)
             .map_err(|error| DriverError::new(format!("cannot read `{}`: {error}", path.display())))
+    }
+
+    fn file_mtime(&self, path: &Path) -> Option<DateTime<Utc>> {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
+        let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+        Some(DateTime::<Utc>::from(modified))
     }
 
     fn notify(&self, message: &str) {

@@ -998,6 +998,28 @@ fn a_nudge_is_pending_only_until_the_next_wake() {
 }
 
 #[test]
+fn every_confirmed_append_touches_the_local_marker() {
+    let project = TestProject::new();
+    let marker = project.work.join(".alder/last-append");
+    let mtime = |marker: &Path| fs::metadata(marker).unwrap().modified().unwrap();
+    // `init` starts no driver, so it wires no hook; the marker appears with
+    // the first ordinary mutation.
+    assert!(!marker.exists());
+    project.success(&["work", "add", "--title", "Touch the marker"]);
+    assert!(marker.exists());
+
+    let stamped = mtime(&marker);
+    // A read leaves the marker alone, and so does a failed mutation.
+    project.success(&["status"]);
+    assert_eq!(mtime(&marker), stamped);
+    project.failure(&["work", "start", "hm-missing"]);
+    assert_eq!(mtime(&marker), stamped);
+    // Another confirmed append advances it.
+    project.success(&["loop", "nudge"]);
+    assert!(mtime(&marker) >= stamped);
+}
+
+#[test]
 fn refresh_reports_change_without_counting_metadata_churn() {
     let project = TestProject::new();
     let work = string(
