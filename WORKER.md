@@ -75,6 +75,11 @@ when it arrives. Never stall silently.
 
 - Never push. Never touch git remotes. Never force anything.
 - Touch nothing outside this worktree.
+- A test that spawns tmux must run on an isolated server: `tmux -S <socket>`
+  (or `-L <label>`) with `TMUX` unset on every call, and tear down one
+  session by exact name. Inside a tmux pane — where you live — `$TMUX` names
+  the real server and takes precedence, so `TMUX_TMPDIR` isolates nothing and
+  a bare `kill-server` kills every worker on the machine.
 - Never run `alder work add` — if you discover new work worth doing, submit
   `alder handoff add` instead; admission is the leader's call.
 - You may `work ask` on your own item and `attempt edit` your own attempt.
