@@ -7,7 +7,8 @@ use crate::error::{AlderError, Result};
 
 use super::{
     Attempt, AttemptCheck, AttemptOutcome, AttemptState, CheckStatus, Event, EventPayload, Handoff,
-    HandoffState, Question, QuestionAnswer, Work, WorkOperation, WorkState, WorkStateChange,
+    HandoffState, LoopControl, Pass, PassState, Question, QuestionAnswer, Work, WorkOperation,
+    WorkState, WorkStateChange,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -16,6 +17,8 @@ pub struct ProjectState {
     pub work: BTreeMap<String, Work>,
     pub attempts: BTreeMap<String, Attempt>,
     pub questions: BTreeMap<String, Question>,
+    pub passes: BTreeMap<String, Pass>,
+    pub loop_control: LoopControl,
 }
 
 impl ProjectState {
@@ -589,6 +592,95 @@ impl ProjectState {
                     actor: event.actor.clone(),
                 });
             }
+            EventPayload::PassStarted { pass } => {
+                if self.passes.contains_key(&pass.id) {
+                    return Err(AlderError::validation(format!(
+                        "pass `{}` already exists",
+                        pass.id
+                    )));
+                }
+                if let Some(open) = self.open_pass() {
+                    return Err(AlderError::with_context(
+                        "pass_open",
+                        format!("pass `{}` is still open", open.id),
+                        json!({"pass_id": open.id, "engine": open.engine}),
+                    ));
+                }
+                require_text("pass engine", &pass.engine)?;
+                validate_handle(&pass.handle)?;
+                let mut triggers = pass.triggers.clone();
+                triggers.sort();
+                triggers.dedup();
+                self.passes.insert(
+                    pass.id.clone(),
+                    Pass {
+                        id: pass.id.clone(),
+                        engine: pass.engine.clone(),
+                        handle: pass.handle.clone(),
+                        triggers,
+                        state: PassState::Open,
+                        outcome: None,
+                        report: None,
+                        wake_at: None,
+                        rotate: false,
+                        why: None,
+                        at_head: pass.at_head,
+                        started_at: event.at,
+                        started_seq: seq,
+                        ended_at: None,
+                        ended_seq: None,
+                    },
+                );
+                // A wake consumes any pending rotation simply by being later in
+                // the log than its request.
+                self.loop_control.last_wake_seq = Some(seq);
+            }
+            EventPayload::PassEnded {
+                pass_id,
+                outcome,
+                report,
+                wake_at,
+                rotate,
+                why,
+            } => {
+                let pass = self
+                    .passes
+                    .get_mut(pass_id)
+                    .ok_or_else(|| AlderError::not_found("pass", pass_id))?;
+                if pass.state == PassState::Ended {
+                    return Err(AlderError::with_context(
+                        "pass_ended",
+                        format!("pass `{pass_id}` has already ended"),
+                        json!({"pass_id": pass_id, "outcome": pass.outcome}),
+                    ));
+                }
+                pass.state = PassState::Ended;
+                pass.outcome = Some(*outcome);
+                pass.report = report.clone().filter(|report| !report.trim().is_empty());
+                pass.wake_at = *wake_at;
+                pass.rotate = *rotate;
+                pass.why = why.clone().filter(|why| !why.trim().is_empty());
+                pass.ended_at = Some(event.at);
+                pass.ended_seq = Some(seq);
+                if *rotate {
+                    self.loop_control.rotate_requested_seq = Some(seq);
+                }
+            }
+            EventPayload::LoopPaused { why } => {
+                self.loop_control.paused = true;
+                self.loop_control.pause_reason = why.clone().filter(|why| !why.trim().is_empty());
+            }
+            EventPayload::LoopResumed {} => {
+                self.loop_control.paused = false;
+                self.loop_control.pause_reason = None;
+            }
+            EventPayload::LoopEngineSelected { engine } => {
+                require_text("engine", engine)?;
+                self.loop_control.engine = Some(engine.clone());
+            }
+            EventPayload::LoopRotationRequested { .. } => {
+                self.loop_control.rotate_requested_seq = Some(seq);
+            }
         }
         Ok(())
     }
@@ -704,6 +796,22 @@ impl ProjectState {
         Ok(())
     }
 
+    /// The one pass that has not ended, if any. Passes are serialized, so this
+    /// is the loop's equivalent of one active attempt per work item.
+    pub fn open_pass(&self) -> Option<&Pass> {
+        self.passes
+            .values()
+            .find(|pass| pass.state == PassState::Open)
+    }
+
+    /// The most recently ended pass in log order.
+    pub fn last_ended_pass(&self) -> Option<&Pass> {
+        self.passes
+            .values()
+            .filter(|pass| pass.state == PassState::Ended)
+            .max_by_key(|pass| pass.ended_seq)
+    }
+
     pub fn active_attempt_for(&self, work_id: &str) -> Option<&Attempt> {
         self.attempts.values().find(|attempt| {
             attempt.work_id == work_id
@@ -804,6 +912,14 @@ impl ProjectState {
             return Err(AlderError::with_context(
                 "config_conflict",
                 format!("configured prefix `{prefix}` does not match handoff `{id}`"),
+                json!({"prefix": prefix, "id": id}),
+            ));
+        }
+        let pass_prefix = format!("{prefix}-pass-");
+        if let Some(id) = self.passes.keys().find(|id| !id.starts_with(&pass_prefix)) {
+            return Err(AlderError::with_context(
+                "config_conflict",
+                format!("configured prefix `{prefix}` does not match pass `{id}`"),
                 json!({"prefix": prefix, "id": id}),
             ));
         }
@@ -1632,6 +1748,203 @@ mod tests {
         for invalid in ["tmux", "Bad:worker", "tmux:"] {
             assert!(validate_handle(invalid).is_err(), "{invalid}");
         }
+    }
+
+    fn wake(id: &str) -> EventPayload {
+        EventPayload::PassStarted {
+            pass: crate::domain::PassDefinition {
+                id: id.to_owned(),
+                engine: "claude".to_owned(),
+                handle: "tmux:alder-leader".to_owned(),
+                triggers: vec![
+                    crate::domain::PassTrigger::Log,
+                    crate::domain::PassTrigger::Log,
+                ],
+                at_head: 0,
+            },
+        }
+    }
+
+    fn end(id: &str, rotate: bool) -> EventPayload {
+        EventPayload::PassEnded {
+            pass_id: id.to_owned(),
+            outcome: crate::domain::PassOutcome::Ok,
+            report: Some("did the work\nsecond line".to_owned()),
+            wake_at: None,
+            rotate,
+            why: None,
+        }
+    }
+
+    #[test]
+    fn only_one_pass_may_be_open_at_a_time() {
+        let mut state = ProjectState::default();
+        state.apply(&event(1, wake("hm-pass-1"))).unwrap();
+        assert_eq!(state.open_pass().unwrap().id, "hm-pass-1");
+        // Triggers are deduplicated so the record reads cleanly.
+        assert_eq!(state.passes["hm-pass-1"].triggers.len(), 1);
+
+        assert_eq!(
+            state.apply(&event(2, wake("hm-pass-2"))).unwrap_err().code,
+            "pass_open"
+        );
+        assert_eq!(
+            state.apply(&event(2, wake("hm-pass-1"))).unwrap_err().code,
+            "validation_failed"
+        );
+
+        state.apply(&event(2, end("hm-pass-1", false))).unwrap();
+        assert!(state.open_pass().is_none());
+        assert_eq!(state.last_ended_pass().unwrap().id, "hm-pass-1");
+        assert_eq!(
+            state.passes["hm-pass-1"].report_line(),
+            Some("did the work")
+        );
+        assert_eq!(
+            state
+                .apply(&event(3, end("hm-pass-1", false)))
+                .unwrap_err()
+                .code,
+            "pass_ended"
+        );
+        assert_eq!(
+            state
+                .apply(&event(3, end("hm-pass-9", false)))
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+        state.apply(&event(3, wake("hm-pass-2"))).unwrap();
+        assert_eq!(state.open_pass().unwrap().id, "hm-pass-2");
+    }
+
+    #[test]
+    fn a_wake_consumes_the_rotation_that_precedes_it() {
+        let mut state = ProjectState::default();
+        assert!(!state.loop_control.rotate_pending());
+
+        state
+            .apply(&event(1, EventPayload::LoopRotationRequested { why: None }))
+            .unwrap();
+        assert!(state.loop_control.rotate_pending());
+
+        state.apply(&event(2, wake("hm-pass-1"))).unwrap();
+        assert!(!state.loop_control.rotate_pending());
+
+        // `pass end --rotate` requests the next rotation the same way.
+        state.apply(&event(3, end("hm-pass-1", true))).unwrap();
+        assert!(state.loop_control.rotate_pending());
+        assert!(state.passes["hm-pass-1"].rotate);
+
+        state.apply(&event(4, wake("hm-pass-2"))).unwrap();
+        assert!(!state.loop_control.rotate_pending());
+    }
+
+    #[test]
+    fn pause_resume_and_engine_selection_are_last_writer_wins() {
+        let mut state = ProjectState::default();
+        assert!(!state.loop_control.paused);
+        assert_eq!(state.loop_control.engine, None);
+
+        state
+            .apply(&event(
+                1,
+                EventPayload::LoopPaused {
+                    why: Some("release freeze".to_owned()),
+                },
+            ))
+            .unwrap();
+        assert!(state.loop_control.paused);
+        assert_eq!(
+            state.loop_control.pause_reason.as_deref(),
+            Some("release freeze")
+        );
+
+        state
+            .apply(&event(
+                2,
+                EventPayload::LoopPaused {
+                    why: Some(" ".to_owned()),
+                },
+            ))
+            .unwrap();
+        assert!(state.loop_control.paused);
+        assert_eq!(state.loop_control.pause_reason, None);
+
+        state
+            .apply(&event(3, EventPayload::LoopResumed {}))
+            .unwrap();
+        assert!(!state.loop_control.paused);
+        assert_eq!(state.loop_control.pause_reason, None);
+
+        for engine in ["claude", "codex"] {
+            state
+                .apply(&event(
+                    4,
+                    EventPayload::LoopEngineSelected {
+                        engine: engine.to_owned(),
+                    },
+                ))
+                .unwrap();
+            assert_eq!(state.loop_control.engine.as_deref(), Some(engine));
+        }
+        assert_eq!(
+            state
+                .apply(&event(
+                    5,
+                    EventPayload::LoopEngineSelected {
+                        engine: " ".to_owned(),
+                    },
+                ))
+                .unwrap_err()
+                .code,
+            "validation_failed"
+        );
+    }
+
+    #[test]
+    fn passes_must_carry_a_valid_engine_handle_and_prefix() {
+        let mut state = ProjectState::default();
+        let invalid_engine = EventPayload::PassStarted {
+            pass: crate::domain::PassDefinition {
+                id: "hm-pass-1".to_owned(),
+                engine: " ".to_owned(),
+                handle: "tmux:alder-leader".to_owned(),
+                triggers: vec![],
+                at_head: 0,
+            },
+        };
+        assert_eq!(
+            state
+                .clone()
+                .apply(&event(1, invalid_engine))
+                .unwrap_err()
+                .code,
+            "validation_failed"
+        );
+        let invalid_handle = EventPayload::PassStarted {
+            pass: crate::domain::PassDefinition {
+                id: "hm-pass-1".to_owned(),
+                engine: "claude".to_owned(),
+                handle: "no-kind".to_owned(),
+                triggers: vec![],
+                at_head: 0,
+            },
+        };
+        assert_eq!(
+            state
+                .clone()
+                .apply(&event(1, invalid_handle))
+                .unwrap_err()
+                .code,
+            "validation_failed"
+        );
+
+        state.apply(&event(1, wake("other-pass-1"))).unwrap();
+        assert_eq!(
+            state.validate_prefix("hm").unwrap_err().code,
+            "config_conflict"
+        );
     }
 
     #[test]

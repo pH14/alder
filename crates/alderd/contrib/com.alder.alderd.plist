@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sample launchd agent for alderd.
+
+  Copy to ~/Library/LaunchAgents/com.alder.alderd.plist, replace every
+  /Users/you path, then:
+
+      launchctl load ~/Library/LaunchAgents/com.alder.alderd.plist
+
+  alderd runs one project. Use one copy per project, with a distinct Label,
+  and give each project a distinct tmuxSession in its .alder/driver.json.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.alder.alderd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/you/.cargo/bin/alderd</string>
+        <string>--root</string>
+        <string>/Users/you/workspace/harmony</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/you/workspace/harmony</string>
+
+    <!-- alderd shells out to alder, git, and tmux, so they must be on PATH. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/you/.cargo/bin</string>
+        <key>ALDER_ACTOR</key>
+        <string>alderd</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- The daemon paces itself; do not let launchd throttle a restart loop
+         faster than one poll interval. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/you/Library/Logs/alderd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/you/Library/Logs/alderd.log</string>
+
+    <!-- alderd wakes an interactive agent; it has no business running when
+         nobody is logged in. LimitLoadToSessionType keeps it in the GUI
+         session where its tmux server lives. -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+</dict>
+</plist>

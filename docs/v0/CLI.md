@@ -4,6 +4,49 @@ The CLI is organized around the project-driving workflow, not the storage
 model. Alder itself stores no leader or writer role; repository skills may
 assign those roles above the CLI.
 
+## Grammar
+
+Five rules decide where a command goes. They are not style preferences; each
+one removes a class of ambiguity that cost a reader a lookup.
+
+**Queries are global.** A reader wants one answer about the project, not one
+answer per noun. `status`, `next`, `show`, `refresh`, and `reconcile` take no
+noun.
+
+**Mutations name their noun.** Every command that appends starts with the thing
+it changes: `alder work start`, `alder attempt end`, `alder loop wake`.
+
+**The noun is the ID type.** `alder work drop <id>` takes a work ID; `alder
+attempt end <id>` takes an attempt ID; `alder pass end <id>` takes a pass ID.
+Alder never infers the resource from an ID's shape, even though the shapes
+differ.
+
+**Parents create; records answer for themselves.** Work creates attempts
+(`work start`) and the loop creates passes (`loop wake`), because the parent
+knows whether another one is allowed. A record that already exists closes
+itself: `attempt end`, `pass end`.
+
+**`edit` never changes state; verbs transition.** `work edit` changes fields,
+dependencies, and checks. Blocking is `work block`, unblocking is
+`work unblock`, ending an attempt is `attempt end`. This is why reading a
+transcript never requires checking which flags an `edit` carried.
+
+The complete surface:
+
+| Global | Work | Attempt | Question | Handoff | Loop | Pass |
+| --- | --- | --- | --- | --- | --- | --- |
+| `init` | `add` | `edit` | `answer` | `add` | `wake` | `end` |
+| `status` | `edit` | `end` | | | `pause` | |
+| `next` | `start` | | | | `resume` | |
+| `show` | `finish` | | | | `use` | |
+| `refresh` | `drop` | | | | `rotate` | |
+| `reconcile` | `reopen` | | | | | |
+| `debug` | `block` | | | | | |
+| | `unblock` | | | | | |
+| | `ask` | | | | | |
+
+## Output
+
 Every command supports the global `--json` flag. Human-readable output is the
 default; JSON is the only structured output format in v0.
 
@@ -12,25 +55,26 @@ to reads, successful mutations, and expected failures. A failure still returns
 a nonzero process status. JSON output contains no tables, color, progress
 indicators, or surrounding prose.
 
-Each result carries a command-specific schema identifier. Field names and
-types are stable, absent values are explicit `null`, and arrays with meaningful
-order are deterministic. Mutation results include their durable IDs, event ID,
-and resulting head. Errors use stable codes and structured context rather than
-requiring a caller to interpret prose.
+Each result carries a command-specific schema identifier, which follows the
+grammar: `alder.<noun>.<verb>.v0` for mutations, `alder.<query>.v0` for
+queries. Field names and types are stable, absent values are explicit `null`,
+and arrays with meaningful order are deterministic. Mutation results include
+their durable IDs, event ID, and resulting head. Errors use stable codes and
+structured context rather than requiring a caller to interpret prose.
 
 For example:
 
 ```text
-$ alder start hm-9a1 --json
-{"schema":"alder.start.v0","head":4212,"work_id":"hm-9a1","attempt_id":"hm-9a1-attempt-1","event_id":"01K..."}
+$ alder work start hm-9a1 --json
+{"schema":"alder.work.start.v0","head":4212,"work_id":"hm-9a1","attempt_id":"hm-9a1-attempt-1","event_id":"01K..."}
 ```
 
 Examples below illustrate intent; detailed JSON schemas remain to be frozen by
 paper replay.
 
 The examples assume the repository prefix `hm`. Work IDs use that prefix;
-attempt and question IDs extend their work ID, while handoff IDs extend only
-the repository prefix because they exist before admission.
+attempt and question IDs extend their work ID, while handoff and pass IDs
+extend only the repository prefix because they belong to no work item.
 
 ## Initialization
 
@@ -80,7 +124,7 @@ standard Git transport and requires no GitHub API integration.
 
 The expected head is not a public command argument. V0 has no `--if-head`
 option. A change already present when the command begins is part of the state
-against which the command is validated. `add handoff` alone may automatically
+against which the command is validated. `handoff add` alone may automatically
 retry after a conflict because its uniquely identified submission is inert.
 
 Every ordinary named read and mutation first establishes the current shared
@@ -101,6 +145,10 @@ attention
   hm-2b7  attempt hm-2b7-attempt-1 absent; last progress 3h ago
   hm-8c3  question hm-8c3-question-1 answered; still blocked
 
+loop
+  engine claude
+  open hm-pass-19  claude  tmux:alder-leader  started 2026-07-27T09:41:02Z
+
 handoffs
   hm-handoff-f27  Frame index v2  specs/frame-index-v2.md
 
@@ -119,6 +167,16 @@ waiting on human
 stale-attempt classification; the caller judges elapsed time. A failed refresh
 produces `unknown` rather than presenting an older observation as current.
 
+The `loop` section reports the loop's desired state and its two interesting
+passes: whether it is paused and why, the desired engine, whether a rotation is
+pending, the open pass, and the last ended pass with its outcome, the first
+line of its report, any wake time it requested, and the head it ended at.
+Comparing that `ended_seq` with the document's own `head` tells a reader
+whether anything has been appended since the loop last ran, without the reader
+remembering anything. It is omitted from human output when the loop has nothing
+to say. In `--json` it is always present under the `loop` key. See
+[LOOP.md](LOOP.md).
+
 With a structured graph change:
 
 ```text
@@ -129,7 +187,7 @@ hypothetical · based on head 4211 · replan.json · not written
 
 The hypothetical durable state is combined with the current external
 observations. Nothing is appended, and the hypothetical change is not written
-to the local projection. Ordinary head synchronization may first rebuild a
+to the local projection. Ordinary head synchronization may first rebuild an
 out-of-date projection.
 
 ### `alder next [--with <changes>]`
@@ -149,8 +207,8 @@ hypothetical · based on head 4211 · replan.json · not written
 $build-index  Build frame index  priority 90
 ```
 
-`--with` accepts the same structured document as `add work --from` or
-`edit work --from`; `--with -` reads it from standard input. Alder validates
+`--with` accepts the same structured document as `work add --from` or
+`work edit --from`; `--with -` reads it from standard input. Alder validates
 the document, applies it to an in-memory projection, and then runs the ordinary
 query.
 
@@ -161,17 +219,18 @@ head. `--with` also composes with `--json`.
 
 ### `alder show <id>`
 
-Show current state and compact history for a handoff, work item, attempt, or
-question.
+Show current state and compact history for a handoff, work item, attempt,
+question, or pass. `show` is global because a reader with an ID in hand should
+not have to know which kind it is.
 
 ## Handoffs
 
-### `alder add handoff`
+### `alder handoff add`
 
 Submit an asynchronous handoff without waiting for the driving agent:
 
 ```text
-$ alder add handoff \
+$ alder handoff add \
     --title "Frame index v2" \
     --ref specs/frame-index-v2.md \
     --note "Scoped in the side session; integrate behind hm-9a1"
@@ -184,22 +243,23 @@ handoff is durably appended; the driving agent may be busy.
 Repository-tuned handoff skills should call this only after an explicit human
 request such as "handoff to leader." Even if an agent submits one
 unexpectedly, it cannot become actionable work without an explicit
-`add work --from-handoff`.
+`work add --handoff`.
 
-`add handoff` does not accept work-shaping fields such as priority,
+`handoff add` does not accept work-shaping fields such as priority,
 dependencies, or checks. Those are admission decisions made if the handoff is
 admitted. The handoff's note may convey urgency or other context without
 affecting scheduling.
 
 Submitted handoffs appear in `alder status`; `alder show <handoff>` provides
-their detail. There is no separate handoff command namespace.
+their detail.
 
-### `alder add work --from-handoff <handoff>`
+### `alder work add --handoff <handoff>`
 
-A writer admits the handoff:
+A writer admits the handoff. The noun is `work` because the command creates
+work; `--handoff` names its source.
 
 ```text
-$ alder add work --from-handoff hm-handoff-f27 \
+$ alder work add --handoff hm-handoff-f27 \
     --priority 70 \
     --requires hm-9a1 \
     --check report:"findings documented"
@@ -215,13 +275,10 @@ unintegrated handoff remains visible.
 
 ## Admission and editing
 
-`add` always requires an explicit resource name. V0 supports `work` and
-`handoff`; it never infers a handoff from omitted work fields.
-
-### `alder add work`
+### `alder work add`
 
 ```text
-$ alder add work \
+$ alder work add \
     --title "Film projector seek" \
     --spec specs/film-projector-seek.md \
     --priority 80 \
@@ -231,18 +288,18 @@ $ alder add work \
 hm-9a1
 ```
 
-Running `add work` is the admission decision. There is no `propose` command in
+Running `work add` is the admission decision. There is no `propose` command in
 v0.
 
 Alder does not authorize one writer over another. Repository skills should
-reserve `add work` for the agent responsible for admission and direct workers
-and side sessions to `add handoff`. This is workflow policy rather than a
+reserve `work add` for the agent responsible for admission and direct workers
+and side sessions to `handoff add`. This is workflow policy rather than a
 durable Alder role.
 
 To admit several related items atomically:
 
 ```text
-$ alder add work --from new-work.json
+$ alder work add --from new-work.json
 build-index     hm-b11
 validate-index  hm-b12
 ```
@@ -253,56 +310,26 @@ validation and prints the resulting mapping. `--from -` reads the same format
 from standard input.
 
 Every item is admitted or none is. An `edit` section is rejected by
-`add work --from`; mixed graph changes use the structured `edit work` form.
+`work add --from`; mixed graph changes use the structured `work edit` form.
 
-`edit` always requires an explicit resource name. Alder does not infer
-`work` or `attempt` from an ID, even though their ID formats differ. Only
-those two resources support `edit` in v0.
+### `alder work edit [<work>]`
 
-### `alder edit work [<work>]`
-
-Edits title, spec, priority, dependencies, check definitions, or work state.
+Edits title, spec, priority, dependencies, or check definitions. It never
+changes work state.
 
 Dependency and check edits are rejected while an attempt is active. Edits
 that would create a dependency cycle are rejected.
 
 ```text
-$ alder edit work hm-9a1 --add-requires hm-a22 \
+$ alder work edit hm-9a1 --add-requires hm-a22 \
     --why "seek now depends on rebuilt frame index"
 ```
-
-Blocking is also a work edit:
-
-```text
-$ alder edit work hm-9a1 --block \
-    --why "release credentials are not available"
-```
-
-There is no separate block object or condition language. If another Alder
-work item is the prerequisite, use `--add-requires` instead.
-
-Blocking work with an active attempt prevents a later start but does not stop
-the existing external execution. The repository skill may leave that
-execution waiting. To terminate it and leave the work blocked, block the work
-first, stop the external execution through its native system, and then record
-the attempt's end with `alder edit attempt --end`. Blocking first makes the
-sequence safe if the caller crashes between mutations: another attempt cannot
-start.
-
-Opening blocked work is explicit:
-
-```text
-$ alder edit work hm-9a1 --unblock \
-    --why "release credentials were installed"
-```
-
-`--unblock` is rejected while the work has an unanswered question.
 
 For an atomic create-and-rewire operation, omit the work argument and provide
 a graph-change document:
 
 ```text
-$ alder edit work --from replan.json
+$ alder work edit --from replan.json
 build-index     hm-b11  added
 validate-index  hm-b12  added
 hm-9a1                   edited
@@ -338,12 +365,15 @@ hm-2b7                   edited
 }
 ```
 
-In this form, `edit work` means editing the work graph, so the document may
+In this form, `work edit` means editing the work graph, so the document may
 contain both additions and edits. This avoids a separate `apply`, `batch`, or
 `transaction` command. The document has no durable state of its own. Its
 top-level `why` records one reason for the complete change and is required
-when the document contains edits. `edit work --from` requires at least one
-edit operation; an additions-only document belongs to `add work --from`.
+when the document contains edits. `work edit --from` requires at least one
+edit operation; an additions-only document belongs to `work add --from`.
+
+The document carries no state fields. `edit` never changes state, in the flags
+or in the document, so a graph change cannot quietly block a work item.
 
 The CLI allocates IDs, resolves local references, applies every operation to a
 temporary projection, and validates the final graph. It then appends one
@@ -358,10 +388,36 @@ Dependency or check changes to work with an active attempt reject the entire
 document. The atomic boundary covers Alder state only; it cannot stop or
 rewrite external executions.
 
-### `alder reopen <work>`
+### `alder work block <work> --why <reason>`
+
+Block work on something that is not another Alder work item:
 
 ```text
-$ alder reopen hm-9a1 --why "merged implementation regressed frame zero"
+$ alder work block hm-9a1 --why "release credentials are not available"
+```
+
+There is no separate block object or condition language. If another Alder
+work item is the prerequisite, use `work edit --add-requires` instead.
+
+Blocking work with an active attempt prevents a later start but does not stop
+the existing external execution. The repository skill may leave that
+execution waiting. To terminate it and leave the work blocked, block the work
+first, stop the external execution through its native system, and then record
+the attempt's end with `alder attempt end`. Blocking first makes the sequence
+safe if the caller crashes between mutations: another attempt cannot start.
+
+### `alder work unblock <work> --why <reason>`
+
+```text
+$ alder work unblock hm-9a1 --why "release credentials were installed"
+```
+
+`unblock` is rejected while the work has an unanswered question.
+
+### `alder work reopen <work>`
+
+```text
+$ alder work reopen hm-9a1 --why "merged implementation regressed frame zero"
 ```
 
 Reopening keeps the same work identity and preserves its attempts. If it would
@@ -371,10 +427,12 @@ confirmation or override flag.
 
 ## Attempts
 
-### `alder start <work>`
+### `alder work start <work>`
+
+Work creates its attempts, so the noun is `work`:
 
 ```text
-$ alder start hm-9a1 \
+$ alder work start hm-9a1 \
     --meta engine=opus-5 \
     --meta requested_host=box-a
 hm-9a1-attempt-1
@@ -389,16 +447,16 @@ The command:
 
 A repository-tuned skill then launches the worker, stamps it with
 `hm-9a1-attempt-1`, and attaches the resulting external handle with
-`alder edit attempt`. This wrapper owns choices such as engine, host, and cloud
+`alder attempt edit`. This wrapper owns choices such as engine, host, and cloud
 allocation. Alder records those choices as metadata but does not interpret
 them.
 
-A second `start` is rejected while an active attempt exists.
+A second `work start` is rejected while an active attempt exists.
 
-### `alder edit attempt <attempt>`
+### `alder attempt edit <attempt>`
 
 ```text
-$ alder edit attempt hm-9a1-attempt-1 \
+$ alder attempt edit hm-9a1-attempt-1 \
     --handle tmux:nimbus-box-17/alder-hm-9a1-attempt-1 \
     --meta host=nimbus:box-17 \
     --meta toolchain=rustc-1.91-zzz
@@ -415,30 +473,35 @@ refreshed until a matching observation command is configured.
 Attaching a handle is a one-way transition: the attempt must not already have
 one, and the handle cannot later be replaced or cleared. Alder records the
 edit as `attempt.bound`. This is a strict field-specific rule of
-`edit attempt`, not a separate command.
+`attempt edit`, not a separate command.
 
 Attempt metadata is open ended. Repository skills define useful conventions;
 Alder never gates core behavior on metadata keys.
 
 ```text
-$ alder edit attempt hm-9a1-attempt-1 \
-    --check tests=satisfied \
+$ alder attempt edit hm-9a1-attempt-1 \
+    --satisfied tests \
     --evidence "CI run 4212-a" \
     --meta pr=github:owner/repo/pull/171 \
     --note "PR 171 opened"
 ```
 
+A check result names its verdict in the flag: `--satisfied <check>` or
+`--failed <check>`, each repeatable and each requiring `--evidence`. `pending`
+is the state every check starts in and is not a result a caller records.
+
 Attempt edits record meaningful milestones. They are not expected on every
 poll. An edit to an ended attempt is rejected.
 
-When several checks need different evidence, repeat the command or provide
-one evidence value per check in the eventual structured CLI.
+When several checks need different evidence, repeat the command.
 
-Ending a non-successful attempt is also an attempt edit:
+### `alder attempt end <attempt>`
+
+The attempt is the record that exists, so it closes itself:
 
 ```text
-$ alder edit attempt hm-9a1-attempt-1 \
-    --end failed \
+$ alder attempt end hm-9a1-attempt-1 \
+    --outcome failed \
     --why "worker exited before producing a patch"
 ```
 
@@ -449,22 +512,22 @@ End outcomes:
 - `lost`
 - `not-started`
 
-`--end` changes only the attempt. Ordinarily its work remains open; work
-already blocked while the attempt was active remains blocked. There are no
-`--block` or `--drop` attempt-edit flags.
+Ending changes only the attempt. Ordinarily its work remains open; work
+already blocked while the attempt was active remains blocked. There is no
+`--block` or `--drop` option: those are work verbs.
 
 Ending the durable Alder attempt rejects later progress edits. It does not
 terminate the external execution. When the handle may still be live, the
 repository skill must stop it through its native system and confirm that
-result before recording `--end`. A new `start` remains rejected until the old
-attempt is durably ended.
+result before recording the end. A new `work start` remains rejected until the
+old attempt is durably ended.
 
 ## Completion and dropping
 
-### `alder finish <work>`
+### `alder work finish <work>`
 
 ```text
-$ alder finish hm-9a1 --attempt hm-9a1-attempt-1
+$ alder work finish hm-9a1 --attempt hm-9a1-attempt-1
 ```
 
 Ordinary completion requires every declared check for that attempt to be
@@ -473,16 +536,16 @@ satisfied. V0 has no optional or non-gating check type.
 Work completed outside Alder uses:
 
 ```text
-$ alder finish hm-9a1 --external --evidence "PR 171 merged"
+$ alder work finish hm-9a1 --external --evidence "PR 171 merged"
 ```
 
 External completion is explicit because it bypasses the ordinary attempt
 contract.
 
-### `alder drop <work>`
+### `alder work drop <work>`
 
 ```text
-$ alder drop hm-9a1 \
+$ alder work drop hm-9a1 \
     --attempt hm-9a1-attempt-1 \
     --outcome cancelled \
     --why "spike showed the approach cannot work"
@@ -504,10 +567,12 @@ attempt.
 
 ## Questions
 
-### `alder ask <work>`
+### `alder work ask <work> "<question>"`
+
+Work creates its questions:
 
 ```text
-$ alder ask hm-3bwm \
+$ alder work ask hm-3bwm \
     "Ship masked digest now, or wait for AA-6?"
 hm-3bwm-question-1
 ```
@@ -515,21 +580,106 @@ hm-3bwm-question-1
 Asking atomically records the question and blocks the work. V0 has no
 standalone or informational questions.
 
-### `alder answer <question>`
+### `alder question answer <question> "<answer>"`
 
 ```text
-$ alder answer hm-3bwm-question-1 \
+$ alder question answer hm-3bwm-question-1 \
     "Ship masked digest; AA-6 is not a gate."
 ```
 
 The answer is durable but does not unblock the work. The driving agent reviews
 it, adjusts the spec, dependencies, or checks if needed, and explicitly
-unblocks it through `alder edit work`. An answer can arrive while that agent is
-busy or being replaced. The invoking environment supplies the best-effort
+unblocks it through `alder work unblock`. An answer can arrive while that agent
+is busy or being replaced. The invoking environment supplies the best-effort
 actor identity recorded on the event; Alder does not use it for authorization.
 
 Answering an already answered question records a revision while retaining the
 prior answer.
+
+## The loop
+
+The loop is a singleton per log and passes are its run records: work is to an
+attempt what the loop is to a pass. [LOOP.md](LOOP.md) defines the design.
+
+### `alder loop wake --engine <name> --handle <kind>:<value> [--trigger <kind>]...`
+
+The loop is the parent, so the loop opens the pass:
+
+```text
+$ alder loop wake --engine claude --handle tmux:alder-leader \
+    --trigger log --trigger due
+hm-pass-19
+```
+
+The engine name is an opaque string. Alder stores it and never validates it.
+Trigger kinds are `log`, `observations`, `due`, and `manual`; they are
+informational provenance and never limit what the pass must do. A wake with no
+stated trigger records `manual`, because it came from a person.
+
+The wake also records the head it was appended at, so a later reader knows what
+the pass saw.
+
+A wake is rejected with `pass_open` while a pass is open. This mirrors one
+active attempt per work item, and it is what makes two concurrent drivers
+harmless.
+
+### `alder pass end [<pass>] --outcome ok|crashed|timeout`
+
+The pass is the record that exists, so it closes itself. Omitting the ID ends
+the open pass; with no open pass the command returns `no_open_pass`.
+
+```text
+$ alder pass end --outcome ok \
+    --report "Integrated hm-handoff-f27; started hm-9a1; ARM lane still blocked." \
+    --wake 20m
+hm-pass-19  ended ok
+```
+
+- `--report` is the iteration report, free text. `status` shows its first line.
+- `--wake <duration>` requests the next wake at a point in the future. It
+  accepts `270s`, `20m`, `1h`, or `2d` and is stored as an absolute time, so a
+  reader never has to know when the pass ended.
+- `--rotate` asks the next wake to start on a fresh session.
+- `--why` explains a non-`ok` outcome.
+
+Ending an already-ended pass returns `pass_ended`.
+
+### `alder loop pause [--why <reason>]` and `alder loop resume`
+
+Desired state, folded last-writer-wins:
+
+```text
+$ alder loop pause --why "release freeze until Thursday"
+loop paused
+$ alder loop resume
+loop resumed
+```
+
+Pause is advisory to the driver, not an Alder-enforced lock: `loop wake` is
+still accepted while paused, so a human can run one deliberate pass without
+first resuming.
+
+### `alder loop use <engine>`
+
+```text
+$ alder loop use codex
+loop engine codex
+```
+
+The desired engine name, folded last-writer-wins. It is an opaque string;
+Alder stores it and never validates it. The driver decides whether it can run
+that engine.
+
+### `alder loop rotate [--why <reason>]`
+
+```text
+$ alder loop rotate --why "engine upgraded"
+rotation requested
+```
+
+A one-shot request that the next wake start on a fresh session. Rotation is
+pending exactly when a rotation request is later in the log than the most
+recent wake, so the next wake consumes it. There is no flag to clear.
 
 ## Repair
 
@@ -565,12 +715,19 @@ $ alder refresh
 observed 7 handles: 5 present, 1 absent, 1 unknown
 unbound:
   nimbus:box-22  present  state=running  estimated_cost=31.70
+changed since the previous refresh
 ```
 
 An exit-zero, valid array is a complete snapshot. Returned values are present;
 omitted durable handles of that kind are absent. After four failed executions,
 the kind is unknown and failed output cannot establish absence. Timeouts
 terminate the complete shell pipeline.
+
+The result carries `"changed": bool` — whether this snapshot differs from the
+stored one. The comparison covers handle identity, presence or absence, and
+attempt binding only. Observation metadata is non-semantic by design, so a
+moving cost ticker or a changing uptime must never report change. This bool is
+what a driver polls to decide whether the world moved.
 
 The inventory includes unbound objects, which is how leaked cloud boxes or
 sessions become visible. Removing an observation command does not invalidate
@@ -584,11 +741,11 @@ propose repairs:
 ```text
 $ alder reconcile
 hm-2b7-attempt-1  recorded active, observed absent
-  suggested: alder edit attempt hm-2b7-attempt-1 --end lost
+  suggested: alder attempt end hm-2b7-attempt-1 --outcome lost --why "external handle absent"
 
 hm-9a1-attempt-1  recorded starting
   found: tmux:nimbus-box-17/alder-hm-9a1-attempt-1
-  suggested: alder edit attempt hm-9a1-attempt-1 --handle tmux:nimbus-box-17/alder-hm-9a1-attempt-1
+  suggested: alder attempt edit hm-9a1-attempt-1 --handle tmux:nimbus-box-17/alder-hm-9a1-attempt-1
 
 hm-6e3-attempt-2  recorded active, observation unknown
   no destructive action suggested
@@ -654,11 +811,11 @@ $ alder status
 $ alder reconcile
 # Status includes submitted handoffs; admit them before selecting more work.
 $ alder next
-$ alder start hm-9a1 --meta engine=opus-5 --meta requested_host=box-a
+$ alder work start hm-9a1 --meta engine=opus-5 --meta requested_host=box-a
 hm-9a1-attempt-1
 
 # The repository skill launches the worker, then:
-$ alder edit attempt hm-9a1-attempt-1 \
+$ alder attempt edit hm-9a1-attempt-1 \
     --handle tmux:nimbus-box-17/alder-hm-9a1-attempt-1 \
     --meta host=nimbus:box-17
 ```
@@ -666,13 +823,23 @@ $ alder edit attempt hm-9a1-attempt-1 \
 Later:
 
 ```text
-$ alder edit attempt hm-9a1-attempt-1 \
-    --check tests=satisfied --evidence "CI 4212-a"
-$ alder edit attempt hm-9a1-attempt-1 \
-    --check review=satisfied --evidence "review 171"
-$ alder finish hm-9a1 --attempt hm-9a1-attempt-1
+$ alder attempt edit hm-9a1-attempt-1 \
+    --satisfied tests --evidence "CI 4212-a"
+$ alder attempt edit hm-9a1-attempt-1 \
+    --satisfied review --evidence "review 171"
+$ alder work finish hm-9a1 --attempt hm-9a1-attempt-1
 $ alder status
 ```
 
 That loop is the center of Alder. New commands should be judged by whether
 they make it more reliable.
+
+When a driver runs that iteration on a schedule, it brackets the same commands
+with a pass:
+
+```text
+$ alder loop wake --engine claude --handle tmux:alder-leader --trigger log
+hm-pass-19
+# ... the iteration above ...
+$ alder pass end --outcome ok --report "Started hm-9a1." --wake 20m
+```

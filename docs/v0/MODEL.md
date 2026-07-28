@@ -78,6 +78,16 @@ The initial event types are:
 - `question.asked`
 - `question.answered`
 
+The loop's types are namespaced separately, because they record how the project
+is being driven rather than what the project owes:
+
+- `pass.started`
+- `pass.ended`
+- `loop.paused`
+- `loop.resumed`
+- `loop.engine_selected`
+- `loop.rotation_requested`
+
 These are storage types, not a requirement that every type become a separate
 user-facing concept.
 
@@ -92,10 +102,15 @@ use `hm`, as a Harmony repository might:
 | Attempt | `<work>-attempt-<ordinal>` | `hm-9a1-attempt-1` |
 | Question | `<work>-question-<ordinal>` | `hm-9a1-question-1` |
 | Handoff | `<prefix>-handoff-<token>` | `hm-handoff-f27` |
+| Pass | `<prefix>-pass-<ordinal>` | `hm-pass-19` |
 
 The prefix is chosen once for the repository and cannot change after its first
-object is appended. Generated tokens contain no hyphens, keeping the four
+object is appended. Generated tokens contain no hyphens, keeping the five
 forms unambiguous.
+
+A pass uses a repository-scoped ordinal rather than a token because passes
+belong to the singleton loop and are serialized: at most one is open, so the
+next ordinal is never contended.
 
 Attempt and question ordinals start at one, increase independently within
 their work item, and are never reused. Every attempted launch consumes an
@@ -119,7 +134,7 @@ append idempotency and do not use this human-facing domain ID grammar.
 - `edit`, with a work ID and explicit field, dependency, check, or state
   changes.
 
-A successful `alder add work` or `alder edit work` invocation produces this
+A successful `alder work add` or `alder work edit` invocation produces this
 event. Structured input may place many operations in it, including additions
 and edits together. The event ID identifies the entire mutation and resolves
 an unknown push outcome without duplicating any newly admitted work.
@@ -161,7 +176,7 @@ The query:
 - identifies the base log head and states that the output is hypothetical.
 
 Invalid documents are rejected exactly as they would be during a real append.
-A later `add work --from` or `edit work --from` invocation rereads and
+A later `work add --from` or `work edit --from` invocation rereads and
 revalidates against its then-current head.
 
 Only `status` and `next` accept `--with` in v0. The overlay contains one
@@ -189,8 +204,7 @@ work and has exactly two states:
 
 `handoff.submitted` changes no work, dependency, readiness, or attempt state.
 It is the asynchronous side-channel write in v0. Its public operation is
-`alder add handoff`.
-Unlike `add work`, it accepts no priority, dependency, or check fields.
+`alder handoff add`. Unlike `work add`, it accepts no priority, dependency, or check fields.
 
 On a head conflict, submission rereads, refolds, and revalidates. Because it
 only creates a uniquely identified inert inbox record, it may then resubmit
@@ -201,7 +215,7 @@ rule.
 `handoff.integrated` contains the same fields as an `add` operation in
 `work.changed`; folding it atomically creates the work item, records the link,
 and changes the handoff to `integrated`. Its public operation is
-`alder add work --from-handoff <handoff>`.
+`alder work add --handoff <handoff>`.
 
 An integrated handoff cannot be integrated again. If its proposed work is
 invalid—for example, it introduces a dependency cycle—the append is rejected
@@ -242,12 +256,15 @@ but Alder does not define or validate its schema.
 
 ### State rules
 
-- New work is created explicitly through an `add work` operation in
+- New work is created explicitly through a `work add` operation in
   `work.changed` or through `handoff.integrated`, and starts `open`.
 - Open work can be blocked, finished, dropped, or started.
 - Blocked work can be unblocked, finished externally, dropped, or edited.
-- Blocking and unblocking are `edit` operations in `work.changed`, not
-  separate event types or durable objects. Both require a reason.
+- Blocking and unblocking remain `edit` operations in `work.changed`, not
+  separate event types or durable objects. Both require a reason. Their public
+  operations are `alder work block` and `alder work unblock`: `edit` never
+  changes state, so the transition is a verb even though the storage is one
+  operation shape.
 - Blocking work with an active attempt prevents a later attempt from starting
   but does not stop the existing external execution.
 - Work with an unanswered question cannot be unblocked.
@@ -328,7 +345,7 @@ After launch:
 - `attempt.ended { outcome: not_started }` records launch failure.
 
 The public operation for attaching the handle is
-`alder edit attempt <attempt> --handle <handle>`. An attempt may transition
+`alder attempt edit <attempt> --handle <handle>`. An attempt may transition
 from no handle to one handle exactly once. Replacing or clearing that handle
 is rejected. The specialized `attempt.bound` event preserves this invariant
 without adding a `bind` command to the CLI.
@@ -342,12 +359,12 @@ dependencies, or already has an active attempt.
 It is not a heartbeat stream. Routine liveness comes from refreshed external
 observations.
 
-An `alder edit attempt` against an ended attempt is rejected. Late external
+An `alder attempt edit` against an ended attempt is rejected. Late external
 results therefore cannot satisfy checks for a later attempt.
 
 ### Ending
 
-`alder edit attempt <attempt> --end <outcome>` records a failed, cancelled,
+`alder attempt end <attempt> --outcome <outcome>` records a failed, cancelled,
 lost, or not-started attempt. It changes only the attempt. Ordinarily the work
 remains `open`; if it was blocked while the attempt was active, it remains
 `blocked`.
@@ -355,7 +372,7 @@ remains `open`; if it was blocked while the attempt was active, it remains
 There is no attempt-edit option that blocks or drops work. If work should
 remain blocked, block it before ending its attempt; this prevents a new
 attempt from starting during the two-step sequence. If work should be dropped,
-`alder drop <work> --attempt <attempt> --outcome <outcome>` performs both
+`alder work drop <work> --attempt <attempt> --outcome <outcome>` performs both
 durable transitions in one `work.dropped` event.
 
 Successful completion is represented by `work.finished`, which ends the
@@ -496,6 +513,64 @@ answer arrive while the driving agent is busy or being replaced.
 An answer may be revised. The latest answer is current; earlier answers remain
 in history. V0 does not create replacement-question chains.
 
+## Passes
+
+A pass is one run of the driving loop. Work is to an attempt what the loop is
+to a pass, and the same invariants follow from that: intent is recorded before
+effects, and at most one pass is open at a time.
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Immutable pass ID |
+| `engine` | Opaque engine name supplied by the caller; never validated |
+| `handle` | Session handle, `<kind>:<value>`, such as `tmux:alder-leader` |
+| `triggers` | Why the loop was woken: `log`, `observations`, `due`, `manual` |
+| `state` | `open` or `ended` |
+| `outcome` | `ok`, `crashed`, or `timeout` |
+| `report` | Free-text iteration report |
+| `wake_at` | Absolute time the pass asked to be woken again |
+| `rotate` | Whether the pass requested a fresh session next time |
+| `why` | Explanation of a non-`ok` outcome |
+| `at_head` | The log head the wake was appended at |
+| `started_at`, `started_seq` | Intent recorded before the agent was prompted |
+| `ended_at`, `ended_seq` | Pass end |
+
+`pass.started` is rejected while another pass is open, and `pass.ended` is
+rejected against an already-ended pass. Pass ordinals start at one, increase by
+one, and are never reused.
+
+`at_head` records what the pass could have seen. Trigger kinds are provenance:
+they say why the wake happened and never limit what the pass must do.
+
+A pass ends `ok` only when the agent that ran it says so. `crashed` and
+`timeout` are what an external driver can honestly assert when the agent is not
+available to speak for itself. An open pass therefore blocks the next wake
+until someone records one of those, which makes the crash window a forced
+repair rather than an optional one.
+
+## Loop controls
+
+The loop is a singleton, so its controls are folded fields rather than objects.
+
+| Field | Fold rule |
+| --- | --- |
+| `paused`, `pause_reason` | Last writer wins. `loop.paused` sets both; `loop.resumed` clears both. No count, nesting, or owner. |
+| `engine` | Last writer wins. `loop.engine_selected` replaces the desired name. The name is opaque and never validated. |
+| `rotate_pending` | Derived, never stored: true when the latest rotation request has a greater sequence than the latest `pass.started`, or when a rotation was requested and no wake has ever happened. |
+
+A rotation request is a `loop.rotation_requested` event or a `pass.ended` whose
+`rotate` is set. The next wake consumes the request by being later in the log,
+so nothing clears a flag and two writers cannot disagree about whether a
+rotation has already been served.
+
+Pause is desired state, not a lock. Alder still accepts `loop wake` while
+paused; enforcement belongs to whatever schedules the loop. Alder does not
+store which driver, host, or process owns the loop, for the same reason it
+stores no leader role.
+
+[LOOP.md](LOOP.md) states the driver's read surface and the crash-window
+reasoning in full.
+
 ## Concurrent writers
 
 Alder stores no leader, generation, lease, or writer role. For each mutation:
@@ -618,6 +693,9 @@ The initial SQLite projection exposes:
 - `blocked`
 - `downstream`
 - `observed_handles`
+- `passes`
+- `pass_open`
+- `loop_control`
 
 `alder status` is built from these projections. Raw SQL is diagnostic; agents
 should rely on the named commands and their stable `--json` results.

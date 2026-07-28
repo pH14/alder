@@ -4,18 +4,20 @@ use std::{
     io::{self, Read},
 };
 
+use chrono::TimeDelta;
 use serde_json::{Value, json};
 
 use crate::{
     cli::{
-        AddResource, AddWorkArgs, Command, DebugCommand, DebugDbCommand, DebugLogCommand,
-        EditAttemptArgs, EditResource, EditWorkArgs, NonSuccessOutcome,
+        AttemptCommand, AttemptEditArgs, Command, DebugCommand, DebugDbCommand, DebugLogCommand,
+        HandoffCommand, LoopCommand, NonSuccessOutcome, PassCommand, PassOutcomeArg,
+        QuestionCommand, TriggerKind, WorkAddArgs, WorkCommand, WorkEditArgs,
     },
     config::{Project, initialize},
     domain::{
         AppendResult, AttemptOutcome, ChangeMode, CheckDefinition, CheckStatus, CheckUpdate, Event,
-        EventPayload, GraphChangeDocument, Ledger, NullableString, ProjectState, Snapshot,
-        prepare_change,
+        EventPayload, GraphChangeDocument, Ledger, NullableString, PassOutcome, PassTrigger,
+        ProjectState, Snapshot, WorkStateChange, prepare_change,
     },
     error::{AlderError, Result},
     observer,
@@ -58,121 +60,77 @@ impl App {
             Command::Status(args) => status(&mut context, args.changes.as_deref()),
             Command::Next(args) => next(&mut context, args.changes.as_deref()),
             Command::Show(args) => show(&context, &args.id),
-            Command::Add(args) => match &args.resource {
-                AddResource::Work(args) => add_work(&context, args),
-                AddResource::Handoff(args) => {
+            Command::Refresh => refresh(&context),
+            Command::Reconcile(args) => reconcile(&context, !args.no_refresh),
+            Command::Work(args) => work(&context, &args.command),
+            Command::Attempt(args) => match &args.command {
+                AttemptCommand::Edit(args) => attempt_edit(&context, args),
+                AttemptCommand::End(args) => {
+                    let outcome: AttemptOutcome = args.outcome.into();
+                    require_reason("--why", Some(&args.why))?;
+                    let result =
+                        context
+                            .ledger
+                            .end_attempt(&args.attempt, outcome, args.why.clone())?;
+                    Ok(mutation_output(
+                        "alder.attempt.end.v0",
+                        &result,
+                        json!({"attempt_id": args.attempt, "outcome": format_outcome(outcome)}),
+                        format!("{}  ended {}", args.attempt, format_outcome(outcome)),
+                    ))
+                }
+            },
+            Command::Question(args) => match &args.command {
+                QuestionCommand::Answer(args) => {
+                    let result = context.ledger.answer(&args.question, args.answer.clone())?;
+                    Ok(mutation_output(
+                        "alder.question.answer.v0",
+                        &result,
+                        json!({"question_id": args.question}),
+                        format!("{}  answered", args.question),
+                    ))
+                }
+            },
+            Command::Handoff(args) => match &args.command {
+                HandoffCommand::Add(args) => {
                     let (result, id) = context.ledger.add_handoff(
                         args.title.clone(),
                         args.artifact_ref.clone(),
                         args.note.clone(),
                     )?;
                     Ok(mutation_output(
-                        "alder.add.handoff.v0",
+                        "alder.handoff.add.v0",
                         &result,
                         json!({"handoff_id": id, "state": "submitted"}),
                         format!("{id}  submitted"),
                     ))
                 }
             },
-            Command::Edit(args) => match &args.resource {
-                EditResource::Work(args) => edit_work(&context, args),
-                EditResource::Attempt(args) => edit_attempt(&context, args),
+            Command::Loop(args) => loop_command(&context, &args.command),
+            Command::Pass(args) => match &args.command {
+                PassCommand::End(args) => {
+                    let wake_after = args.wake.as_deref().map(parse_duration).transpose()?;
+                    let (result, id) = context.ledger.end_pass(
+                        args.pass.as_deref(),
+                        args.outcome.into(),
+                        args.report.clone(),
+                        wake_after,
+                        args.rotate,
+                        args.why.clone(),
+                    )?;
+                    let outcome: PassOutcome = args.outcome.into();
+                    Ok(mutation_output(
+                        "alder.pass.end.v0",
+                        &result,
+                        json!({
+                            "pass_id": id,
+                            "outcome": outcome.as_str(),
+                            "rotate": args.rotate,
+                        }),
+                        format!("{id}  ended {}", outcome.as_str()),
+                    ))
+                }
             },
-            Command::Reopen(args) => {
-                let result = context.ledger.reopen(&args.work, args.why.clone())?;
-                Ok(mutation_output(
-                    "alder.reopen.v0",
-                    &result,
-                    json!({"work_id": args.work}),
-                    format!("{}  reopened", args.work),
-                ))
-            }
-            Command::Start(args) => {
-                let metadata = parse_metadata(&args.meta)?;
-                let (result, id) = context.ledger.start(&args.work, metadata)?;
-                Ok(mutation_output(
-                    "alder.start.v0",
-                    &result,
-                    json!({"work_id": args.work, "attempt_id": id}),
-                    id,
-                ))
-            }
-            Command::Finish(args) => {
-                if args.external && args.attempt.is_some() {
-                    return Err(AlderError::validation(
-                        "--external cannot be combined with --attempt",
-                    ));
-                }
-                if !args.external && args.evidence.is_some() {
-                    return Err(AlderError::validation(
-                        "--evidence is accepted only with --external",
-                    ));
-                }
-                let result = context.ledger.finish(
-                    &args.work,
-                    args.attempt.clone(),
-                    args.external,
-                    args.evidence.clone(),
-                )?;
-                Ok(mutation_output(
-                    "alder.finish.v0",
-                    &result,
-                    json!({
-                        "work_id": args.work,
-                        "attempt_id": args.attempt,
-                        "external": args.external,
-                    }),
-                    format!("{}  done", args.work),
-                ))
-            }
-            Command::Drop(args) => {
-                let result = context.ledger.drop_work(
-                    &args.work,
-                    args.attempt.clone(),
-                    args.outcome.map(Into::into),
-                    args.why.clone(),
-                )?;
-                let downstream = context.snapshot.state.downstream(&args.work);
-                Ok(mutation_output(
-                    "alder.drop.v0",
-                    &result,
-                    json!({
-                        "work_id": args.work,
-                        "attempt_id": args.attempt,
-                        "outcome": args.outcome.map(|outcome| format_outcome(outcome.into())),
-                        "affected_downstream": downstream,
-                    }),
-                    format!(
-                        "{}  dropped{}",
-                        args.work,
-                        if downstream.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" · affects {}", downstream.join(", "))
-                        }
-                    ),
-                ))
-            }
-            Command::Ask(args) => {
-                let (result, id) = context.ledger.ask(&args.work, args.question.clone())?;
-                Ok(mutation_output(
-                    "alder.ask.v0",
-                    &result,
-                    json!({"work_id": args.work, "question_id": id}),
-                    id,
-                ))
-            }
-            Command::Answer(args) => {
-                let result = context.ledger.answer(&args.question, args.answer.clone())?;
-                Ok(mutation_output(
-                    "alder.answer.v0",
-                    &result,
-                    json!({"question_id": args.question}),
-                    format!("{}  answered", args.question),
-                ))
-            }
-            Command::Refresh => refresh(&context),
-            Command::Reconcile(args) => reconcile(&context, !args.no_refresh),
             Command::Debug(args) => debug(&context, &args.command),
         }
     }
@@ -236,7 +194,196 @@ fn actor() -> String {
         .unwrap_or_else(|_| "unknown".to_owned())
 }
 
-fn add_work(context: &Context, args: &AddWorkArgs) -> Result<Output> {
+fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
+    match command {
+        WorkCommand::Add(args) => work_add(context, args),
+        WorkCommand::Edit(args) => work_edit(context, args),
+        WorkCommand::Start(args) => {
+            let metadata = parse_metadata(&args.meta)?;
+            let (result, id) = context.ledger.start(&args.work, metadata)?;
+            Ok(mutation_output(
+                "alder.work.start.v0",
+                &result,
+                json!({"work_id": args.work, "attempt_id": id}),
+                id,
+            ))
+        }
+        WorkCommand::Finish(args) => {
+            if args.external && args.attempt.is_some() {
+                return Err(AlderError::validation(
+                    "--external cannot be combined with --attempt",
+                ));
+            }
+            if !args.external && args.evidence.is_some() {
+                return Err(AlderError::validation(
+                    "--evidence is accepted only with --external",
+                ));
+            }
+            let result = context.ledger.finish(
+                &args.work,
+                args.attempt.clone(),
+                args.external,
+                args.evidence.clone(),
+            )?;
+            Ok(mutation_output(
+                "alder.work.finish.v0",
+                &result,
+                json!({
+                    "work_id": args.work,
+                    "attempt_id": args.attempt,
+                    "external": args.external,
+                }),
+                format!("{}  done", args.work),
+            ))
+        }
+        WorkCommand::Drop(args) => {
+            let result = context.ledger.drop_work(
+                &args.work,
+                args.attempt.clone(),
+                args.outcome.map(Into::into),
+                args.why.clone(),
+            )?;
+            let downstream = context.snapshot.state.downstream(&args.work);
+            Ok(mutation_output(
+                "alder.work.drop.v0",
+                &result,
+                json!({
+                    "work_id": args.work,
+                    "attempt_id": args.attempt,
+                    "outcome": args.outcome.map(|outcome| format_outcome(outcome.into())),
+                    "affected_downstream": downstream,
+                }),
+                format!(
+                    "{}  dropped{}",
+                    args.work,
+                    if downstream.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · affects {}", downstream.join(", "))
+                    }
+                ),
+            ))
+        }
+        WorkCommand::Reopen(args) => {
+            require_reason("--why", Some(&args.why))?;
+            let result = context.ledger.reopen(&args.work, args.why.clone())?;
+            Ok(mutation_output(
+                "alder.work.reopen.v0",
+                &result,
+                json!({"work_id": args.work}),
+                format!("{}  reopened", args.work),
+            ))
+        }
+        WorkCommand::Block(args) => {
+            require_reason("--why", Some(&args.why))?;
+            let result = context.ledger.set_work_state(
+                &args.work,
+                WorkStateChange::Block {
+                    reason: args.why.clone(),
+                },
+            )?;
+            Ok(mutation_output(
+                "alder.work.block.v0",
+                &result,
+                json!({"work_id": args.work, "state": "blocked"}),
+                format!("{}  blocked", args.work),
+            ))
+        }
+        WorkCommand::Unblock(args) => {
+            require_reason("--why", Some(&args.why))?;
+            let result = context.ledger.set_work_state(
+                &args.work,
+                WorkStateChange::Unblock {
+                    reason: args.why.clone(),
+                },
+            )?;
+            Ok(mutation_output(
+                "alder.work.unblock.v0",
+                &result,
+                json!({"work_id": args.work, "state": "open"}),
+                format!("{}  open", args.work),
+            ))
+        }
+        WorkCommand::Ask(args) => {
+            let (result, id) = context.ledger.ask(&args.work, args.question.clone())?;
+            Ok(mutation_output(
+                "alder.work.ask.v0",
+                &result,
+                json!({"work_id": args.work, "question_id": id}),
+                id,
+            ))
+        }
+    }
+}
+
+fn loop_command(context: &Context, command: &LoopCommand) -> Result<Output> {
+    match command {
+        LoopCommand::Wake(args) => {
+            let mut triggers: Vec<PassTrigger> =
+                args.trigger.iter().copied().map(Into::into).collect();
+            // A wake with no stated trigger came from a person at a terminal.
+            if triggers.is_empty() {
+                triggers.push(PassTrigger::Manual);
+            }
+            triggers.sort();
+            triggers.dedup();
+            let (result, id) = context.ledger.wake_loop(
+                args.engine.clone(),
+                args.handle.clone(),
+                triggers.clone(),
+            )?;
+            Ok(mutation_output(
+                "alder.loop.wake.v0",
+                &result,
+                json!({
+                    "pass_id": id,
+                    "engine": args.engine,
+                    "handle": args.handle,
+                    "triggers": trigger_names(&triggers),
+                }),
+                id,
+            ))
+        }
+        LoopCommand::Pause(args) => {
+            let result = context.ledger.pause_loop(args.why.clone())?;
+            Ok(mutation_output(
+                "alder.loop.pause.v0",
+                &result,
+                json!({"paused": true, "why": args.why}),
+                "loop paused",
+            ))
+        }
+        LoopCommand::Resume => {
+            let result = context.ledger.resume_loop()?;
+            Ok(mutation_output(
+                "alder.loop.resume.v0",
+                &result,
+                json!({"paused": false}),
+                "loop resumed",
+            ))
+        }
+        LoopCommand::Use(args) => {
+            let result = context.ledger.select_engine(args.engine.clone())?;
+            Ok(mutation_output(
+                "alder.loop.use.v0",
+                &result,
+                json!({"engine": args.engine}),
+                format!("loop engine {}", args.engine),
+            ))
+        }
+        LoopCommand::Rotate(args) => {
+            let result = context.ledger.request_rotation(args.why.clone())?;
+            Ok(mutation_output(
+                "alder.loop.rotate.v0",
+                &result,
+                json!({"rotate_pending": true, "why": args.why}),
+                "rotation requested",
+            ))
+        }
+    }
+}
+
+fn work_add(context: &Context, args: &WorkAddArgs) -> Result<Output> {
     if let Some(path) = args.from.as_deref() {
         ensure_no_direct_work_fields(args)?;
         let document = read_change(path)?;
@@ -254,14 +401,14 @@ fn add_work(context: &Context, args: &AddWorkArgs) -> Result<Output> {
             .collect::<Vec<_>>()
             .join("\n");
         return Ok(mutation_output(
-            "alder.add.work.v0",
+            "alder.work.add.v0",
             &result,
             json!({"work": mappings.iter().map(|(local, id)| json!({"local": local, "work_id": id})).collect::<Vec<_>>()}),
             human,
         ));
     }
     let checks = parse_checks(&args.check)?;
-    if let Some(handoff) = args.from_handoff.as_deref() {
+    if let Some(handoff) = args.handoff.as_deref() {
         let (result, id) = context.ledger.integrate_handoff(
             handoff,
             args.title.clone(),
@@ -271,7 +418,7 @@ fn add_work(context: &Context, args: &AddWorkArgs) -> Result<Output> {
             checks,
         )?;
         return Ok(mutation_output(
-            "alder.add.work.v0",
+            "alder.work.add.v0",
             &result,
             json!({"work_id": id, "handoff_id": handoff}),
             format!("{id}  integrated from {handoff}"),
@@ -280,7 +427,7 @@ fn add_work(context: &Context, args: &AddWorkArgs) -> Result<Output> {
     let title = args
         .title
         .clone()
-        .ok_or_else(|| AlderError::validation("add work requires --title"))?;
+        .ok_or_else(|| AlderError::validation("work add requires --title"))?;
     let (result, id) = context.ledger.add_work(
         title,
         args.spec.clone(),
@@ -289,15 +436,15 @@ fn add_work(context: &Context, args: &AddWorkArgs) -> Result<Output> {
         checks,
     )?;
     Ok(mutation_output(
-        "alder.add.work.v0",
+        "alder.work.add.v0",
         &result,
         json!({"work_id": id, "handoff_id": null}),
         id,
     ))
 }
 
-fn ensure_no_direct_work_fields(args: &AddWorkArgs) -> Result<()> {
-    if args.from_handoff.is_some()
+fn ensure_no_direct_work_fields(args: &WorkAddArgs) -> Result<()> {
+    if args.handoff.is_some()
         || args.title.is_some()
         || args.spec.is_some()
         || args.priority != 0
@@ -312,7 +459,7 @@ fn ensure_no_direct_work_fields(args: &AddWorkArgs) -> Result<()> {
     }
 }
 
-fn edit_work(context: &Context, args: &EditWorkArgs) -> Result<Output> {
+fn work_edit(context: &Context, args: &WorkEditArgs) -> Result<Output> {
     if let Some(path) = args.from.as_deref() {
         if args.work.is_some() || has_single_edit_fields(args) {
             return Err(AlderError::validation(
@@ -335,7 +482,7 @@ fn edit_work(context: &Context, args: &EditWorkArgs) -> Result<Output> {
             .collect();
         lines.extend(edited.iter().map(|id| format!("{id:<20} edited")));
         return Ok(mutation_output(
-            "alder.edit.work.v0",
+            "alder.work.edit.v0",
             &result,
             json!({
                 "added": mappings.iter().map(|(local, id)| json!({"local": local, "work_id": id})).collect::<Vec<_>>(),
@@ -347,10 +494,10 @@ fn edit_work(context: &Context, args: &EditWorkArgs) -> Result<Output> {
     let id = args
         .work
         .clone()
-        .ok_or_else(|| AlderError::validation("edit work requires a work ID or --from"))?;
+        .ok_or_else(|| AlderError::validation("work edit requires a work ID or --from"))?;
     if !has_actual_edit_fields(args) {
         return Err(AlderError::validation(
-            "edit work requires at least one field change",
+            "work edit requires at least one field change",
         ));
     }
     if args.spec.is_some() && args.clear_spec {
@@ -362,7 +509,7 @@ fn edit_work(context: &Context, args: &EditWorkArgs) -> Result<Output> {
         .why
         .clone()
         .filter(|why| !why.trim().is_empty())
-        .ok_or_else(|| AlderError::validation("edit work requires --why"))?;
+        .ok_or_else(|| AlderError::validation("work edit requires --why"))?;
     let spec = if args.clear_spec {
         Some(NullableString(None))
     } else {
@@ -380,8 +527,6 @@ fn edit_work(context: &Context, args: &EditWorkArgs) -> Result<Output> {
             remove_requires: args.remove_requires.clone(),
             add_checks: parse_checks(&args.add_check)?,
             remove_checks: args.remove_check.clone(),
-            block: args.block,
-            unblock: args.unblock,
         }],
     };
     let prepared =
@@ -399,11 +544,11 @@ fn edit_work(context: &Context, args: &EditWorkArgs) -> Result<Output> {
     ))
 }
 
-fn has_single_edit_fields(args: &EditWorkArgs) -> bool {
+fn has_single_edit_fields(args: &WorkEditArgs) -> bool {
     has_actual_edit_fields(args) || args.why.is_some()
 }
 
-fn has_actual_edit_fields(args: &EditWorkArgs) -> bool {
+fn has_actual_edit_fields(args: &WorkEditArgs) -> bool {
     args.title.is_some()
         || args.spec.is_some()
         || args.clear_spec
@@ -412,43 +557,16 @@ fn has_actual_edit_fields(args: &EditWorkArgs) -> bool {
         || !args.remove_requires.is_empty()
         || !args.add_check.is_empty()
         || !args.remove_check.is_empty()
-        || args.block
-        || args.unblock
 }
 
-fn edit_attempt(context: &Context, args: &EditAttemptArgs) -> Result<Output> {
+fn attempt_edit(context: &Context, args: &AttemptEditArgs) -> Result<Output> {
     let metadata = parse_metadata(&args.meta)?;
-    if let Some(outcome) = args.end {
-        if args.handle.is_some()
-            || !metadata.is_empty()
-            || !args.check.is_empty()
+    if let Some(handle) = args.handle.clone() {
+        if !args.satisfied.is_empty()
+            || !args.failed.is_empty()
             || args.evidence.is_some()
             || args.note.is_some()
         {
-            return Err(AlderError::validation(
-                "--end cannot be combined with progress or binding fields",
-            ));
-        }
-        let why = args
-            .why
-            .clone()
-            .filter(|why| !why.trim().is_empty())
-            .ok_or_else(|| AlderError::validation("--end requires --why"))?;
-        let result = context
-            .ledger
-            .end_attempt(&args.attempt, outcome.into(), why)?;
-        return Ok(mutation_output(
-            "alder.edit.attempt.v0",
-            &result,
-            json!({"attempt_id": args.attempt, "change": "ended", "outcome": format_outcome(outcome.into())}),
-            format!("{}  ended {}", args.attempt, format_outcome(outcome.into())),
-        ));
-    }
-    if args.why.is_some() {
-        return Err(AlderError::validation("--why is accepted only with --end"));
-    }
-    if let Some(handle) = args.handle.clone() {
-        if !args.check.is_empty() || args.evidence.is_some() || args.note.is_some() {
             return Err(AlderError::validation(
                 "--handle can be combined only with --meta",
             ));
@@ -457,16 +575,16 @@ fn edit_attempt(context: &Context, args: &EditAttemptArgs) -> Result<Output> {
             .ledger
             .bind_attempt(&args.attempt, handle.clone(), metadata)?;
         return Ok(mutation_output(
-            "alder.edit.attempt.v0",
+            "alder.attempt.edit.v0",
             &result,
             json!({"attempt_id": args.attempt, "change": "bound", "handle": handle}),
             format!("{}  bound {}", args.attempt, handle),
         ));
     }
-    let checks = parse_check_updates(&args.check, args.evidence.as_deref())?;
+    let checks = parse_check_results(&args.satisfied, &args.failed, args.evidence.as_deref())?;
     if metadata.is_empty() && checks.is_empty() && args.note.is_none() {
         return Err(AlderError::validation(
-            "edit attempt requires a handle, metadata, note, check, or end outcome",
+            "attempt edit requires a handle, metadata, note, or check result",
         ));
     }
     let result =
@@ -474,7 +592,7 @@ fn edit_attempt(context: &Context, args: &EditAttemptArgs) -> Result<Output> {
             .ledger
             .update_attempt(&args.attempt, metadata, args.note.clone(), checks)?;
     Ok(mutation_output(
-        "alder.edit.attempt.v0",
+        "alder.attempt.edit.v0",
         &result,
         json!({"attempt_id": args.attempt, "change": "updated"}),
         format!("{}  updated", args.attempt),
@@ -558,12 +676,14 @@ fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
         .rev()
         .map(event_summary)
         .collect();
+    let loop_section = loop_section(&state);
     let json = json!({
         "schema": "alder.status.v0",
         "head": context.snapshot.head.sequence(),
         "revision": context.snapshot.head.revision(),
         "hypothetical": hypothetical,
         "source": source,
+        "loop": loop_section,
         "observations": {
             "runs": runs,
             "handles": observations,
@@ -615,6 +735,7 @@ fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
             )
         }),
     );
+    human_section(&mut lines, "loop", loop_lines(&state));
     human_section(
         &mut lines,
         "handoffs",
@@ -682,6 +803,87 @@ fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
         }),
     );
     Ok(Output::new(json, lines.join("\n")))
+}
+
+/// The loop's desired state and its two interesting passes. The driver reads
+/// this section and ignores the rest of `status`.
+fn loop_section(state: &ProjectState) -> Value {
+    let control = &state.loop_control;
+    json!({
+        "paused": control.paused,
+        "pause_reason": control.pause_reason,
+        "engine": control.engine,
+        "rotate_pending": control.rotate_pending(),
+        "open_pass": state.open_pass().map(|pass| json!({
+            "id": pass.id,
+            "engine": pass.engine,
+            "handle": pass.handle,
+            "triggers": trigger_names(&pass.triggers),
+            "started_at": pass.started_at,
+            "at_head": pass.at_head,
+        })),
+        "last_pass": state.last_ended_pass().map(|pass| json!({
+            "id": pass.id,
+            "engine": pass.engine,
+            "outcome": pass.outcome.map(PassOutcome::as_str),
+            "report_line": pass.report_line(),
+            "wake_at": pass.wake_at,
+            "ended_at": pass.ended_at,
+            // The head the log stood at when this pass ended. A reader
+            // comparing it with the current head learns whether anything has
+            // been appended since, without remembering anything itself.
+            "ended_seq": pass.ended_seq,
+        })),
+    })
+}
+
+fn loop_lines(state: &ProjectState) -> Vec<String> {
+    let control = &state.loop_control;
+    let mut lines = Vec::new();
+    let mut desired = Vec::new();
+    if control.paused {
+        desired.push(match control.pause_reason.as_deref() {
+            Some(reason) => format!("paused · {reason}"),
+            None => "paused".to_owned(),
+        });
+    }
+    if let Some(engine) = control.engine.as_deref() {
+        desired.push(format!("engine {engine}"));
+    }
+    if control.rotate_pending() {
+        desired.push("rotate pending".to_owned());
+    }
+    if !desired.is_empty() {
+        lines.push(desired.join(" · "));
+    }
+    if let Some(pass) = state.open_pass() {
+        lines.push(format!(
+            "open {}  {}  {}  started {}",
+            pass.id,
+            pass.engine,
+            pass.handle,
+            pass.started_at.to_rfc3339()
+        ));
+    }
+    if let Some(pass) = state.last_ended_pass() {
+        let mut line = format!(
+            "last {}  {}",
+            pass.id,
+            pass.outcome.map(PassOutcome::as_str).unwrap_or("ended")
+        );
+        if let Some(report) = pass.report_line() {
+            line.push_str(&format!("  {report}"));
+        }
+        if let Some(wake_at) = pass.wake_at {
+            line.push_str(&format!("  wake {}", wake_at.to_rfc3339()));
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+fn trigger_names(triggers: &[PassTrigger]) -> Vec<&'static str> {
+    triggers.iter().copied().map(PassTrigger::as_str).collect()
 }
 
 fn next(context: &mut Context, changes: Option<&str>) -> Result<Output> {
@@ -790,6 +992,12 @@ fn show(context: &Context, id: &str) -> Result<Output> {
                 serde_json::to_value(value)?,
                 BTreeSet::from([id.to_owned()]),
             )
+        } else if let Some(value) = context.snapshot.state.passes.get(id) {
+            (
+                "pass",
+                serde_json::to_value(value)?,
+                BTreeSet::from([id.to_owned()]),
+            )
         } else {
             return Err(AlderError::not_found("object", id));
         };
@@ -847,10 +1055,14 @@ fn refresh(context: &Context) -> Result<Output> {
                 .map(|handle| format!("  {}  {}", handle.handle, handle.status.as_str())),
         );
     }
+    if result.changed {
+        lines.push("changed since the previous refresh".to_owned());
+    }
     Ok(Output::new(
         json!({
             "schema": "alder.refresh.v0",
             "head": context.snapshot.head.sequence(),
+            "changed": result.changed,
             "result": result,
         }),
         lines.join("\n"),
@@ -1231,36 +1443,84 @@ fn parse_metadata(values: &[String]) -> Result<BTreeMap<String, Value>> {
     Ok(metadata)
 }
 
-fn parse_check_updates(values: &[String], evidence: Option<&str>) -> Result<Vec<CheckUpdate>> {
-    if values.is_empty() {
+/// A check result names its check and its verdict in the flag itself, so one
+/// invocation cannot mix a check key with an unrelated status word.
+fn parse_check_results(
+    satisfied: &[String],
+    failed: &[String],
+    evidence: Option<&str>,
+) -> Result<Vec<CheckUpdate>> {
+    if satisfied.is_empty() && failed.is_empty() {
+        if evidence.is_some() {
+            return Err(AlderError::validation(
+                "--evidence is accepted only with --satisfied or --failed",
+            ));
+        }
         return Ok(Vec::new());
     }
     let evidence = evidence
         .filter(|evidence| !evidence.trim().is_empty())
-        .ok_or_else(|| AlderError::validation("--check requires --evidence"))?;
-    values
-        .iter()
-        .map(|value| {
-            let (key, status) = value.split_once('=').ok_or_else(|| {
-                AlderError::validation(format!("check `{value}` must have the form KEY=STATUS"))
-            })?;
-            let status = match status {
-                "pending" => CheckStatus::Pending,
-                "satisfied" => CheckStatus::Satisfied,
-                "failed" => CheckStatus::Failed,
-                _ => {
-                    return Err(AlderError::validation(format!(
-                        "unknown check status `{status}`"
-                    )));
-                }
-            };
-            Ok(CheckUpdate {
-                key: key.to_owned(),
+        .ok_or_else(|| AlderError::validation("--satisfied and --failed require --evidence"))?;
+    let mut seen = BTreeSet::new();
+    let mut updates = Vec::new();
+    for (keys, status) in [
+        (satisfied, CheckStatus::Satisfied),
+        (failed, CheckStatus::Failed),
+    ] {
+        for key in keys {
+            if key.trim().is_empty() {
+                return Err(AlderError::validation("a check key cannot be empty"));
+            }
+            if !seen.insert(key.clone()) {
+                return Err(AlderError::validation(format!(
+                    "check `{key}` was given more than one result"
+                )));
+            }
+            updates.push(CheckUpdate {
+                key: key.clone(),
                 status,
                 evidence: evidence.to_owned(),
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    Ok(updates)
+}
+
+/// Parse a wake delay such as `270s`, `20m`, `1h`, or `2d`. The stored value is
+/// an absolute time, so a reader never has to know when the pass ended.
+fn parse_duration(value: &str) -> Result<TimeDelta> {
+    let trimmed = value.trim();
+    let invalid = || {
+        AlderError::with_context(
+            "validation_failed",
+            format!("duration `{value}` must look like 270s, 20m, 1h, or 2d"),
+            json!({"duration": value}),
+        )
+    };
+    let (digits, unit) = trimmed.split_at(trimmed.len().saturating_sub(1));
+    let amount: i64 = digits.parse().map_err(|_| invalid())?;
+    if amount <= 0 {
+        return Err(invalid());
+    }
+    let seconds = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => return Err(invalid()),
+    };
+    amount
+        .checked_mul(seconds)
+        .map(TimeDelta::seconds)
+        .ok_or_else(invalid)
+}
+
+fn require_reason(flag: &str, why: Option<&String>) -> Result<()> {
+    if why.is_some_and(|why| !why.trim().is_empty()) {
+        Ok(())
+    } else {
+        Err(AlderError::validation(format!("{flag} cannot be empty")))
+    }
 }
 
 fn human_section<I>(lines: &mut Vec<String>, title: &str, entries: I)
@@ -1297,14 +1557,37 @@ impl From<NonSuccessOutcome> for AttemptOutcome {
     }
 }
 
+impl From<PassOutcomeArg> for PassOutcome {
+    fn from(value: PassOutcomeArg) -> Self {
+        match value {
+            PassOutcomeArg::Ok => Self::Ok,
+            PassOutcomeArg::Crashed => Self::Crashed,
+            PassOutcomeArg::Timeout => Self::Timeout,
+        }
+    }
+}
+
+impl From<TriggerKind> for PassTrigger {
+    fn from(value: TriggerKind) -> Self {
+        match value {
+            TriggerKind::Log => Self::Log,
+            TriggerKind::Observations => Self::Observations,
+            TriggerKind::Due => Self::Due,
+            TriggerKind::Manual => Self::Manual,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::domain::{Pass, PassState};
+
     use super::*;
 
-    fn blank_add_work_args() -> AddWorkArgs {
-        AddWorkArgs {
+    fn blank_add_work_args() -> WorkAddArgs {
+        WorkAddArgs {
             from: None,
-            from_handoff: None,
+            handoff: None,
             title: None,
             spec: None,
             priority: 0,
@@ -1313,8 +1596,8 @@ mod tests {
         }
     }
 
-    fn blank_edit_work_args() -> EditWorkArgs {
-        EditWorkArgs {
+    fn blank_edit_work_args() -> WorkEditArgs {
+        WorkEditArgs {
             work: None,
             from: None,
             title: None,
@@ -1325,8 +1608,6 @@ mod tests {
             remove_requires: Vec::new(),
             add_check: Vec::new(),
             remove_check: Vec::new(),
-            block: false,
-            unblock: false,
             why: None,
         }
     }
@@ -1336,7 +1617,7 @@ mod tests {
         assert!(ensure_no_direct_work_fields(&blank_add_work_args()).is_ok());
 
         let mut args = blank_add_work_args();
-        args.from_handoff = Some("hm-handoff-1".to_owned());
+        args.handoff = Some("hm-handoff-1".to_owned());
         assert!(ensure_no_direct_work_fields(&args).is_err());
 
         let mut args = blank_add_work_args();
@@ -1405,14 +1686,6 @@ mod tests {
         args.remove_check.push("test".to_owned());
         cases.push(args);
 
-        let mut args = blank_edit_work_args();
-        args.block = true;
-        cases.push(args);
-
-        let mut args = blank_edit_work_args();
-        args.unblock = true;
-        cases.push(args);
-
         for args in cases {
             assert!(has_actual_edit_fields(&args));
             assert!(has_single_edit_fields(&args));
@@ -1446,28 +1719,123 @@ mod tests {
     }
 
     #[test]
-    fn check_updates_cover_every_status_and_require_evidence() {
-        assert!(parse_check_updates(&[], None).unwrap().is_empty());
-        assert!(parse_check_updates(&["test=pending".to_owned()], None).is_err());
-        assert!(parse_check_updates(&["test=pending".to_owned()], Some(" ")).is_err());
-        assert!(parse_check_updates(&["malformed".to_owned()], Some("proof")).is_err());
-        assert!(parse_check_updates(&["test=unknown".to_owned()], Some("proof")).is_err());
+    fn check_results_name_their_verdict_and_require_evidence() {
+        let none: Vec<String> = Vec::new();
+        assert!(parse_check_results(&none, &none, None).unwrap().is_empty());
+        assert!(parse_check_results(&none, &none, Some("proof")).is_err());
+        assert!(parse_check_results(&["test".to_owned()], &none, None).is_err());
+        assert!(parse_check_results(&["test".to_owned()], &none, Some(" ")).is_err());
+        assert!(parse_check_results(&[" ".to_owned()], &none, Some("proof")).is_err());
+        assert!(
+            parse_check_results(&["test".to_owned()], &["test".to_owned()], Some("proof")).is_err()
+        );
+        assert!(
+            parse_check_results(
+                &["test".to_owned(), "test".to_owned()],
+                &none,
+                Some("proof")
+            )
+            .is_err()
+        );
 
-        let updates = parse_check_updates(
-            &[
-                "one=pending".to_owned(),
-                "two=satisfied".to_owned(),
-                "three=failed".to_owned(),
-            ],
-            Some("proof"),
-        )
-        .unwrap();
-        assert_eq!(updates.len(), 3);
-        assert_eq!(updates[0].key, "one");
-        assert_eq!(updates[0].status, CheckStatus::Pending);
-        assert_eq!(updates[0].evidence, "proof");
-        assert_eq!(updates[1].status, CheckStatus::Satisfied);
-        assert_eq!(updates[2].status, CheckStatus::Failed);
+        let updates =
+            parse_check_results(&["tests".to_owned()], &["review".to_owned()], Some("CI 42"))
+                .unwrap();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].key, "tests");
+        assert_eq!(updates[0].status, CheckStatus::Satisfied);
+        assert_eq!(updates[0].evidence, "CI 42");
+        assert_eq!(updates[1].key, "review");
+        assert_eq!(updates[1].status, CheckStatus::Failed);
+    }
+
+    #[test]
+    fn wake_durations_accept_only_a_positive_amount_and_known_unit() {
+        assert_eq!(parse_duration("270s").unwrap(), TimeDelta::seconds(270));
+        assert_eq!(parse_duration("20m").unwrap(), TimeDelta::minutes(20));
+        assert_eq!(parse_duration(" 1h ").unwrap(), TimeDelta::hours(1));
+        assert_eq!(parse_duration("2d").unwrap(), TimeDelta::days(2));
+        for invalid in [
+            "",
+            "m",
+            "20",
+            "0m",
+            "-5m",
+            "20w",
+            "1.5h",
+            "9223372036854775807d",
+        ] {
+            assert!(parse_duration(invalid).is_err(), "{invalid}");
+        }
+
+        assert!(require_reason("--why", Some(&"reason".to_owned())).is_ok());
+        assert!(require_reason("--why", Some(&" ".to_owned())).is_err());
+        assert!(require_reason("--why", None).is_err());
+    }
+
+    #[test]
+    fn the_loop_section_reports_desired_state_and_both_interesting_passes() {
+        let mut state = ProjectState::default();
+        let empty = loop_section(&state);
+        assert_eq!(empty["paused"], false);
+        assert!(empty["engine"].is_null());
+        assert!(empty["open_pass"].is_null());
+        assert!(empty["last_pass"].is_null());
+        assert!(loop_lines(&state).is_empty());
+
+        state.loop_control.paused = true;
+        state.loop_control.pause_reason = Some("release freeze".to_owned());
+        state.loop_control.engine = Some("codex".to_owned());
+        state.loop_control.rotate_requested_seq = Some(3);
+        let paused = loop_section(&state);
+        assert_eq!(paused["pause_reason"], "release freeze");
+        assert_eq!(paused["engine"], "codex");
+        assert_eq!(paused["rotate_pending"], true);
+        assert_eq!(
+            loop_lines(&state)[0],
+            "paused · release freeze · engine codex · rotate pending"
+        );
+
+        let at = chrono::Utc::now();
+        state.passes.insert(
+            "hm-pass-1".to_owned(),
+            Pass {
+                id: "hm-pass-1".to_owned(),
+                engine: "claude".to_owned(),
+                handle: "tmux:alder-leader".to_owned(),
+                triggers: vec![PassTrigger::Log],
+                state: PassState::Ended,
+                outcome: Some(PassOutcome::Ok),
+                report: Some("swept the frontier\nand more".to_owned()),
+                wake_at: Some(at),
+                rotate: false,
+                why: None,
+                at_head: 4,
+                started_at: at,
+                started_seq: 5,
+                ended_at: Some(at),
+                ended_seq: Some(6),
+            },
+        );
+        let ended = loop_section(&state);
+        assert_eq!(ended["last_pass"]["id"], "hm-pass-1");
+        assert_eq!(ended["last_pass"]["outcome"], "ok");
+        assert_eq!(ended["last_pass"]["report_line"], "swept the frontier");
+        assert_eq!(ended["last_pass"]["ended_seq"], 6);
+        let lines = loop_lines(&state);
+        assert!(lines[1].starts_with("last hm-pass-1  ok  swept the frontier  wake "));
+
+        let mut open = state.passes["hm-pass-1"].clone();
+        open.id = "hm-pass-2".to_owned();
+        open.state = PassState::Open;
+        open.outcome = None;
+        open.ended_seq = None;
+        state.passes.insert(open.id.clone(), open);
+        let both = loop_section(&state);
+        assert_eq!(both["open_pass"]["id"], "hm-pass-2");
+        assert_eq!(both["open_pass"]["triggers"], json!(["log"]));
+        assert_eq!(both["last_pass"]["id"], "hm-pass-1");
+        assert!(loop_lines(&state)[1].starts_with("open hm-pass-2  claude  tmux:alder-leader"));
     }
 
     #[test]

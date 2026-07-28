@@ -123,8 +123,8 @@ fn string(value: &Value, key: &str) -> String {
 fn drive_work_and_preserve_the_completion_contract() {
     let project = TestProject::new();
     let first = project.success(&[
-        "add",
         "work",
+        "add",
         "--title",
         "Build index",
         "--priority",
@@ -136,56 +136,56 @@ fn drive_work_and_preserve_the_completion_contract() {
     ]);
     let first_id = string(&first, "work_id");
     let second = project.success(&[
-        "add",
         "work",
+        "add",
         "--title",
         "Validate index",
         "--requires",
         &first_id,
     ]);
     let second_id = string(&second, "work_id");
-    let resource_less = project.failure(&["edit", "work", &first_id]);
+    let resource_less = project.failure(&["work", "edit", &first_id]);
     assert_eq!(resource_less["code"], "validation_failed");
     assert_eq!(
         resource_less["message"],
-        "edit work requires at least one field change"
+        "work edit requires at least one field change"
     );
 
     let next = project.success(&["next"]);
     assert_eq!(next["work"].as_array().unwrap().len(), 1);
     assert_eq!(next["work"][0]["id"], first_id);
 
-    let started = project.success(&["start", &first_id, "--meta", "engine=opus-5"]);
+    let started = project.success(&["work", "start", &first_id, "--meta", "engine=opus-5"]);
     let attempt = string(&started, "attempt_id");
     assert!(attempt.ends_with("-attempt-1"));
     let in_flight = project.success(&["status"]);
     assert_eq!(in_flight["in_flight"][0]["id"], attempt);
     assert!(in_flight["ready"].as_array().unwrap().is_empty());
-    let duplicate = project.failure(&["start", &first_id]);
+    let duplicate = project.failure(&["work", "start", &first_id]);
     assert_eq!(duplicate["code"], "active_attempt");
     assert_eq!(duplicate["context"]["active_attempt_id"], attempt);
 
-    let incomplete = project.failure(&["finish", &first_id, "--attempt", &attempt]);
+    let incomplete = project.failure(&["work", "finish", &first_id, "--attempt", &attempt]);
     assert_eq!(incomplete["code"], "incomplete_checks");
     project.success(&[
-        "edit",
         "attempt",
+        "edit",
         &attempt,
-        "--check",
-        "tests=satisfied",
+        "--satisfied",
+        "tests",
         "--evidence",
         "CI 42",
     ]);
     project.success(&[
-        "edit",
         "attempt",
+        "edit",
         &attempt,
-        "--check",
-        "review=satisfied",
+        "--satisfied",
+        "review",
         "--evidence",
         "review 17",
     ]);
-    project.success(&["finish", &first_id, "--attempt", &attempt]);
+    project.success(&["work", "finish", &first_id, "--attempt", &attempt]);
 
     let next = project.success(&["next"]);
     assert_eq!(next["work"][0]["id"], second_id);
@@ -203,7 +203,7 @@ fn drive_work_and_preserve_the_completion_contract() {
     let query = project.success(&["debug", "query", "SELECT count(*) AS n FROM work_current"]);
     assert_eq!(query["result"]["rows"][0]["n"], 2);
 
-    let asked = project.success(&["ask", &second_id, "Ship now?"]);
+    let asked = project.success(&["work", "ask", &second_id, "Ship now?"]);
     let question = string(&asked, "question_id");
     let waiting = project.success(&["status"]);
     assert_eq!(waiting["waiting_on_human"][0]["id"], question);
@@ -212,8 +212,8 @@ fn drive_work_and_preserve_the_completion_contract() {
             .human(&["status"])
             .contains("answered questions still blocked")
     );
-    project.success(&["answer", &question, "Wait"]);
-    project.success(&["answer", &question, "Ship"]);
+    project.success(&["question", "answer", &question, "Wait"]);
+    project.success(&["question", "answer", &question, "Ship"]);
     let status = project.success(&["status"]);
     assert!(status["waiting_on_human"].as_array().unwrap().is_empty());
     assert_eq!(status["questions"][0]["answer"], "Ship");
@@ -229,8 +229,8 @@ fn drive_work_and_preserve_the_completion_contract() {
     );
 
     let handoff = project.success(&[
-        "add",
         "handoff",
+        "add",
         "--title",
         "Side work",
         "--ref",
@@ -243,7 +243,7 @@ fn drive_work_and_preserve_the_completion_contract() {
 #[test]
 fn graph_changes_are_hypothetical_then_atomic() {
     let project = TestProject::new();
-    let root = project.success(&["add", "work", "--title", "Root"]);
+    let root = project.success(&["work", "add", "--title", "Root"]);
     let root_id = string(&root, "work_id");
     let base_head = root["head"].as_u64().unwrap();
     let document = project.work.join("change.json");
@@ -272,7 +272,7 @@ fn graph_changes_are_hypothetical_then_atomic() {
     let query = project.success(&["debug", "query", "SELECT count(*) AS n FROM work_current"]);
     assert_eq!(query["result"]["rows"][0]["n"], 1);
 
-    let applied = project.success(&["edit", "work", "--from", path(&document)]);
+    let applied = project.success(&["work", "edit", "--from", path(&document)]);
     assert_eq!(applied["head"], base_head + 1);
     assert_eq!(applied["added"].as_array().unwrap().len(), 2);
     let log = project.success(&["debug", "log", "tail"]);
@@ -285,21 +285,21 @@ fn graph_changes_are_hypothetical_then_atomic() {
         serde_json::to_vec(&json!({"add": [{"local": "extra", "title": "Extra"}]})).unwrap(),
     )
     .unwrap();
-    let added = project.success(&["add", "work", "--from", path(&additions_only)]);
+    let added = project.success(&["work", "add", "--from", path(&additions_only)]);
     assert_eq!(added["work"].as_array().unwrap().len(), 1);
-    let wrong_surface = project.failure(&["edit", "work", "--from", path(&additions_only)]);
+    let wrong_surface = project.failure(&["work", "edit", "--from", path(&additions_only)]);
     assert_eq!(wrong_surface["code"], "validation_failed");
 }
 
 #[test]
 fn observations_distinguish_presence_outage_and_missing_configuration() {
     let project = TestProject::new();
-    let work = project.success(&["add", "work", "--title", "Observed work"]);
+    let work = project.success(&["work", "add", "--title", "Observed work"]);
     let work_id = string(&work, "work_id");
-    let started = project.success(&["start", &work_id]);
+    let started = project.success(&["work", "start", &work_id]);
     let attempt = string(&started, "attempt_id");
     let handle = "tmux:worker";
-    project.success(&["edit", "attempt", &attempt, "--handle", handle]);
+    project.success(&["attempt", "edit", &attempt, "--handle", handle]);
 
     let command = format!(
         "printf '%s\\n' '[{{\"value\":\"worker\",\"attempt_id\":\"{attempt}\",\"metadata\":{{\"state\":\"running\"}}}}]'"
@@ -396,7 +396,7 @@ fn refresh_reports_unbound_observed_handles_in_both_outputs() {
 #[test]
 fn unavailable_remote_is_not_replaced_by_local_git_or_sqlite_state() {
     let project = TestProject::new();
-    let added = project.success(&["add", "work", "--title", "Cached work"]);
+    let added = project.success(&["work", "add", "--title", "Cached work"]);
     let revision = string(&added, "revision");
     project.success(&["status"]);
 
@@ -417,7 +417,7 @@ fn unavailable_remote_is_not_replaced_by_local_git_or_sqlite_state() {
 #[test]
 fn debug_log_human_output_uses_one_consistent_header() {
     let project = TestProject::new();
-    let added = project.success(&["add", "work", "--title", "Inspect output"]);
+    let added = project.success(&["work", "add", "--title", "Inspect output"]);
     let revision = string(&added, "revision");
     let event_id = string(&added, "event_id");
     let header = format!("head 1  {revision}");
@@ -453,7 +453,7 @@ fn invalid_commands_and_errors_use_the_requested_output_channel() {
     let project = TestProject::new();
     let validation = project
         .command()
-        .args(["finish", "missing", "--evidence", "proof"])
+        .args(["work", "finish", "missing", "--evidence", "proof"])
         .output()
         .unwrap();
     assert_eq!(validation.status.code(), Some(1));
@@ -476,11 +476,12 @@ fn invalid_commands_and_errors_use_the_requested_output_channel() {
 #[test]
 fn mutually_exclusive_edit_and_finish_arguments_are_all_rejected() {
     let project = TestProject::new();
-    let added = project.success(&["add", "work", "--title", "work"]);
+    let added = project.success(&["work", "add", "--title", "work"]);
     let work = string(&added, "work_id");
 
     assert_eq!(
         project.failure(&[
+            "work",
             "finish",
             &work,
             "--external",
@@ -492,7 +493,7 @@ fn mutually_exclusive_edit_and_finish_arguments_are_all_rejected() {
         "validation_failed"
     );
     assert_eq!(
-        project.failure(&["finish", &work, "--evidence", "proof"])["code"],
+        project.failure(&["work", "finish", &work, "--evidence", "proof"])["code"],
         "validation_failed"
     );
 
@@ -507,13 +508,13 @@ fn mutually_exclusive_edit_and_finish_arguments_are_all_rejected() {
     )
     .unwrap();
     assert_eq!(
-        project.failure(&["edit", "work", &work, "--from", path(&document)])["code"],
+        project.failure(&["work", "edit", &work, "--from", path(&document)])["code"],
         "validation_failed"
     );
     assert_eq!(
         project.failure(&[
-            "edit",
             "work",
+            "edit",
             "--from",
             path(&document),
             "--title",
@@ -521,12 +522,12 @@ fn mutually_exclusive_edit_and_finish_arguments_are_all_rejected() {
         ])["code"],
         "validation_failed"
     );
-    project.success(&["edit", "work", &work, "--spec", "one", "--why", "set spec"]);
-    project.success(&["edit", "work", &work, "--clear-spec", "--why", "clear spec"]);
+    project.success(&["work", "edit", &work, "--spec", "one", "--why", "set spec"]);
+    project.success(&["work", "edit", &work, "--clear-spec", "--why", "clear spec"]);
     assert!(project.success(&["show", &work])["current"]["spec"].is_null());
     let conflicting_spec = project.failure(&[
-        "edit",
         "work",
+        "edit",
         &work,
         "--title",
         "changed",
@@ -541,54 +542,138 @@ fn mutually_exclusive_edit_and_finish_arguments_are_all_rejected() {
         conflicting_spec["message"],
         "--spec and --clear-spec cannot be combined"
     );
-    let blank_why = project.failure(&["edit", "work", &work, "--title", "changed", "--why", " "]);
+    let blank_why = project.failure(&["work", "edit", &work, "--title", "changed", "--why", " "]);
     assert_eq!(blank_why["code"], "validation_failed");
-    assert_eq!(blank_why["message"], "edit work requires --why");
+    assert_eq!(blank_why["message"], "work edit requires --why");
 
-    let started = project.success(&["start", &work]);
+    // `edit` never changes state, so the state fields are gone from both the
+    // flags and the graph-change document.
+    let state_document = project.work.join("state.json");
+    fs::write(
+        &state_document,
+        serde_json::to_vec(&json!({
+            "why": "block it",
+            "edit": [{"id": work, "block": true}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        project.failure(&["work", "edit", "--from", path(&state_document)])["code"],
+        "invalid_json"
+    );
+
+    let started = project.success(&["work", "start", &work]);
     let attempt = string(&started, "attempt_id");
     for fields in [
-        vec!["--handle", "tmux:one"],
-        vec!["--meta", "engine=opus"],
-        vec!["--check", "test=failed"],
+        vec!["--satisfied", "test", "--evidence", "proof"],
+        vec!["--failed", "test", "--evidence", "proof"],
         vec!["--evidence", "proof"],
         vec!["--note", "working"],
     ] {
-        let mut args = vec![
-            "edit",
-            "attempt",
-            attempt.as_str(),
-            "--end",
-            "failed",
-            "--why",
-            "reason",
-        ];
+        let mut args = vec!["attempt", "edit", attempt.as_str(), "--handle", "tmux:one"];
         args.extend(fields);
         assert_eq!(project.failure(&args)["code"], "validation_failed");
     }
-    let missing_why = project.failure(&["edit", "attempt", &attempt, "--end", "failed"]);
-    assert_eq!(missing_why["code"], "validation_failed");
-    assert_eq!(missing_why["message"], "--end requires --why");
-    let blank_why =
-        project.failure(&["edit", "attempt", &attempt, "--end", "failed", "--why", " "]);
-    assert_eq!(blank_why["code"], "validation_failed");
-    assert_eq!(blank_why["message"], "--end requires --why");
     assert_eq!(
-        project.failure(&["edit", "attempt", &attempt, "--why", "reason"])["code"],
+        project.failure(&["attempt", "edit", &attempt])["code"],
         "validation_failed"
     );
-    for fields in [
-        vec!["--check", "test=failed", "--evidence", "proof"],
-        vec!["--evidence", "proof"],
-        vec!["--note", "working"],
-    ] {
-        let mut args = vec!["edit", "attempt", attempt.as_str(), "--handle", "tmux:one"];
-        args.extend(fields);
-        assert_eq!(project.failure(&args)["code"], "validation_failed");
-    }
     assert_eq!(
-        project.failure(&["edit", "attempt", &attempt])["code"],
-        "validation_failed"
+        project.failure(&["attempt", "edit", &attempt, "--satisfied", "test"])["message"],
+        "--satisfied and --failed require --evidence"
+    );
+    assert_eq!(
+        project.failure(&["attempt", "edit", &attempt, "--evidence", "proof"])["message"],
+        "--evidence is accepted only with --satisfied or --failed"
+    );
+    let blank_end_why = project.failure(&[
+        "attempt",
+        "end",
+        &attempt,
+        "--outcome",
+        "failed",
+        "--why",
+        " ",
+    ]);
+    assert_eq!(blank_end_why["code"], "validation_failed");
+    assert_eq!(blank_end_why["message"], "--why cannot be empty");
+    let ended = project.success(&[
+        "attempt",
+        "end",
+        &attempt,
+        "--outcome",
+        "failed",
+        "--why",
+        "worker exited",
+    ]);
+    assert_eq!(ended["schema"], "alder.attempt.end.v0");
+    assert_eq!(ended["outcome"], "failed");
+    assert_eq!(
+        project.failure(&["attempt", "edit", &attempt, "--note", "late",])["code"],
+        "attempt_ended"
+    );
+}
+
+#[test]
+fn work_state_verbs_replace_the_removed_edit_flags() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&["work", "add", "--title", "Blockable"]),
+        "work_id",
+    );
+
+    let blocked = project.success(&["work", "block", &work, "--why", "credentials missing"]);
+    assert_eq!(blocked["schema"], "alder.work.block.v0");
+    assert_eq!(
+        project.success(&["show", &work])["current"]["state"],
+        "blocked"
+    );
+    assert!(
+        project.success(&["next"])["work"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let question = string(
+        &project.success(&["work", "ask", &work, "Which credentials?"]),
+        "question_id",
+    );
+    assert_eq!(
+        project.failure(&["work", "unblock", &work, "--why", "guessing"])["code"],
+        "unanswered_question"
+    );
+    project.success(&["question", "answer", &question, "the release pair"]);
+    let unblocked = project.success(&["work", "unblock", &work, "--why", "credentials installed"]);
+    assert_eq!(unblocked["schema"], "alder.work.unblock.v0");
+    assert_eq!(
+        project.success(&["show", &work])["current"]["state"],
+        "open"
+    );
+    assert_eq!(
+        project.failure(&["work", "block", "hm-missing", "--why", "reason"])["code"],
+        "not_found"
+    );
+
+    let attempt = string(&project.success(&["work", "start", &work]), "attempt_id");
+    let dropped = project.success(&[
+        "work",
+        "drop",
+        &work,
+        "--attempt",
+        &attempt,
+        "--outcome",
+        "cancelled",
+        "--why",
+        "approach cannot work",
+    ]);
+    assert_eq!(dropped["schema"], "alder.work.drop.v0");
+    let reopened = project.success(&["work", "reopen", &work, "--why", "requirement stands"]);
+    assert_eq!(reopened["schema"], "alder.work.reopen.v0");
+    assert_eq!(
+        project.success(&["show", &work])["current"]["state"],
+        "open"
     );
 }
 
@@ -612,8 +697,8 @@ fn initialization_validates_each_store_field_and_reports_the_remote_head() {
         "config_conflict"
     );
 
-    project.success(&["add", "work", "--title", "one"]);
-    project.success(&["add", "work", "--title", "two"]);
+    project.success(&["work", "add", "--title", "one"]);
+    project.success(&["work", "add", "--title", "two"]);
     let initialized = project.success(&["init", "--prefix", "hm"]);
     assert_eq!(initialized["status"], "already_initialized");
     assert_eq!(initialized["head"], 2);
@@ -625,17 +710,17 @@ fn actor_overrides_and_object_history_are_preserved() {
     let output = project
         .command()
         .env("ALDER_ACTOR", "side-channel")
-        .args(["add", "work", "--title", "one", "--json"])
+        .args(["work", "add", "--title", "one", "--json"])
         .output()
         .unwrap();
     assert!(output.status.success());
     let added: Value = serde_json::from_slice(&output.stdout).unwrap();
     let first = string(&added, "work_id");
-    let second = project.success(&["add", "work", "--title", "two"]);
+    let second = project.success(&["work", "add", "--title", "two"]);
     let second = string(&second, "work_id");
-    let first_question = project.success(&["ask", &first, "first question"]);
+    let first_question = project.success(&["work", "ask", &first, "first question"]);
     let first_question = string(&first_question, "question_id");
-    project.success(&["ask", &second, "second question"]);
+    project.success(&["work", "ask", &second, "second question"]);
 
     let shown = project.success(&["show", &first]);
     assert_eq!(shown["history"][0]["actor"], "side-channel");
@@ -653,7 +738,7 @@ fn actor_overrides_and_object_history_are_preserved() {
 #[test]
 fn hypothetical_ordinals_and_debug_selection_are_exact() {
     let project = TestProject::new();
-    project.success(&["add", "work", "--title", "root"]);
+    project.success(&["work", "add", "--title", "root"]);
     let document = project.work.join("anonymous.json");
     fs::write(
         &document,
@@ -699,4 +784,233 @@ fn hypothetical_ordinals_and_debug_selection_are_exact() {
         project.failure(&["debug", "observations", "missing", "--run"])["code"],
         "observer_unconfigured"
     );
+}
+
+#[test]
+fn the_loop_records_passes_and_folds_its_desired_state() {
+    let project = TestProject::new();
+    let empty = project.success(&["status"]);
+    assert_eq!(empty["loop"]["paused"], false);
+    assert_eq!(empty["loop"]["rotate_pending"], false);
+    assert!(empty["loop"]["engine"].is_null());
+    assert!(empty["loop"]["open_pass"].is_null());
+    assert!(empty["loop"]["last_pass"].is_null());
+    assert!(!project.human(&["status"]).contains("\nloop\n"));
+
+    project.success(&["loop", "use", "claude"]);
+    let paused = project.success(&["loop", "pause", "--why", "release freeze"]);
+    assert_eq!(paused["schema"], "alder.loop.pause.v0");
+    let status = project.success(&["status"]);
+    assert_eq!(status["loop"]["paused"], true);
+    assert_eq!(status["loop"]["pause_reason"], "release freeze");
+    assert_eq!(status["loop"]["engine"], "claude");
+    assert!(
+        project
+            .human(&["status"])
+            .contains("paused · release freeze · engine claude")
+    );
+    project.success(&["loop", "resume"]);
+    assert_eq!(project.success(&["status"])["loop"]["paused"], false);
+
+    let woke = project.success(&[
+        "loop",
+        "wake",
+        "--engine",
+        "claude",
+        "--handle",
+        "tmux:alder-leader",
+        "--trigger",
+        "log",
+        "--trigger",
+        "due",
+    ]);
+    assert_eq!(woke["schema"], "alder.loop.wake.v0");
+    let pass = string(&woke, "pass_id");
+    assert_eq!(pass, "hm-pass-1");
+    // Triggers fold into a canonical order rather than command-line order.
+    assert_eq!(woke["triggers"], json!(["log", "due"]));
+
+    let open = project.success(&["status"])["loop"]["open_pass"].clone();
+    assert_eq!(open["id"], pass);
+    assert_eq!(open["engine"], "claude");
+    assert_eq!(open["handle"], "tmux:alder-leader");
+    assert_eq!(open["at_head"], 3);
+
+    // Passes are serialized, exactly like one active attempt per work item.
+    let conflict = project.failure(&[
+        "loop",
+        "wake",
+        "--engine",
+        "claude",
+        "--handle",
+        "tmux:alder-leader",
+    ]);
+    assert_eq!(conflict["code"], "pass_open");
+    assert_eq!(conflict["context"]["pass_id"], pass);
+
+    let ended = project.success(&[
+        "pass",
+        "end",
+        "--outcome",
+        "ok",
+        "--report",
+        "started hm-9a1\nsecond line",
+        "--wake",
+        "20m",
+    ]);
+    assert_eq!(ended["schema"], "alder.pass.end.v0");
+    assert_eq!(ended["pass_id"], pass);
+    assert_eq!(ended["outcome"], "ok");
+    let last = project.success(&["status"])["loop"]["last_pass"].clone();
+    assert_eq!(last["id"], pass);
+    assert_eq!(last["outcome"], "ok");
+    assert_eq!(last["report_line"], "started hm-9a1");
+    assert!(last["wake_at"].is_string());
+    // The head at which the pass ended is the driver's log-trigger baseline:
+    // it equals the current head until someone else appends.
+    assert_eq!(last["ended_seq"], project.success(&["status"])["head"]);
+    assert!(
+        project
+            .human(&["status"])
+            .contains("last hm-pass-1  ok  started hm-9a1")
+    );
+
+    assert_eq!(
+        project.failure(&["pass", "end", "--outcome", "ok"])["code"],
+        "no_open_pass"
+    );
+    assert_eq!(
+        project.failure(&["pass", "end", &pass, "--outcome", "ok"])["code"],
+        "pass_ended"
+    );
+    assert_eq!(
+        project.failure(&["pass", "end", "hm-pass-9", "--outcome", "ok"])["code"],
+        "not_found"
+    );
+    assert_eq!(
+        project.failure(&[
+            "loop",
+            "wake",
+            "--engine",
+            "claude",
+            "--handle",
+            "tmux:alder-leader",
+            "--wake",
+            "20x",
+        ])["code"],
+        "invalid_command"
+    );
+
+    let shown = project.success(&["show", &pass]);
+    assert_eq!(shown["kind"], "pass");
+    assert_eq!(shown["current"]["engine"], "claude");
+    assert_eq!(shown["current"]["triggers"], json!(["log", "due"]));
+    let types: Vec<_> = shown["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["pass.started", "pass.ended"]);
+
+    let rows = project.success(&[
+        "debug",
+        "query",
+        "SELECT id, engine, state, outcome FROM passes ORDER BY started_seq",
+    ]);
+    assert_eq!(rows["result"]["rows"][0]["id"], pass);
+    assert_eq!(rows["result"]["rows"][0]["state"], "ended");
+    let control = project.success(&["debug", "query", "SELECT * FROM loop_control"]);
+    assert_eq!(control["result"]["rows"][0]["engine"], "claude");
+    assert_eq!(control["result"]["rows"][0]["paused"], 0);
+}
+
+#[test]
+fn a_rotation_is_pending_only_until_the_next_wake() {
+    let project = TestProject::new();
+    let requested = project.success(&["loop", "rotate", "--why", "engine upgraded"]);
+    assert_eq!(requested["schema"], "alder.loop.rotate.v0");
+    assert_eq!(project.success(&["status"])["loop"]["rotate_pending"], true);
+    assert!(project.human(&["status"]).contains("rotate pending"));
+
+    let wake = [
+        "loop",
+        "wake",
+        "--engine",
+        "codex",
+        "--handle",
+        "tmux:alder-leader",
+    ];
+    project.success(&wake);
+    assert_eq!(
+        project.success(&["status"])["loop"]["rotate_pending"],
+        false
+    );
+
+    // `pass end --rotate` requests the next rotation without a second command.
+    project.success(&["pass", "end", "--outcome", "ok", "--rotate"]);
+    assert_eq!(project.success(&["status"])["loop"]["rotate_pending"], true);
+    project.success(&wake);
+    assert_eq!(
+        project.success(&["status"])["loop"]["rotate_pending"],
+        false
+    );
+    project.success(&[
+        "pass",
+        "end",
+        "--outcome",
+        "crashed",
+        "--why",
+        "engine exited",
+    ]);
+    assert_eq!(
+        project.success(&["status"])["loop"]["rotate_pending"],
+        false
+    );
+    assert_eq!(
+        project.success(&["status"])["loop"]["last_pass"]["outcome"],
+        "crashed"
+    );
+}
+
+#[test]
+fn refresh_reports_change_without_counting_metadata_churn() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&["work", "add", "--title", "Observed"]),
+        "work_id",
+    );
+    let attempt = string(&project.success(&["work", "start", &work]), "attempt_id");
+    project.success(&["attempt", "edit", &attempt, "--handle", "tmux:worker"]);
+
+    let ticker = project.work.join("cost");
+    project.config(json!([{
+        "observer": "tmux",
+        "list": format!(
+            "n=$(cat '{path}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{path}'; \
+             printf '[{{\"value\":\"worker\",\"attempt_id\":\"{attempt}\",\
+             \"metadata\":{{\"estimated_cost\":%s}}}}]' \"$n\"",
+            path = ticker.display(),
+        )
+    }]));
+
+    let first = project.success(&["refresh"]);
+    assert_eq!(first["changed"], true);
+    assert_eq!(first["result"]["changed"], true);
+    for _ in 0..2 {
+        assert_eq!(project.success(&["refresh"])["changed"], false);
+    }
+    assert!(
+        !project
+            .human(&["refresh"])
+            .contains("changed since the previous refresh")
+    );
+
+    project.config(json!([{"observer": "tmux", "list": "printf '[]'"}]));
+    assert!(
+        project
+            .human(&["refresh"])
+            .contains("changed since the previous refresh")
+    );
+    assert_eq!(project.success(&["refresh"])["changed"], false);
 }

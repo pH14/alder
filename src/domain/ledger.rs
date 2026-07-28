@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use chrono::Utc;
+use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{Value, json};
 use ulid::Ulid;
 
@@ -9,8 +9,9 @@ use alder_log::{AppendReceipt, Log, LogError};
 
 use super::{
     AttemptDefinition, AttemptOutcome, CheckUpdate, Event, EventDraft, EventPayload,
-    GraphChangeDocument, HandoffDefinition, Head, PreparedChange, ProjectState, QuestionDefinition,
-    WorkDefinition, WorkOperation, WorkState,
+    GraphChangeDocument, HandoffDefinition, Head, PassDefinition, PassOutcome, PassTrigger,
+    PreparedChange, ProjectState, QuestionDefinition, WorkDefinition, WorkOperation, WorkState,
+    WorkStateChange,
 };
 
 const ID_ALLOCATION_ATTEMPTS: usize = 16;
@@ -70,7 +71,16 @@ impl<S: Log> Ledger<S> {
         snapshot: &Snapshot,
         payload: EventPayload,
     ) -> Result<AppendResult> {
-        let draft = self.draft(payload);
+        self.append_payload_at(snapshot, Utc::now(), payload)
+    }
+
+    fn append_payload_at(
+        &self,
+        snapshot: &Snapshot,
+        at: DateTime<Utc>,
+        payload: EventPayload,
+    ) -> Result<AppendResult> {
+        let draft = self.draft_at(at, payload);
         let candidate = draft.materialize(snapshot.head.sequence().saturating_add(1));
         let mut state = snapshot.state.clone();
         state.apply(&candidate)?;
@@ -78,7 +88,7 @@ impl<S: Log> Ledger<S> {
         let receipt = self
             .store
             .append(&snapshot.head, &super::encode_draft(&draft)?)?;
-        Ok(append_result(receipt)?)
+        append_result(receipt)
     }
 
     pub fn commit_change(
@@ -405,10 +415,133 @@ impl<S: Log> Ledger<S> {
         )
     }
 
+    /// Change one work item's state. Blocking and unblocking remain `edit`
+    /// operations in `work.changed`; only the CLI spelling is a verb.
+    pub fn set_work_state(&self, work_id: &str, change: WorkStateChange) -> Result<AppendResult> {
+        let snapshot = self.snapshot()?;
+        if !snapshot.state.work.contains_key(work_id) {
+            return Err(AlderError::not_found("work", work_id));
+        }
+        self.append_payload(
+            &snapshot,
+            EventPayload::WorkChanged {
+                why: Some(match &change {
+                    WorkStateChange::Block { reason } | WorkStateChange::Unblock { reason } => {
+                        reason.clone()
+                    }
+                }),
+                operations: vec![WorkOperation::Edit {
+                    id: work_id.to_owned(),
+                    title: None,
+                    spec: None,
+                    priority: None,
+                    add_requires: Vec::new(),
+                    remove_requires: Vec::new(),
+                    add_checks: Vec::new(),
+                    remove_checks: Vec::new(),
+                    state_change: Some(change),
+                }],
+            },
+        )
+    }
+
+    pub fn wake_loop(
+        &self,
+        engine: String,
+        handle: String,
+        triggers: Vec<PassTrigger>,
+    ) -> Result<(AppendResult, String)> {
+        let snapshot = self.snapshot()?;
+        if let Some(open) = snapshot.state.open_pass() {
+            return Err(AlderError::with_context(
+                "pass_open",
+                format!("pass `{}` is still open", open.id),
+                json!({
+                    "pass_id": open.id,
+                    "engine": open.engine,
+                    "handle": open.handle,
+                    "started_at": open.started_at,
+                }),
+            ));
+        }
+        let ordinal = snapshot.state.passes.len().saturating_add(1);
+        let id = format!("{}-pass-{ordinal}", self.prefix);
+        let result = self.append_payload(
+            &snapshot,
+            EventPayload::PassStarted {
+                pass: PassDefinition {
+                    id: id.clone(),
+                    engine,
+                    handle,
+                    triggers,
+                    at_head: snapshot.head.sequence(),
+                },
+            },
+        )?;
+        Ok((result, id))
+    }
+
+    pub fn end_pass(
+        &self,
+        pass_id: Option<&str>,
+        outcome: PassOutcome,
+        report: Option<String>,
+        wake_after: Option<TimeDelta>,
+        rotate: bool,
+        why: Option<String>,
+    ) -> Result<(AppendResult, String)> {
+        let snapshot = self.snapshot()?;
+        let id = match pass_id {
+            Some(id) => id.to_owned(),
+            None => snapshot
+                .state
+                .open_pass()
+                .map(|pass| pass.id.clone())
+                .ok_or_else(|| {
+                    AlderError::new("no_open_pass", "the loop has no open pass to end")
+                })?,
+        };
+        let at = Utc::now();
+        let payload = EventPayload::PassEnded {
+            pass_id: id.clone(),
+            outcome,
+            report,
+            wake_at: wake_after.map(|after| at + after),
+            rotate,
+            why,
+        };
+        let result = self.append_payload_at(&snapshot, at, payload)?;
+        Ok((result, id))
+    }
+
+    pub fn pause_loop(&self, why: Option<String>) -> Result<AppendResult> {
+        let snapshot = self.snapshot()?;
+        self.append_payload(&snapshot, EventPayload::LoopPaused { why })
+    }
+
+    pub fn resume_loop(&self) -> Result<AppendResult> {
+        let snapshot = self.snapshot()?;
+        self.append_payload(&snapshot, EventPayload::LoopResumed {})
+    }
+
+    pub fn select_engine(&self, engine: String) -> Result<AppendResult> {
+        let snapshot = self.snapshot()?;
+        self.append_payload(&snapshot, EventPayload::LoopEngineSelected { engine })
+    }
+
+    pub fn request_rotation(&self, why: Option<String>) -> Result<AppendResult> {
+        let snapshot = self.snapshot()?;
+        self.append_payload(&snapshot, EventPayload::LoopRotationRequested { why })
+    }
+
     fn draft(&self, payload: EventPayload) -> EventDraft {
+        self.draft_at(Utc::now(), payload)
+    }
+
+    fn draft_at(&self, at: DateTime<Utc>, payload: EventPayload) -> EventDraft {
         EventDraft {
             id: Ulid::new().to_string(),
-            at: Utc::now(),
+            at,
             actor: self.actor.clone(),
             payload,
             schema: "alder.event.v0".to_owned(),
@@ -496,9 +629,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::domain::{
-        ChangeMode, CheckDefinition, CheckStatus, EditWorkInput, GraphChangeDocument,
-    };
+    use crate::domain::{CheckDefinition, CheckStatus};
     use alder_log::{
         AppendReceipt, Log as Store, LogError, MemoryLog as MemoryStore, Record, RecordDraft,
     };
@@ -710,27 +841,13 @@ mod tests {
         assert_eq!(snapshot.state.questions[&question].answers.len(), 2);
         assert_eq!(snapshot.state.work[&work].state, WorkState::Blocked);
 
-        let document = GraphChangeDocument {
-            why: Some("decision incorporated".to_owned()),
-            add: vec![],
-            edit: vec![EditWorkInput {
-                id: work.clone(),
-                title: None,
-                spec: None,
-                priority: None,
-                add_requires: vec![],
-                remove_requires: vec![],
-                add_checks: vec![],
-                remove_checks: vec![],
-                block: false,
-                unblock: true,
-            }],
-        };
-        let prepared = ledger
-            .allocate_change(&snapshot, &document, ChangeMode::Edit)
-            .unwrap();
         ledger
-            .commit_change(&snapshot, &document, prepared)
+            .set_work_state(
+                &work,
+                WorkStateChange::Unblock {
+                    reason: "decision incorporated".to_owned(),
+                },
+            )
             .unwrap();
         assert_eq!(
             ledger.snapshot().unwrap().state.work[&work].state,
@@ -887,6 +1004,124 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, "invalid_transition");
+    }
+
+    #[test]
+    fn passes_take_serial_ordinals_and_carry_the_head_they_saw() {
+        let ledger = Ledger::new(MemoryStore::new(), "hm", "alderd");
+        ledger
+            .add_work("work".to_owned(), None, 0, vec![], vec![])
+            .unwrap();
+
+        let (_, first) = ledger
+            .wake_loop(
+                "claude".to_owned(),
+                "tmux:alder-leader".to_owned(),
+                vec![PassTrigger::Log],
+            )
+            .unwrap();
+        assert_eq!(first, "hm-pass-1");
+        assert_eq!(ledger.snapshot().unwrap().state.passes[&first].at_head, 1);
+
+        let conflict = ledger
+            .wake_loop(
+                "claude".to_owned(),
+                "tmux:alder-leader".to_owned(),
+                vec![PassTrigger::Manual],
+            )
+            .unwrap_err();
+        assert_eq!(conflict.code, "pass_open");
+        assert_eq!(conflict.context["pass_id"], "hm-pass-1");
+
+        let (_, ended) = ledger
+            .end_pass(
+                None,
+                PassOutcome::Ok,
+                Some("swept the frontier".to_owned()),
+                Some(TimeDelta::minutes(20)),
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(ended, first);
+        let state = ledger.snapshot().unwrap().state;
+        let wake_at = state.passes[&first].wake_at.expect("a wake time");
+        assert!(wake_at > Utc::now() + TimeDelta::minutes(19));
+
+        assert_eq!(
+            ledger
+                .end_pass(None, PassOutcome::Ok, None, None, false, None)
+                .unwrap_err()
+                .code,
+            "no_open_pass"
+        );
+
+        let (_, second) = ledger
+            .wake_loop(
+                "codex".to_owned(),
+                "tmux:alder-leader".to_owned(),
+                vec![PassTrigger::Due],
+            )
+            .unwrap();
+        assert_eq!(second, "hm-pass-2");
+    }
+
+    #[test]
+    fn loop_controls_and_work_state_verbs_append_their_own_events() {
+        let ledger = Ledger::new(MemoryStore::new(), "hm", "operator");
+        let (_, work) = ledger
+            .add_work("work".to_owned(), None, 0, vec![], vec![])
+            .unwrap();
+
+        ledger
+            .pause_loop(Some("release freeze".to_owned()))
+            .unwrap();
+        ledger.select_engine("codex".to_owned()).unwrap();
+        ledger.request_rotation(None).unwrap();
+        let state = ledger.snapshot().unwrap().state;
+        assert!(state.loop_control.paused);
+        assert_eq!(state.loop_control.engine.as_deref(), Some("codex"));
+        assert!(state.loop_control.rotate_pending());
+
+        ledger.resume_loop().unwrap();
+        assert!(!ledger.snapshot().unwrap().state.loop_control.paused);
+
+        ledger
+            .set_work_state(
+                &work,
+                WorkStateChange::Block {
+                    reason: "credentials missing".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            ledger.snapshot().unwrap().state.work[&work].state,
+            WorkState::Blocked
+        );
+        ledger
+            .set_work_state(
+                &work,
+                WorkStateChange::Unblock {
+                    reason: "credentials installed".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            ledger.snapshot().unwrap().state.work[&work].state,
+            WorkState::Open
+        );
+        assert_eq!(
+            ledger
+                .set_work_state(
+                    "hm-missing",
+                    WorkStateChange::Block {
+                        reason: "reason".to_owned(),
+                    },
+                )
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
     }
 
     #[test]

@@ -32,6 +32,12 @@ Work may also carry a durable question when progress requires an asynchronous
 human decision. Questions are subordinate to work rather than a second kind of
 work or a general messaging system.
 
+It also records the driving loop itself: passes, which are the loop's run
+records, and a small set of loop controls. Work is to an attempt what the loop
+is to a pass. These are namespaced separately from the six core structures
+because they describe how the project is being driven rather than what the
+project owes. [LOOP.md](LOOP.md) defines them.
+
 Events are stored in Git. Current state is a deterministic fold of those
 events into a local SQLite database. Observations from external systems are
 refreshed into separate, local tables and never outrank a fresh observation.
@@ -60,22 +66,29 @@ One bounded pass is:
 Alder supplies the state needed for this loop. It does not contain the loop's
 engineering judgment.
 
+A pass is that iteration made durable. `alder loop wake` opens one before an
+agent is prompted and `alder pass end` closes it with an outcome, an optional
+report, and an optional request to be woken again. Alder records passes; it
+does not run them. Deciding *when* to wake an agent belongs to a small external
+driver whose read surface is deliberately tiny, and deciding *what* to do
+belongs to the agent.
+
 ## Principles
 
 ### Admission is a decision
 
-Nothing is Alder work until a writer runs `alder add work`. Alder does not
+Nothing is Alder work until a writer runs `alder work add`. Alder does not
 authorize one writer over another. Repository skills decide which agent may
 admit work and should direct workers and side sessions to the handoff path.
 
 Alder provides a small asynchronous inbox for side sessions:
 
-- `alder add handoff` records a title, artifact reference, and optional note;
+- `alder handoff add` records a title, artifact reference, and optional note;
 - the handoff is `submitted`, not work, and does not participate in readiness
   or dependencies;
 - the driving agent drains submitted handoffs before selecting more work;
-- `alder add work --from-handoff` atomically creates admitted work and marks
-  the handoff `integrated`.
+- `alder work add --handoff` atomically creates admitted work and marks the
+  handoff `integrated`.
 
 These are the only two handoff states. If integration cannot validate, the
 handoff remains submitted and visible.
@@ -84,7 +97,7 @@ Submission is intentionally weaker than admission. A repository-tuned handoff
 skill should invoke it only after an explicit human request such as "handoff
 to leader." Alder does not pretend that a free-form claim of human delegation
 is enforceable; even an unwanted submission cannot enter the work graph until
-a writer explicitly admits it with `add work`.
+a writer explicitly admits it with `work add`.
 
 ### IDs carry context
 
@@ -100,7 +113,7 @@ One decision may add or edit many work items. Alder validates the
 resulting graph and records the whole decision as one event, so a crash cannot
 leave half of a re-plan durable.
 
-The ordinary `add work` and `edit work` forms remain convenient for one item.
+The ordinary `work add` and `work edit` forms remain convenient for one item.
 Structured input lets the same commands perform larger changes. It is an input
 format, not a durable batch, draft, or transaction lifecycle.
 
@@ -114,13 +127,24 @@ planning language.
 
 An attempt is recorded before its worker is launched. The external worker is
 stamped with the attempt ID, then its external handle is attached to the
-attempt with `alder edit attempt`.
+attempt with `alder attempt edit`.
 
 This makes both crash windows repairable:
 
 - recorded attempt, no worker: end the attempt as `not_started`;
 - worker exists, handle was not recorded: find it by attempt ID and attach its
-  handle with `alder edit attempt`.
+  handle with `alder attempt edit`.
+
+A pass follows the same rule. `alder loop wake` is appended before an agent is
+prompted, and it returns the pass ID the prompt carries:
+
+- recorded pass, agent never prompted: the pass stays open until someone ends
+  it as `crashed` or, past its time budget, `timeout`;
+- prompted agent, no record: impossible, because the prompt carries the pass ID
+  the wake produced.
+
+An open pass rejects the next wake, so the repair is forced rather than
+optional, and any reader with a terminal can perform it.
 
 ### Attempts outlive callers
 
@@ -136,7 +160,7 @@ appends to it. If another writer advances the log before the append, the
 mutation changes nothing and the caller must reread and reconsider it.
 
 Ordinary mutations are never silently replayed against the new head.
-`add handoff` is the exception because submission is inert and uniquely
+`handoff add` is the exception because submission is inert and uniquely
 identified, making reconsideration automatic and safe.
 
 The expected head is internal to the command. V0 has no public `--if-head`
@@ -146,14 +170,18 @@ another valid writer.
 
 ### One active attempt per work item
 
-`alder start` rejects work that already has an active attempt. Starting again
-requires explicitly ending that attempt with `alder edit attempt --end`, so a
+`alder work start` rejects work that already has an active attempt. Starting
+again requires explicitly ending that attempt with `alder attempt end`, so a
 second launch cannot silently hide the first.
+
+One open pass per loop is the same rule at the loop's scale. `alder loop wake`
+rejects a second pass while one is open, so two drivers cannot quietly run two
+leaders.
 
 ### Completion criteria precede execution
 
 Checks belong to the work item and are set at admission or by an explicit
-`edit work` while the work is not running. Every declared check gates ordinary
+`work edit` while the work is not running. Every declared check gates ordinary
 completion, and a later attempt cannot weaken that contract.
 
 ### Outcomes matter
@@ -177,9 +205,9 @@ only when the work itself has changed identity.
 
 ## Execution and environment boundary
 
-`alder start` records an attempt and returns its ID. A repository-tuned skill
-then launches the work, stamps the external execution with that ID, and
-attaches an external handle to the attempt with `alder edit attempt`.
+`alder work start` records an attempt and returns its ID. A repository-tuned
+skill then launches the work, stamps the external execution with that ID, and
+attaches an external handle to the attempt with `alder attempt edit`.
 
 A handle has the form `<kind>:<opaque-value>`, such as:
 
@@ -319,7 +347,9 @@ V0 does not include:
 - public dashboard publication;
 - durable leader roles, generations, or leases;
 - generic storage backends;
-- committed SQLite projections or snapshots.
+- committed SQLite projections or snapshots;
+- observations in the durable log;
+- engine validation, or any driver diagnostic as a durable event.
 
 An attempt may record an external handle and open-ended metadata. They provide
 reconciliation and provenance without becoming a resource scheduler.

@@ -1,29 +1,36 @@
 # alder
 
-Coordination for autonomous engineering work as **state-machine replication
-over a single-leader shared log** — plus the refined, provider-neutral
-process (leader, reviewer, handoff, watchdog roles) for acting on it.
+A durable work-and-attempt ledger for autonomous engineering workflows.
 
-Two documents anchor all design context:
+Alder exists so a fresh agent can answer, without a previous session's
+memory: what is actionable now, what has already been launched, what is
+blocked or waiting on a person, and what changed while it was away.
 
-- **[docs/SHARED-LOG.md](docs/SHARED-LOG.md)** — the why: the model, the
-  protocol rules, placement and privacy, the layer architecture
-  (core / process / bindings / profile), and the rulings to date.
-- **[docs/MODEL.sql](docs/MODEL.sql)** — the what: the entire state model
-  as executable SQL — tables, legal transitions (the `transitions` table is
-  the state diagram), and the derived views (`ready`, `stale`, `budget`, …).
-- **[docs/SCENARIOS.md](docs/SCENARIOS.md)** — the test suite: situations
-  the design must handle, stated without mechanism. Design choices are
-  argued against these.
-- **[docs/WALKTHROUGH.md](docs/WALKTHROUGH.md)** — the feel: ten scenarios
-  as full CLI sequences, for judging the API surface.
+Events are appended to a shared log stored in a Git remote ref. The remote
+is authoritative, so independent writers coordinate through compare-and-append
+against it rather than through a server. Current state is a deterministic
+fold of those events into a local SQLite database, rebuildable from the log
+at any time. Observations of external systems are refreshed into separate
+local tables and never masquerade as ledger facts.
 
-Read them first; when prose and DDL disagree, the DDL is the bug report.
+The model: work items with dependencies and acceptance checks, attempts at
+that work, questions that park work on a human decision, and handoffs
+submitted from outside. Human-readable output is the default; every command
+also takes `--json`, the stable agent-facing surface.
 
-Lineage: LogAct (arXiv:2604.07988), Corfu, Tango, Delos, FuzzyLog, Calvin.
-The log is opaque, app-agnostic, and totally ordered; semantics live in
-the apps above it — item tracking, resources, decisions, each its own
-state machine (Tango's shared objects) — and all state is a deterministic
-fold. Storage is git; queries are sqlite.
+    alder init --prefix hm
+    alder work add --title "Ship the parser" --check tests:"cargo test passes"
+    alder next
+    alder work start hm-x7k2pq
+    alder work finish hm-x7k2pq --attempt hm-x7k2pq-attempt-1
 
-Status: design phase. First consumer: Harmony.
+The repository is a two-crate workspace: the `alder` CLI, and
+[crates/alder-log](crates/alder-log), a reusable Git-backed append-only
+record log with no knowledge of Alder's domain.
+
+Design docs live in [docs/v0](docs/v0): purpose and boundaries, the state
+model, the CLI contract, the driving loop and its daemon, implementation
+notes, and acceptance criteria.
+
+Lineage: Corfu, Tango, Delos, FuzzyLog. The log is opaque and totally
+ordered; semantics live in the state machines folded above it.

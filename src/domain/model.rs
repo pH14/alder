@@ -93,6 +93,25 @@ pub enum EventPayload {
     QuestionAsked { question: QuestionDefinition },
     #[serde(rename = "question.answered")]
     QuestionAnswered { question_id: String, answer: String },
+    #[serde(rename = "pass.started")]
+    PassStarted { pass: PassDefinition },
+    #[serde(rename = "pass.ended")]
+    PassEnded {
+        pass_id: String,
+        outcome: PassOutcome,
+        report: Option<String>,
+        wake_at: Option<DateTime<Utc>>,
+        rotate: bool,
+        why: Option<String>,
+    },
+    #[serde(rename = "loop.paused")]
+    LoopPaused { why: Option<String> },
+    #[serde(rename = "loop.resumed")]
+    LoopResumed {},
+    #[serde(rename = "loop.engine_selected")]
+    LoopEngineSelected { engine: String },
+    #[serde(rename = "loop.rotation_requested")]
+    LoopRotationRequested { why: Option<String> },
 }
 
 impl EventPayload {
@@ -110,6 +129,12 @@ impl EventPayload {
             Self::AttemptEnded { .. } => "attempt.ended",
             Self::QuestionAsked { .. } => "question.asked",
             Self::QuestionAnswered { .. } => "question.answered",
+            Self::PassStarted { .. } => "pass.started",
+            Self::PassEnded { .. } => "pass.ended",
+            Self::LoopPaused { .. } => "loop.paused",
+            Self::LoopResumed {} => "loop.resumed",
+            Self::LoopEngineSelected { .. } => "loop.engine_selected",
+            Self::LoopRotationRequested { .. } => "loop.rotation_requested",
         }
     }
 
@@ -140,6 +165,14 @@ impl EventPayload {
             | Self::AttemptEnded { attempt_id, .. } => attempt_id == id,
             Self::QuestionAsked { question } => question.id == id || question.work_id == id,
             Self::QuestionAnswered { question_id, .. } => question_id == id,
+            Self::PassStarted { pass } => pass.id == id,
+            Self::PassEnded { pass_id, .. } => pass_id == id,
+            // Loop controls belong to the singleton loop rather than to a pass,
+            // so they name no object and appear in no object's history.
+            Self::LoopPaused { .. }
+            | Self::LoopResumed {}
+            | Self::LoopEngineSelected { .. }
+            | Self::LoopRotationRequested { .. } => false,
         }
     }
 }
@@ -388,6 +421,114 @@ pub struct QuestionAnswer {
     pub actor: String,
 }
 
+/// Why the loop was woken. Trigger kinds are informational provenance; they
+/// never limit what the pass must do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PassTrigger {
+    Log,
+    Observations,
+    Due,
+    Manual,
+}
+
+impl PassTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::Observations => "observations",
+            Self::Due => "due",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PassState {
+    Open,
+    Ended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PassOutcome {
+    Ok,
+    Crashed,
+    Timeout,
+}
+
+impl PassOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Crashed => "crashed",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PassDefinition {
+    pub id: String,
+    pub engine: String,
+    pub handle: String,
+    pub triggers: Vec<PassTrigger>,
+    pub at_head: u64,
+}
+
+/// One run of the loop. A pass is to the loop what an attempt is to work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pass {
+    pub id: String,
+    pub engine: String,
+    pub handle: String,
+    pub triggers: Vec<PassTrigger>,
+    pub state: PassState,
+    pub outcome: Option<PassOutcome>,
+    pub report: Option<String>,
+    pub wake_at: Option<DateTime<Utc>>,
+    pub rotate: bool,
+    pub why: Option<String>,
+    pub at_head: u64,
+    pub started_at: DateTime<Utc>,
+    pub started_seq: u64,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub ended_seq: Option<u64>,
+}
+
+impl Pass {
+    /// The first line of the iteration report, which is what `status` shows.
+    pub fn report_line(&self) -> Option<&str> {
+        self.report
+            .as_deref()
+            .and_then(|report| report.lines().next())
+    }
+}
+
+/// The desired state of the singleton loop. Every field is a last-writer-wins
+/// fold except rotation, which is derived from event order.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LoopControl {
+    pub paused: bool,
+    pub pause_reason: Option<String>,
+    pub engine: Option<String>,
+    pub rotate_requested_seq: Option<u64>,
+    pub last_wake_seq: Option<u64>,
+}
+
+impl LoopControl {
+    /// A rotation is pending when its request is later in the log than the
+    /// most recent wake. The next wake consumes it; no stored flag is cleared.
+    pub fn rotate_pending(&self) -> bool {
+        match (self.rotate_requested_seq, self.last_wake_seq) {
+            (Some(requested), Some(woke)) => requested > woke,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alder_log::Head;
@@ -561,6 +702,49 @@ mod tests {
                 "question.answered",
                 vec!["question"],
             ),
+            (
+                EventPayload::PassStarted {
+                    pass: PassDefinition {
+                        id: "pass".to_owned(),
+                        engine: "claude".to_owned(),
+                        handle: "tmux:alder-leader".to_owned(),
+                        triggers: vec![PassTrigger::Log],
+                        at_head: 4,
+                    },
+                },
+                "pass.started",
+                vec!["pass"],
+            ),
+            (
+                EventPayload::PassEnded {
+                    pass_id: "pass".to_owned(),
+                    outcome: PassOutcome::Ok,
+                    report: None,
+                    wake_at: None,
+                    rotate: false,
+                    why: None,
+                },
+                "pass.ended",
+                vec!["pass"],
+            ),
+            (
+                EventPayload::LoopPaused { why: None },
+                "loop.paused",
+                vec![],
+            ),
+            (EventPayload::LoopResumed {}, "loop.resumed", vec![]),
+            (
+                EventPayload::LoopEngineSelected {
+                    engine: "codex".to_owned(),
+                },
+                "loop.engine_selected",
+                vec![],
+            ),
+            (
+                EventPayload::LoopRotationRequested { why: None },
+                "loop.rotation_requested",
+                vec![],
+            ),
         ];
 
         for (payload, type_name, references) in cases {
@@ -603,6 +787,29 @@ mod tests {
         ] {
             assert!(outcome.is_non_success());
         }
+    }
+
+    #[test]
+    fn rotation_is_pending_only_between_its_request_and_the_next_wake() {
+        let control = |requested, woke| LoopControl {
+            rotate_requested_seq: requested,
+            last_wake_seq: woke,
+            ..LoopControl::default()
+        };
+        assert!(!control(None, None).rotate_pending());
+        assert!(!control(None, Some(4)).rotate_pending());
+        assert!(control(Some(3), None).rotate_pending());
+        assert!(control(Some(5), Some(4)).rotate_pending());
+        assert!(!control(Some(4), Some(4)).rotate_pending());
+        assert!(!control(Some(3), Some(4)).rotate_pending());
+
+        assert_eq!(PassTrigger::Log.as_str(), "log");
+        assert_eq!(PassTrigger::Observations.as_str(), "observations");
+        assert_eq!(PassTrigger::Due.as_str(), "due");
+        assert_eq!(PassTrigger::Manual.as_str(), "manual");
+        assert_eq!(PassOutcome::Ok.as_str(), "ok");
+        assert_eq!(PassOutcome::Crashed.as_str(), "crashed");
+        assert_eq!(PassOutcome::Timeout.as_str(), "timeout");
     }
 
     #[test]

@@ -33,6 +33,24 @@ pub struct RefreshResult {
     pub absent: usize,
     pub unknown: usize,
     pub unbound: Vec<ObservedHandle>,
+    /// Whether this snapshot differs semantically from the stored one. Only
+    /// handle identity, presence, and attempt binding count; observation
+    /// metadata is non-semantic and its churn must not read as change.
+    pub changed: bool,
+}
+
+/// The semantic content of an observation inventory.
+fn signature(observations: &[ObservedHandle]) -> BTreeSet<(&str, &'static str, Option<&str>)> {
+    observations
+        .iter()
+        .map(|observation| {
+            (
+                observation.handle.as_str(),
+                observation.status.as_str(),
+                observation.attempt_id.as_deref(),
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,7 +124,9 @@ pub fn refresh(
     }
     let observations = projection.observations()?;
     let bound: BTreeSet<_> = durable.iter().map(|(handle, _)| handle.as_str()).collect();
+    let changed = signature(&existing) != signature(&observations);
     Ok(RefreshResult {
+        changed,
         present: observations
             .iter()
             .filter(|handle| handle.status == ObservationStatus::Present)
@@ -486,7 +506,7 @@ pub fn reconcile(
                         status: "absent".to_owned(),
                         detail: "an active attempt's bound handle is confirmed absent".to_owned(),
                         suggested_command: Some(format!(
-                            "alder edit attempt {} --end lost --why \"external handle absent\"",
+                            "alder attempt end {} --outcome lost --why \"external handle absent\"",
                             attempt.id
                         )),
                         metadata: observation.metadata.clone(),
@@ -531,7 +551,7 @@ pub fn reconcile(
                     status: "present".to_owned(),
                     detail: "a stamped external object matches the unbound attempt".to_owned(),
                     suggested_command: Some(format!(
-                        "alder edit attempt {} --handle {}",
+                        "alder attempt edit {} --handle {}",
                         attempt.id, observation.handle
                     )),
                     metadata: observation.metadata.clone(),
@@ -544,7 +564,7 @@ pub fn reconcile(
                     status: "absent".to_owned(),
                     detail: "no configured observer found a stamped external object".to_owned(),
                     suggested_command: Some(format!(
-                        "alder edit attempt {} --end not-started --why \"worker was not launched\"",
+                        "alder attempt end {} --outcome not-started --why \"worker was not launched\"",
                         attempt.id
                     )),
                     metadata: json!({}),
@@ -769,6 +789,94 @@ mod tests {
         assert!(handles.iter().any(|handle| {
             handle.handle == "nimbus:other" && handle.status == ObservationStatus::Present
         }));
+    }
+
+    #[test]
+    fn change_detection_ignores_metadata_churn_and_catches_real_change() {
+        let temporary = TempDir::new().unwrap();
+        let projection = Projection::new(temporary.path().join("state.db"));
+        let mut state = ProjectState::default();
+        state.attempts.insert(
+            "attempt-one".to_owned(),
+            attempt("attempt-one", AttemptState::Active, Some("tmux:worker")),
+        );
+        let ticker = temporary.path().join("cost");
+        // The cost ticker moves on every execution; nothing semantic does.
+        let volatile = ObserverConfig {
+            observer: "tmux".to_owned(),
+            list: format!(
+                "n=$(cat '{path}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{path}'; \
+                 printf '[{{\"value\":\"worker\",\"attempt_id\":\"attempt-one\",\
+                 \"metadata\":{{\"cost\":%s}}}}]' \"$n\"",
+                path = ticker.display()
+            ),
+        };
+
+        // The first sweep populates an empty inventory, which is a change.
+        assert!(
+            refresh(&projection, std::slice::from_ref(&volatile), &state)
+                .unwrap()
+                .changed
+        );
+        for _ in 0..3 {
+            assert!(
+                !refresh(&projection, std::slice::from_ref(&volatile), &state)
+                    .unwrap()
+                    .changed
+            );
+        }
+        assert_ne!(
+            projection.observations().unwrap()[0].metadata,
+            json!({"cost": 1})
+        );
+
+        // Losing the worker changes presence, which is semantic.
+        let gone = ObserverConfig {
+            observer: "tmux".to_owned(),
+            list: "printf '[]'".to_owned(),
+        };
+        assert!(
+            refresh(&projection, std::slice::from_ref(&gone), &state)
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !refresh(&projection, std::slice::from_ref(&gone), &state)
+                .unwrap()
+                .changed
+        );
+
+        // So does the same handle presenting a different attempt ID.
+        let rebound = ObserverConfig {
+            observer: "tmux".to_owned(),
+            list: "printf '[{\"value\":\"worker\",\"attempt_id\":\"attempt-two\"}]'".to_owned(),
+        };
+        assert!(
+            refresh(&projection, std::slice::from_ref(&rebound), &state)
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !refresh(&projection, std::slice::from_ref(&rebound), &state)
+                .unwrap()
+                .changed
+        );
+
+        // And so does an outage, which turns the kind unknown.
+        let outage = ObserverConfig {
+            observer: "tmux".to_owned(),
+            list: "exit 1".to_owned(),
+        };
+        assert!(
+            refresh(&projection, std::slice::from_ref(&outage), &state)
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !refresh(&projection, std::slice::from_ref(&outage), &state)
+                .unwrap()
+                .changed
+        );
     }
 
     #[test]

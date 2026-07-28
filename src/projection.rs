@@ -297,6 +297,32 @@ fn create_schema(connection: &Connection) -> Result<()> {
             actor TEXT NOT NULL,
             PRIMARY KEY (question_id, seq)
         );
+        CREATE TABLE IF NOT EXISTS passes (
+            id TEXT PRIMARY KEY,
+            engine TEXT NOT NULL,
+            handle TEXT NOT NULL,
+            triggers TEXT NOT NULL,
+            state TEXT NOT NULL,
+            outcome TEXT,
+            report TEXT,
+            wake_at TEXT,
+            rotate INTEGER NOT NULL,
+            why TEXT,
+            at_head INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            started_seq INTEGER NOT NULL,
+            ended_at TEXT,
+            ended_seq INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS loop_control (
+            id INTEGER PRIMARY KEY CHECK (id = 0),
+            paused INTEGER NOT NULL,
+            pause_reason TEXT,
+            engine TEXT,
+            rotate_pending INTEGER NOT NULL,
+            rotate_requested_seq INTEGER,
+            last_wake_seq INTEGER
+        );
         CREATE TABLE IF NOT EXISTS observed_handles (
             handle TEXT PRIMARY KEY,
             attempt_id TEXT,
@@ -345,6 +371,9 @@ fn create_schema(connection: &Connection) -> Result<()> {
         DROP VIEW IF EXISTS questions_open;
         CREATE VIEW questions_open AS
             SELECT * FROM questions WHERE answer IS NULL;
+        DROP VIEW IF EXISTS pass_open;
+        CREATE VIEW pass_open AS
+            SELECT * FROM passes WHERE state = 'open';
         DROP VIEW IF EXISTS downstream;
         CREATE VIEW downstream AS
             WITH RECURSIVE graph(root_id, work_id) AS (
@@ -398,6 +427,8 @@ fn rebuild(
     let transaction = connection.transaction()?;
     transaction.execute_batch(
         "
+        DELETE FROM loop_control;
+        DELETE FROM passes;
         DELETE FROM question_answers;
         DELETE FROM questions;
         DELETE FROM attempt_checks;
@@ -527,6 +558,49 @@ fn insert_state(transaction: &Transaction<'_>, state: &ProjectState) -> Result<(
     for question in state.questions.values() {
         insert_question(transaction, question)?;
     }
+    for pass in state.passes.values() {
+        transaction.execute(
+            "INSERT INTO passes
+             (id, engine, handle, triggers, state, outcome, report, wake_at, rotate, why,
+              at_head, started_at, started_seq, ended_at, ended_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                pass.id,
+                pass.engine,
+                pass.handle,
+                pass.triggers
+                    .iter()
+                    .map(|trigger| trigger.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                enum_json(pass.state)?,
+                pass.outcome.map(enum_json).transpose()?,
+                pass.report,
+                pass.wake_at.map(|at| at.to_rfc3339()),
+                pass.rotate as i64,
+                pass.why,
+                pass.at_head,
+                pass.started_at.to_rfc3339(),
+                pass.started_seq,
+                pass.ended_at.map(|at| at.to_rfc3339()),
+                pass.ended_seq,
+            ],
+        )?;
+    }
+    let control = &state.loop_control;
+    transaction.execute(
+        "INSERT INTO loop_control
+         (id, paused, pause_reason, engine, rotate_pending, rotate_requested_seq, last_wake_seq)
+         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            control.paused as i64,
+            control.pause_reason,
+            control.engine,
+            control.rotate_pending() as i64,
+            control.rotate_requested_seq,
+            control.last_wake_seq,
+        ],
+    )?;
     Ok(())
 }
 

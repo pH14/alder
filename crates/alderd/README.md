@@ -1,0 +1,142 @@
+# alderd
+
+`alderd` decides *when* to wake an Alder leader agent. It never decides *what*
+the leader should do.
+
+The daemon holds no API token, links no model client, and reads no work,
+attempt, or question state. It shells out to the `alder` CLI for everything it
+knows about the log, and it drives one tmux session for everything it does to
+the world. Its complete read surface is three commands:
+
+1. `alder status --json` — the head, and the loop section. Everything else in
+   the document is ignored.
+2. `alder refresh --json` — the `"changed"` bool.
+3. `alder show <pass-id> --json` — only while awaiting an open pass.
+
+It runs no Git command. The log trigger is `head > last_pass.ended_seq`, both
+read from that one `status` document, so the baseline lives in the log rather
+than in the daemon and a restarted daemon recovers it for free.
+
+Anything that requires judgment — which work to start, whether an attempt is
+stale, what a report means — belongs to the leader.
+
+See [`docs/v0/LOOP.md`](../../docs/v0/LOOP.md) for the durable model behind
+this: passes, loop controls, and the crash windows the pass lifecycle repairs.
+
+## Running it
+
+```text
+alderd [--root <project>]
+```
+
+The project must already be initialized (`alder init`) and must contain
+`.alder/driver.json`. `alderd` reads the store remote and ref from
+`.alder/config.json` so it watches exactly the ref Alder writes.
+
+Logs go to standard error. `contrib/com.alder.alderd.plist` is a sample launchd
+agent; copy it to `~/Library/LaunchAgents/`, edit the paths, and
+`launchctl load` it.
+
+## Configuration
+
+`.alder/driver.json`. The `.alder/` directory is gitignored, so this file is
+machine-local by design: which engines exist and how aggressively to poll are
+properties of the box, not durable project facts.
+
+```json
+{
+  "engines": {
+    "claude": { "cmd": "claude", "args": [] },
+    "codex": { "cmd": "codex", "args": ["--full-auto"] }
+  },
+  "passDoc": ".alder/PASS.md",
+  "tmuxSession": "alder-leader",
+  "pollSeconds": 60,
+  "debounceSeconds": 20,
+  "maxIntervalSeconds": 1800,
+  "passTimeoutSeconds": 3600,
+  "maxPassesPerSession": 25,
+  "notify": "terminal-notifier -title alder -message",
+  "alder": "alder"
+}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `engines` | required | Engine name to the interactive CLI that provides it. The name matches `alder loop use <engine>`; Alder itself never validates it. |
+| `passDoc` | required | The pass prompt document. A bootstrap injection points the engine at it, and changing its contents ends the current session era. |
+| `tmuxSession` | `alder-leader` | The tmux session name. It also becomes the pass handle, `tmux:<session>`. |
+| `pollSeconds` | 60 | Poll interval, also the interval used while awaiting a pass. |
+| `debounceSeconds` | 20 | How long a fire condition must hold before injecting. |
+| `maxIntervalSeconds` | 1800 | Ceiling between passes. It also overrides both deferrals. |
+| `passTimeoutSeconds` | 3600 | How long an open pass may live before the driver ends it as `timeout`. |
+| `maxPassesPerSession` | 25 | Passes one session may serve before rotation. |
+| `notify` | none | Shell command invoked with one message argument, on a crashed or timed-out pass, an unknown engine name, and a repeated store outage. A standing condition is reported once, not once per poll. |
+| `alder` | `alder` | Path to the `alder` binary. |
+
+## What one poll does
+
+1. Read the head and the loop fold. A `store_unavailable` result is retried
+   silently and notified after three consecutive polls.
+2. If a pass is open, adopt it and wait; this is also how a daemon restart
+   recovers. Nothing else happens while a pass is open.
+3. If the loop is paused, idle.
+4. Refresh observations, then compute the trigger kinds that hold:
+   `log` (the head advanced past the last pass's `ended_seq`),
+   `observations` (refresh reported a change), and
+   `due` (a requested wake time arrived, or `maxIntervalSeconds` elapsed).
+5. Decide: idle if nothing holds, hold if the injection should wait, fire
+   otherwise.
+
+Firing is strictly ordered:
+
+1. **Reconcile the session.** Kill it if the desired engine changed, a rotation
+   is pending, the pass document changed, the pass budget is spent, or the
+   session is not one this daemon started. Create it with
+   `tmux new-session -d -s <session> 'caffeinate -i <cmd> <args>'` and mark the
+   next injection as a bootstrap.
+2. **Record intent.** `alder loop wake --engine <engine> --handle tmux:<session>
+   --trigger …` returns the pass ID. If the wake is rejected with `pass_open`,
+   another writer opened a pass in the last few seconds; the driver concedes
+   and does nothing. It never ends a pass it did not find already open.
+3. **Inject.** `tmux send-keys` with either
+   `Read <passDoc>, then run one pass (pass-id: <id>; triggers: <kinds>).` or
+   `Run one pass (pass-id: <id>; triggers: <kinds>).`
+4. **Await.** Poll `alder show <pass-id> --json` until the pass ends. If the
+   pass's *own* recorded tmux session died, append
+   `pass end <id> --outcome crashed`; past the timeout, `--outcome timeout`.
+   Both notify.
+
+The crash check reads the handle on the pass, not the driver's own session
+name. A pass another writer opened may name a different tmux session, or none
+at all (`codex:019f…`), and the driver may only claim `crashed` for a tmux
+session it actually checked. For anything else, `timeout` is the only verdict
+it can honestly reach.
+
+Passes are serialized. Alder rejects a second `loop wake` while one is open, so
+two passes cannot run even if two drivers do. The driver that loses the race
+concedes; the next poll adopts whatever pass is open and resolves it under the
+rules above.
+
+## Deferrals
+
+- **Debounce.** A burst of log commits produces one pass, not one per commit.
+- **Attached client.** If `tmux list-clients` shows someone watching, the
+  injection waits so it does not land under their cursor.
+
+Neither deferral survives `maxIntervalSeconds`. A loop that never runs is worse
+than an inconvenient injection.
+
+## Trigger kinds are not scope
+
+`log`, `observations`, and `due` are provenance recorded on the pass and
+repeated in the injection. They never narrow the pass. A pass woken by
+`observations` still runs its complete sync, because the driver cannot know
+what else changed and is not allowed to guess.
+
+## Testing
+
+Decision logic lives in `src/decide.rs` as pure functions over a snapshot and
+is unit tested without tmux or Git. `tests/driver.rs` runs the orchestration
+against a fake world that models the loop fold, so the ordering rules — intent
+before effects, one open pass, crash repair — are checked rather than asserted.

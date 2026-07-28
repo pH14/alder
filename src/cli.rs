@@ -1,5 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+/// The grammar has two halves. Queries are global because a reader wants one
+/// answer about the project, not one answer per noun. Every mutation names the
+/// noun whose ID it takes, so the noun always identifies the argument type.
 #[derive(Debug, Parser)]
 #[command(name = "alder", version, about)]
 pub struct Cli {
@@ -12,20 +15,31 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Create or verify `.alder/config.json`.
     Init(InitArgs),
+    /// The default context pack.
     Status(OverlayArgs),
+    /// Actionable work in priority order.
     Next(OverlayArgs),
+    /// Current state and history for any Alder object.
     Show(ShowArgs),
-    Add(AddArgs),
-    Edit(EditArgs),
-    Reopen(ReopenArgs),
-    Start(StartArgs),
-    Finish(FinishArgs),
-    Drop(DropArgs),
-    Ask(AskArgs),
-    Answer(AnswerArgs),
+    /// Run configured observation commands without appending.
     Refresh,
+    /// Compare durable attempts with observed reality.
     Reconcile(ReconcileArgs),
+    /// Work items: the durable requirements Alder coordinates.
+    Work(WorkArgs),
+    /// Attempts: one external execution of one work item.
+    Attempt(AttemptArgs),
+    /// Questions: an asynchronous human decision one work item needs.
+    Question(QuestionArgs),
+    /// Handoffs: the asynchronous inbox for later admission.
+    Handoff(HandoffArgs),
+    /// The driving loop and its controls.
+    Loop(LoopArgs),
+    /// Passes: one run of the driving loop.
+    Pass(PassArgs),
+    /// Diagnostics kept out of the ordinary workflow.
     Debug(DebugArgs),
 }
 
@@ -51,23 +65,45 @@ pub struct ShowArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct AddArgs {
-    #[command(subcommand)]
-    pub resource: AddResource,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AddResource {
-    Work(AddWorkArgs),
-    Handoff(AddHandoffArgs),
+pub struct ReconcileArgs {
+    #[arg(long)]
+    pub no_refresh: bool,
 }
 
 #[derive(Debug, Args)]
-pub struct AddWorkArgs {
+pub struct WorkArgs {
+    #[command(subcommand)]
+    pub command: WorkCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkCommand {
+    /// Admit work, optionally from a handoff or a graph-change document.
+    Add(WorkAddArgs),
+    /// Change fields, dependencies, or checks. Never changes state.
+    Edit(WorkEditArgs),
+    /// Record an attempt before its worker is launched.
+    Start(WorkStartArgs),
+    /// Complete work through its attempt or with external evidence.
+    Finish(WorkFinishArgs),
+    /// Drop work, ending its active attempt when it has one.
+    Drop(WorkDropArgs),
+    /// Return terminal work to open with the same identity.
+    Reopen(WorkReasonArgs),
+    /// Block work on something outside the Alder graph.
+    Block(WorkReasonArgs),
+    /// Return blocked work to open.
+    Unblock(WorkReasonArgs),
+    /// Ask a human decision, blocking the work.
+    Ask(WorkAskArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WorkAddArgs {
     #[arg(long, value_name = "FILE")]
     pub from: Option<String>,
     #[arg(long, value_name = "HANDOFF")]
-    pub from_handoff: Option<String>,
+    pub handoff: Option<String>,
     #[arg(long)]
     pub title: Option<String>,
     #[arg(long)]
@@ -81,29 +117,7 @@ pub struct AddWorkArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct AddHandoffArgs {
-    #[arg(long)]
-    pub title: String,
-    #[arg(long = "ref")]
-    pub artifact_ref: String,
-    #[arg(long)]
-    pub note: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct EditArgs {
-    #[command(subcommand)]
-    pub resource: EditResource,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum EditResource {
-    Work(EditWorkArgs),
-    Attempt(EditAttemptArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct EditWorkArgs {
+pub struct WorkEditArgs {
     pub work: Option<String>,
     #[arg(long, value_name = "FILE")]
     pub from: Option<String>,
@@ -123,49 +137,19 @@ pub struct EditWorkArgs {
     pub add_check: Vec<String>,
     #[arg(long, value_name = "KEY")]
     pub remove_check: Vec<String>,
-    #[arg(long, conflicts_with = "unblock")]
-    pub block: bool,
-    #[arg(long, conflicts_with = "block")]
-    pub unblock: bool,
     #[arg(long)]
     pub why: Option<String>,
 }
 
 #[derive(Debug, Args)]
-pub struct EditAttemptArgs {
-    pub attempt: String,
-    #[arg(long)]
-    pub handle: Option<String>,
-    #[arg(long, value_name = "KEY=VALUE")]
-    pub meta: Vec<String>,
-    #[arg(long, value_name = "KEY=STATUS")]
-    pub check: Vec<String>,
-    #[arg(long)]
-    pub evidence: Option<String>,
-    #[arg(long)]
-    pub note: Option<String>,
-    #[arg(long, value_enum)]
-    pub end: Option<NonSuccessOutcome>,
-    #[arg(long)]
-    pub why: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct ReopenArgs {
-    pub work: String,
-    #[arg(long)]
-    pub why: String,
-}
-
-#[derive(Debug, Args)]
-pub struct StartArgs {
+pub struct WorkStartArgs {
     pub work: String,
     #[arg(long, value_name = "KEY=VALUE")]
     pub meta: Vec<String>,
 }
 
 #[derive(Debug, Args)]
-pub struct FinishArgs {
+pub struct WorkFinishArgs {
     pub work: String,
     #[arg(long)]
     pub attempt: Option<String>,
@@ -176,7 +160,7 @@ pub struct FinishArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct DropArgs {
+pub struct WorkDropArgs {
     pub work: String,
     #[arg(long)]
     pub attempt: Option<String>,
@@ -187,15 +171,56 @@ pub struct DropArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct AskArgs {
+pub struct WorkReasonArgs {
+    pub work: String,
+    #[arg(long)]
+    pub why: String,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkAskArgs {
     pub work: String,
     pub question: String,
 }
 
 #[derive(Debug, Args)]
-pub struct AnswerArgs {
-    pub question: String,
-    pub answer: String,
+pub struct AttemptArgs {
+    #[command(subcommand)]
+    pub command: AttemptCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AttemptCommand {
+    /// Bind a handle, record progress, or record a check result.
+    Edit(AttemptEditArgs),
+    /// End a non-successful attempt.
+    End(AttemptEndArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AttemptEditArgs {
+    pub attempt: String,
+    #[arg(long, value_name = "KIND:VALUE")]
+    pub handle: Option<String>,
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub meta: Vec<String>,
+    #[arg(long, value_name = "CHECK")]
+    pub satisfied: Vec<String>,
+    #[arg(long, value_name = "CHECK")]
+    pub failed: Vec<String>,
+    #[arg(long)]
+    pub evidence: Option<String>,
+    #[arg(long)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AttemptEndArgs {
+    pub attempt: String,
+    #[arg(long, value_enum)]
+    pub outcome: NonSuccessOutcome,
+    #[arg(long)]
+    pub why: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -208,9 +233,128 @@ pub enum NonSuccessOutcome {
 }
 
 #[derive(Debug, Args)]
-pub struct ReconcileArgs {
+pub struct QuestionArgs {
+    #[command(subcommand)]
+    pub command: QuestionCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum QuestionCommand {
+    /// Record a human decision. Answering never unblocks the work.
+    Answer(QuestionAnswerArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct QuestionAnswerArgs {
+    pub question: String,
+    pub answer: String,
+}
+
+#[derive(Debug, Args)]
+pub struct HandoffArgs {
+    #[command(subcommand)]
+    pub command: HandoffCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HandoffCommand {
+    /// Submit an asynchronous handoff for later admission.
+    Add(HandoffAddArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct HandoffAddArgs {
     #[arg(long)]
-    pub no_refresh: bool,
+    pub title: String,
+    #[arg(long = "ref")]
+    pub artifact_ref: String,
+    #[arg(long)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct LoopArgs {
+    #[command(subcommand)]
+    pub command: LoopCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LoopCommand {
+    /// Open a pass. The loop is the parent, so the loop creates the record.
+    Wake(LoopWakeArgs),
+    /// Ask the driver to stop waking the loop.
+    Pause(OptionalReasonArgs),
+    /// Ask the driver to resume waking the loop.
+    Resume,
+    /// Set the desired engine name. Alder never validates it.
+    Use(LoopUseArgs),
+    /// Ask the next wake to start a fresh session.
+    Rotate(OptionalReasonArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct LoopWakeArgs {
+    #[arg(long)]
+    pub engine: String,
+    #[arg(long, value_name = "KIND:VALUE")]
+    pub handle: String,
+    #[arg(long, value_enum)]
+    pub trigger: Vec<TriggerKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum TriggerKind {
+    Log,
+    Observations,
+    Due,
+    Manual,
+}
+
+#[derive(Debug, Args)]
+pub struct OptionalReasonArgs {
+    #[arg(long)]
+    pub why: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct LoopUseArgs {
+    pub engine: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PassArgs {
+    #[command(subcommand)]
+    pub command: PassCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PassCommand {
+    /// Close a pass. The record answers for itself, so the pass ends itself.
+    End(PassEndArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PassEndArgs {
+    pub pass: Option<String>,
+    #[arg(long, value_enum)]
+    pub outcome: PassOutcomeArg,
+    #[arg(long)]
+    pub report: Option<String>,
+    #[arg(long, value_name = "DURATION")]
+    pub wake: Option<String>,
+    #[arg(long)]
+    pub rotate: bool,
+    #[arg(long)]
+    pub why: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum PassOutcomeArg {
+    Ok,
+    Crashed,
+    Timeout,
 }
 
 #[derive(Debug, Args)]

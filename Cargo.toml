@@ -30,5 +30,5 @@ lto = "thin"
 unsafe_code = "forbid"
 
 [workspace]
-members = ["crates/alder-log"]
+members = ["crates/alder-log", "crates/alderd"]
 resolver = "3"

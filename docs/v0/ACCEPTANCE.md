@@ -10,9 +10,9 @@ document defines the minimum cases and the evidence each case must produce.
 Given admitted work with dependencies and checks:
 
 - `next` returns only actionable work;
-- `start` records an attempt before launch;
+- `work start` records an attempt before launch;
 - progress and evidence survive caller restart;
-- `finish` refuses incomplete checks;
+- `work finish` refuses incomplete checks;
 - finishing one item updates the ready frontier.
 
 ### A2. Concurrent writers
@@ -32,7 +32,7 @@ attempt to append them concurrently.
   decision;
 - every existing active attempt must remain intact.
 
-Repeat with a uniquely identified `add handoff` submission. Its inert append
+Repeat with a uniquely identified `handoff add` submission. Its inert append
 may be reconsidered automatically and must not be duplicated.
 
 The expected head must remain internal to each command. No mutation accepts a
@@ -58,7 +58,7 @@ Record `attempt.started`, create a stamped external worker, then crash before
 recording its handle binding.
 
 Reconciliation must find the worker by attempt ID and allow a later caller to
-attach its handle with `edit attempt` and adopt it.
+attach its handle with `attempt edit` and adopt it.
 
 ### A5. Unknown append outcome
 
@@ -72,11 +72,11 @@ The client must search the remote suffix by event ID:
 
 ### A6. Reject duplicate launch
 
-With one active attempt, run `start` again.
+With one active attempt, run `work start` again.
 
 The command must change nothing and identify the active attempt. To run the
 work again, the repository skill must stop the old external execution, confirm
-the result, record `alder edit attempt <attempt> --end <outcome>`, and only
+the result, record `alder attempt end <attempt> --outcome <outcome>`, and only
 then create a new attempt. If the handle cannot be observed, Alder must not
 imply that the external execution was fenced.
 
@@ -89,7 +89,7 @@ never reused, including when an attempt ended as `not_started`.
 End an attempt, begin a new attempt, then submit a delayed check result against
 the old attempt.
 
-The `alder edit attempt` must be rejected and must not affect the new
+The `alder attempt edit` must be rejected and must not affect the new
 attempt's checks.
 
 ### A8. Preserve the completion contract
@@ -98,7 +98,7 @@ Create work with two checks, fail and end its first attempt, and start a second
 attempt.
 
 The second attempt must still require both checks. Every declared check must
-gate ordinary completion; `start` may not remove them.
+gate ordinary completion; `work start` may not remove them.
 
 ### A9. Drop a prerequisite
 
@@ -107,7 +107,7 @@ Create B depending on A, then drop A.
 B must remain non-actionable. Alder must report the dependency impact rather
 than treating any terminal state as success.
 
-Repeat with an active attempt for A. `drop` must require that attempt's ID and
+Repeat with an active attempt for A. `work drop` must require that attempt's ID and
 a non-success outcome, then end the attempt and drop A in one append. It must
 reject a mismatched attempt, a missing outcome, or attempt fields when A has no
 active attempt. It must not claim to terminate the external execution.
@@ -127,8 +127,9 @@ prefix.
 The ready frontier and introspection queries must follow the edits without
 creating successor items merely to preserve history.
 
-Resource-less forms such as `alder edit hm-9a1` and
-`alder edit hm-9a1-attempt-1` must be rejected rather than inferred.
+Resource-less forms such as `alder edit hm-9a1` and `alder start hm-9a1` must
+be rejected rather than inferred: every mutation names its noun, and the noun
+is the ID type the command takes.
 
 Finish A, start downstream B, and then try to reopen A. Alder must reject the
 reopen and return B's active attempt. After that attempt is resolved, reopening
@@ -181,7 +182,7 @@ The answer must not silently unblock the work. Every caller must see:
 Unblocking must be rejected while any attached question is unanswered. Once
 the questions are answered, the driving agent may incorporate the decision
 and explicitly return it to open with
-`alder edit work <work> --unblock`.
+`alder work unblock <work> --why <reason>`. `edit` never changes state.
 
 ### A15. Explicit admission
 
@@ -192,7 +193,7 @@ handoff. A side session explicitly told "handoff to leader" may create a
 submitted handoff, but that handoff must not affect work counts, readiness,
 dependencies, or attempts.
 
-Only an explicit `add work` invocation may turn a requirement or handoff into
+Only an explicit `work add` invocation may turn a requirement or handoff into
 work. Repository skills must reserve that invocation for the agent responsible
 for admission; Alder itself must not claim to enforce writer roles.
 
@@ -222,7 +223,7 @@ dependencies. Query both `status --with <changes>` and `next --with <changes>`.
 - invalid input must be rejected under the same rules as a real append;
 - a later real append must reread and revalidate its current head.
 
-There must be no top-level `impact` command and no `edit work --dry-run`. V0
+There must be no top-level `impact` command and no `work edit --dry-run`. V0
 does not accept preview-only terminal outcomes or multi-step scenarios.
 
 ### A18. Phone check-in
@@ -252,7 +253,7 @@ If Nimbus is unreachable, its objects become unknown rather than absent.
 ### A20. Handle variety
 
 Attach tmux, Codex, and GitHub Actions handles to attempts with
-`edit attempt --handle`, and discover unbound Nimbus handles.
+`attempt edit --handle`, and discover unbound Nimbus handles.
 
 All must use the same core handle representation. Provider-specific values
 remain opaque, and provider metadata must not alter readiness or completion
@@ -336,7 +337,7 @@ tables.
 ### A24. Asynchronous handoff
 
 While the driving agent is busy in a long-running turn, run
-`alder add handoff` from a side session.
+`alder handoff add` from a side session.
 
 - its ID must use the repository-scoped form `<prefix>-handoff-<token>` and
   must not imply a work relationship before integration;
@@ -345,15 +346,15 @@ While the driving agent is busy in a long-running turn, run
 - the handoff must be durable and visible as `submitted`;
 - restarting or replacing the driving agent must not lose it;
 - `next` and `ready` must ignore it;
-- `alder add work --from-handoff` must atomically create exactly one work item
+- `alder work add --handoff` must atomically create exactly one work item
   and link its ID;
 - repeating either append by event ID must not duplicate the handoff or work;
 - the resulting state must be `integrated`, with no intermediate handoff
   state.
 
 If integration fails validation, the handoff must remain submitted. There
-must be no top-level `handoff` command namespace, and resource-less `add` must
-be rejected rather than inferring intent from omitted fields.
+must be no bare `add` command: `handoff add` and `work add` are distinct
+commands under distinct nouns rather than one command inferring its resource.
 
 ### A25. Atomic graph change
 
@@ -374,10 +375,10 @@ items by local name, and rewires several existing dependencies.
 - resolving an unknown append outcome by event ID must not duplicate the
   event or any newly added work.
 
-Exercise `add work --from` separately and verify that it accepts several
-additions atomically but rejects an `edit` section. `edit work --from` must
+Exercise `work add --from` separately and verify that it accepts several
+additions atomically but rejects an `edit` section. `work edit --from` must
 require at least one edit, leaving no synonymous command for an additions-only
-document.
+document, and must reject a state field such as `block` in the document.
 
 ### A26. Structured command output
 
@@ -434,6 +435,109 @@ If the shared Git head cannot be read, an ordinary read or mutation fails with
 `store_unavailable`; Alder does not present cached SQLite data as current. A
 failed observation command instead makes only that observer kind `unknown`.
 
+### A28. Crashed pass
+
+Wake the loop, then destroy the engine session without recording a pass end.
+
+- the pass must remain `open` and visible in `alder status`;
+- a second `alder loop wake` must be rejected with `pass_open` and must name
+  the open pass, exactly as a second `work start` names the active attempt;
+- ending it as `crashed` must require no privileged tool: `alder pass end <id>
+  --outcome crashed --why <reason>` from any terminal must work;
+- after that end, the next wake must succeed and must take the next ordinal;
+- the ordinal must never be reused, including for a pass that produced no
+  report.
+
+Repeat with a pass that outlived its time budget. The honest outcome is
+`timeout`; nothing in Alder decides that threshold, and a driver that ends the
+pass must supply the outcome itself.
+
+### A29. Driver restart mid-pass
+
+Stop and restart the driver while a pass is open.
+
+- the restarted driver must adopt the open pass rather than opening another;
+- it must not append a wake, a report, or any record of its own restart;
+- when the leader ends the pass normally, the outcome must be `ok` with the
+  leader's report, unaffected by the restart;
+- the driver's own state — which session it launched, which head it last saw —
+  may be lost, and losing it must only cause a session restart, never a second
+  pass.
+
+### A30. Engine swap while a pass is open
+
+Run `alder loop use <other-engine>` while a pass is open.
+
+- the change must be accepted immediately and must fold as the desired engine;
+- the open pass must keep the engine it recorded at wake; a desired-state
+  change must not rewrite history;
+- the running pass must not be interrupted, ended, or invalidated;
+- the next wake must record the new engine, and the driver must replace the
+  session rather than injecting into one running the old engine.
+
+### A31. Rotate and pause interleaving
+
+Exercise these in order, checking the fold after each step:
+
+1. `loop rotate` — rotation pending;
+2. `loop pause` — still pending; pausing does not consume a rotation;
+3. `loop resume`, then `loop wake` — rotation consumed, no longer pending;
+4. `pass end --rotate` — pending again;
+5. `loop rotate` twice, then one wake — pending, then not; two requests do not
+   require two wakes;
+6. `loop pause` twice, then `loop resume` once — the loop is running. Pause is
+   last-writer-wins, not a counter.
+
+No step may write a flag that a later step must clear. Rotation must remain
+derivable from event order alone, so replaying the log from empty must produce
+the same answer at every point.
+
+### A32. Wake head conflict
+
+Have two drivers read the same head and attempt `loop wake` concurrently.
+
+- exactly one wake may advance the head;
+- the loser must receive a structured head conflict and change nothing;
+- after rereading, the loser must see the winner's pass and its own next wake
+  must be rejected with `pass_open`;
+- neither driver may retry automatically into a second pass. A wake is an
+  ordinary mutation and follows the ordinary reconsider-on-conflict rule.
+
+The same must hold when one driver wakes while a human is running commands: the
+loop needs no lease, because one open pass is the whole exclusion mechanism.
+
+### A33. Pass end concurrent with an ordinary mutation
+
+While a pass is open, have the leader run `pass end` at the same moment another
+writer appends an ordinary mutation such as `work finish`.
+
+- one append wins and the other receives a head conflict;
+- if `pass end` loses, rerunning it after rereading must succeed and must
+  produce exactly one `pass.ended`;
+- if `pass end` wins, the other writer's reread must show the ended pass and
+  must be able to proceed;
+- a `pass end` against an already-ended pass must be rejected with
+  `pass_ended`, so a retry after an unknown append outcome cannot record a
+  second ending or overwrite the first report.
+
+Resolving an unknown push outcome by event ID must not duplicate the pass end.
+
+### A34. Refresh change detection
+
+Configure an observation command whose metadata moves on every execution — a
+cost ticker, an uptime — while its handles, presence, and attempt bindings stay
+the same.
+
+- the first refresh into an empty inventory must report `"changed": true`;
+- every later refresh must report `false`, however much metadata moved;
+- losing a handle, gaining one, or a handle presenting a different attempt ID
+  must each report `true` once and `false` on the next unchanged refresh;
+- an observation outage must report `true` when it turns a kind unknown, and
+  `false` while it stays unknown.
+
+A false positive here wakes an agent for nothing, so the metadata exclusion is
+a requirement rather than an optimization.
+
 ## Paper replay gate
 
 Before freezing event bodies or SQLite tables, replay:
@@ -443,7 +547,9 @@ Before freezing event bodies or SQLite tables, replay:
 3. one campaign with substantial re-scoping;
 4. one case where external reality contradicted recorded state;
 5. one case with a large number of agent-proposed follow-ups;
-6. one turn that atomically adds and rewires substantial work.
+6. one turn that atomically adds and rewires substantial work;
+7. one unattended day of the loop, including at least one crashed pass and one
+   engine rotation.
 
 For every real action, record:
 
@@ -480,7 +586,7 @@ The v0 model may freeze when:
 - every acceptance case has a written replay;
 - the representative week requires no manual state outside Alder;
 - a fresh agent can resume using only `status`, `show`, and reconciliation;
-- no candidate or handoff becomes work without an explicit `add work`;
+- no candidate or handoff becomes work without an explicit `work add`;
 - the event vocabulary has no synonym pairs;
 - every durable field is required by at least one acceptance case;
 - deleting any table or command would fail a named case.

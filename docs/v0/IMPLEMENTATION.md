@@ -1,6 +1,6 @@
 # Alder v0 implementation choices
 
-The product contract remains `README.md`, `MODEL.md`, `CLI.md`, and
+The product contract remains `README.md`, `MODEL.md`, `CLI.md`, `LOOP.md`, and
 `ACCEPTANCE.md` in this directory. The following choices fill in details those
 documents intentionally leave open.
 
@@ -29,10 +29,23 @@ documents intentionally leave open.
 - CLI metadata values are parsed as JSON scalars or objects when possible and
   otherwise stored as strings. This keeps common `key=value` calls concise
   without assigning meaning to metadata keys.
-- One `edit attempt` invocation performs exactly one event-kind transition:
-  handle binding (with optional metadata), progress/check update, or
-  non-successful ending. This avoids combining independently meaningful
-  attempt transitions in one storage event.
+- One `attempt edit` invocation performs exactly one event-kind transition:
+  handle binding (with optional metadata) or a progress and check update.
+  Ending is `attempt end`, a separate command over a separate event. This
+  avoids combining independently meaningful attempt transitions in one storage
+  event.
+- A check result is recorded as `--satisfied <check>` or `--failed <check>`,
+  each repeatable and each requiring `--evidence`. `pending` is the state every
+  check starts in, so there is no flag that sets it.
+- `pass end --wake <duration>` accepts `270s`, `20m`, `1h`, or `2d` and stores
+  an absolute timestamp. A reader of the event never needs to know when the
+  pass ended to know when it asked to be woken.
+- Trigger kinds fold into a canonical order and are deduplicated, so two wakes
+  citing the same reasons produce identical records.
+- The driver lives in the separate `alderd` crate and reaches the log only by
+  running the `alder` CLI. It links no Alder code, so a change to Alder's
+  internals cannot silently change the driver's behaviour, and the coupling
+  that remains is the documented `--json` contract.
 - Observer diagnostics retain at most 4,096 characters of standard error from
   each execution. Failed standard output is never retained as inventory.
 - `cargo mutants` exercises the complete crate with locked dependencies and

@@ -4,9 +4,7 @@ use serde::Deserialize;
 
 use crate::error::{AlderError, Result};
 
-use super::{
-    CheckDefinition, NullableString, ProjectState, WorkDefinition, WorkOperation, WorkStateChange,
-};
+use super::{CheckDefinition, NullableString, ProjectState, WorkDefinition, WorkOperation};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,10 +55,6 @@ pub struct EditWorkInput {
     pub add_checks: Vec<CheckDefinition>,
     #[serde(default)]
     pub remove_checks: Vec<String>,
-    #[serde(default)]
-    pub block: bool,
-    #[serde(default)]
-    pub unblock: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,21 +171,6 @@ where
                 "work `{id}` is targeted more than once"
             )));
         }
-        if edit.block && edit.unblock {
-            return Err(AlderError::validation(format!(
-                "work `{id}` cannot be blocked and unblocked in one operation"
-            )));
-        }
-        let reason = document.why.clone().unwrap_or_default();
-        let state_change = if edit.block {
-            Some(WorkStateChange::Block {
-                reason: reason.clone(),
-            })
-        } else if edit.unblock {
-            Some(WorkStateChange::Unblock { reason })
-        } else {
-            None
-        };
         operations.push(WorkOperation::Edit {
             id,
             title: edit.title.clone(),
@@ -209,7 +188,9 @@ where
                 .collect::<Result<_>>()?,
             add_checks: edit.add_checks.clone(),
             remove_checks: edit.remove_checks.clone(),
-            state_change,
+            // `edit` never changes state; `work block` and `work unblock` are
+            // the verbs that transition it.
+            state_change: None,
         });
     }
 
@@ -379,14 +360,12 @@ mod tests {
             )
             .is_err()
         );
+        // `edit` never changes state, so the document has no state fields at all.
         assert!(
-            prepare(
-                json!({
-                    "why": "contradiction",
-                    "edit": [{"id": "hm-one", "block": true, "unblock": true}]
-                }),
-                ChangeMode::Hypothetical,
-            )
+            serde_json::from_value::<GraphChangeDocument>(json!({
+                "why": "state change",
+                "edit": [{"id": "hm-one", "block": true}]
+            }))
             .is_err()
         );
     }
