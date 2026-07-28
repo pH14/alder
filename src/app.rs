@@ -380,6 +380,15 @@ fn loop_command(context: &Context, command: &LoopCommand) -> Result<Output> {
                 "rotation requested",
             ))
         }
+        LoopCommand::Nudge(args) => {
+            let result = context.ledger.request_nudge(args.why.clone())?;
+            Ok(mutation_output(
+                "alder.loop.nudge.v0",
+                &result,
+                json!({"nudge_pending": true, "why": args.why}),
+                "nudge requested",
+            ))
+        }
     }
 }
 
@@ -814,6 +823,7 @@ fn loop_section(state: &ProjectState) -> Value {
         "pause_reason": control.pause_reason,
         "engine": control.engine,
         "rotate_pending": control.rotate_pending(),
+        "nudge_pending": control.nudge_pending(),
         "open_pass": state.open_pass().map(|pass| json!({
             "id": pass.id,
             "engine": pass.engine,
@@ -852,6 +862,9 @@ fn loop_lines(state: &ProjectState) -> Vec<String> {
     }
     if control.rotate_pending() {
         desired.push("rotate pending".to_owned());
+    }
+    if control.nudge_pending() {
+        desired.push("nudge pending".to_owned());
     }
     if !desired.is_empty() {
         lines.push(desired.join(" · "));

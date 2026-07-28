@@ -87,6 +87,7 @@ is being driven rather than what the project owes:
 - `loop.resumed`
 - `loop.engine_selected`
 - `loop.rotation_requested`
+- `loop.nudge_requested`
 
 These are storage types, not a requirement that every type become a separate
 user-facing concept.
@@ -557,11 +558,13 @@ The loop is a singleton, so its controls are folded fields rather than objects.
 | `paused`, `pause_reason` | Last writer wins. `loop.paused` sets both; `loop.resumed` clears both. No count, nesting, or owner. |
 | `engine` | Last writer wins. `loop.engine_selected` replaces the desired name. The name is opaque and never validated. |
 | `rotate_pending` | Derived, never stored: true when the latest rotation request has a greater sequence than the latest `pass.started`, or when a rotation was requested and no wake has ever happened. |
+| `nudge_pending` | Derived the same way from the latest `loop.nudge_requested`. A nudge asks the driver to wake the loop now; the next wake consumes it. |
 
 A rotation request is a `loop.rotation_requested` event or a `pass.ended` whose
 `rotate` is set. The next wake consumes the request by being later in the log,
 so nothing clears a flag and two writers cannot disagree about whether a
-rotation has already been served.
+rotation has already been served. A nudge request follows the identical rule
+over its own event kind.
 
 Pause is desired state, not a lock. Alder still accepts `loop wake` while
 paused; enforcement belongs to whatever schedules the loop. Alder does not

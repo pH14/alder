@@ -208,9 +208,44 @@ impl Projection {
         let connection = Connection::open(&self.path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        reset_if_schema_changed(&connection)?;
         create_schema(&connection)?;
         Ok(connection)
     }
+}
+
+/// Tables are created with `IF NOT EXISTS`, so a shape change alone would
+/// leave an old database half-matching the code. Everything here is derived —
+/// from the log, or for observations from the running world — so the honest
+/// response to a schema change is to drop it all and let the next sync and
+/// sweep refill it.
+const SCHEMA_VERSION: i64 = 1;
+
+fn reset_if_schema_changed(connection: &Connection) -> Result<()> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "
+        DROP TABLE IF EXISTS projection_meta;
+        DROP TABLE IF EXISTS events;
+        DROP TABLE IF EXISTS work_current;
+        DROP TABLE IF EXISTS handoffs;
+        DROP TABLE IF EXISTS dependencies;
+        DROP TABLE IF EXISTS work_checks;
+        DROP TABLE IF EXISTS attempts;
+        DROP TABLE IF EXISTS attempt_checks;
+        DROP TABLE IF EXISTS questions;
+        DROP TABLE IF EXISTS question_answers;
+        DROP TABLE IF EXISTS passes;
+        DROP TABLE IF EXISTS loop_control;
+        DROP TABLE IF EXISTS observed_handles;
+        DROP TABLE IF EXISTS observation_runs;
+        ",
+    )?;
+    connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
 }
 
 fn create_schema(connection: &Connection) -> Result<()> {
@@ -321,6 +356,8 @@ fn create_schema(connection: &Connection) -> Result<()> {
             engine TEXT,
             rotate_pending INTEGER NOT NULL,
             rotate_requested_seq INTEGER,
+            nudge_pending INTEGER NOT NULL,
+            nudge_requested_seq INTEGER,
             last_wake_seq INTEGER
         );
         CREATE TABLE IF NOT EXISTS observed_handles (
@@ -590,14 +627,17 @@ fn insert_state(transaction: &Transaction<'_>, state: &ProjectState) -> Result<(
     let control = &state.loop_control;
     transaction.execute(
         "INSERT INTO loop_control
-         (id, paused, pause_reason, engine, rotate_pending, rotate_requested_seq, last_wake_seq)
-         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6)",
+         (id, paused, pause_reason, engine, rotate_pending, rotate_requested_seq,
+          nudge_pending, nudge_requested_seq, last_wake_seq)
+         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             control.paused as i64,
             control.pause_reason,
             control.engine,
             control.rotate_pending() as i64,
             control.rotate_requested_seq,
+            control.nudge_pending() as i64,
+            control.nudge_requested_seq,
             control.last_wake_seq,
         ],
     )?;

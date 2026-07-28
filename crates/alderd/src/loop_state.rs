@@ -23,6 +23,8 @@ pub struct LoopState {
     #[serde(default)]
     pub rotate_pending: bool,
     #[serde(default)]
+    pub nudge_pending: bool,
+    #[serde(default)]
     pub open_pass: Option<OpenPass>,
     #[serde(default)]
     pub last_pass: Option<LastPass>,
@@ -80,6 +82,7 @@ mod tests {
                 "pause_reason": "release freeze",
                 "engine": "codex",
                 "rotate_pending": true,
+                "nudge_pending": true,
                 "open_pass": {
                     "id": "hm-pass-3",
                     "engine": "claude",
@@ -105,6 +108,7 @@ mod tests {
         assert_eq!(state.pause_reason.as_deref(), Some("release freeze"));
         assert_eq!(state.engine.as_deref(), Some("codex"));
         assert!(state.rotate_pending);
+        assert!(state.nudge_pending);
         assert_eq!(state.open_pass.as_ref().unwrap().id, "hm-pass-3");
         assert_eq!(state.open_pass.as_ref().unwrap().engine, "claude");
         assert_eq!(
@@ -117,7 +121,7 @@ mod tests {
         let empty = LoopState::from_status(&json!({
             "head": 0,
             "loop": {"paused": false, "engine": null, "rotate_pending": false,
-                     "open_pass": null, "last_pass": null}
+                     "nudge_pending": false, "open_pass": null, "last_pass": null}
         }))
         .unwrap();
         assert!(!empty.paused);

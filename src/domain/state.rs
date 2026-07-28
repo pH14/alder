@@ -681,6 +681,9 @@ impl ProjectState {
             EventPayload::LoopRotationRequested { .. } => {
                 self.loop_control.rotate_requested_seq = Some(seq);
             }
+            EventPayload::LoopNudgeRequested { .. } => {
+                self.loop_control.nudge_requested_seq = Some(seq);
+            }
         }
         Ok(())
     }
@@ -1838,6 +1841,35 @@ mod tests {
 
         state.apply(&event(4, wake("hm-pass-2"))).unwrap();
         assert!(!state.loop_control.rotate_pending());
+    }
+
+    #[test]
+    fn a_wake_consumes_the_nudge_that_precedes_it() {
+        let mut state = ProjectState::default();
+        assert!(!state.loop_control.nudge_pending());
+
+        state
+            .apply(&event(1, EventPayload::LoopNudgeRequested { why: None }))
+            .unwrap();
+        assert!(state.loop_control.nudge_pending());
+
+        state.apply(&event(2, wake("hm-pass-1"))).unwrap();
+        assert!(!state.loop_control.nudge_pending());
+
+        // A nudge after the wake waits for the next one.
+        state
+            .apply(&event(3, EventPayload::LoopNudgeRequested { why: None }))
+            .unwrap();
+        assert!(state.loop_control.nudge_pending());
+        // A nudge is not a rotation: each is consumed independently.
+        assert!(!state.loop_control.rotate_pending());
+
+        // Ending the pass is not a wake, so the nudge stays pending.
+        state.apply(&event(4, end("hm-pass-1", false))).unwrap();
+        assert!(state.loop_control.nudge_pending());
+
+        state.apply(&event(5, wake("hm-pass-2"))).unwrap();
+        assert!(!state.loop_control.nudge_pending());
     }
 
     #[test]

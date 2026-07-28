@@ -112,6 +112,8 @@ pub enum EventPayload {
     LoopEngineSelected { engine: String },
     #[serde(rename = "loop.rotation_requested")]
     LoopRotationRequested { why: Option<String> },
+    #[serde(rename = "loop.nudge_requested")]
+    LoopNudgeRequested { why: Option<String> },
 }
 
 impl EventPayload {
@@ -135,6 +137,7 @@ impl EventPayload {
             Self::LoopResumed {} => "loop.resumed",
             Self::LoopEngineSelected { .. } => "loop.engine_selected",
             Self::LoopRotationRequested { .. } => "loop.rotation_requested",
+            Self::LoopNudgeRequested { .. } => "loop.nudge_requested",
         }
     }
 
@@ -172,7 +175,8 @@ impl EventPayload {
             Self::LoopPaused { .. }
             | Self::LoopResumed {}
             | Self::LoopEngineSelected { .. }
-            | Self::LoopRotationRequested { .. } => false,
+            | Self::LoopRotationRequested { .. }
+            | Self::LoopNudgeRequested { .. } => false,
         }
     }
 }
@@ -514,6 +518,7 @@ pub struct LoopControl {
     pub pause_reason: Option<String>,
     pub engine: Option<String>,
     pub rotate_requested_seq: Option<u64>,
+    pub nudge_requested_seq: Option<u64>,
     pub last_wake_seq: Option<u64>,
 }
 
@@ -521,7 +526,17 @@ impl LoopControl {
     /// A rotation is pending when its request is later in the log than the
     /// most recent wake. The next wake consumes it; no stored flag is cleared.
     pub fn rotate_pending(&self) -> bool {
-        match (self.rotate_requested_seq, self.last_wake_seq) {
+        Self::pending(self.rotate_requested_seq, self.last_wake_seq)
+    }
+
+    /// A nudge follows the identical rule: pending between its request and the
+    /// next wake, consumed by log order alone.
+    pub fn nudge_pending(&self) -> bool {
+        Self::pending(self.nudge_requested_seq, self.last_wake_seq)
+    }
+
+    fn pending(requested_seq: Option<u64>, last_wake_seq: Option<u64>) -> bool {
+        match (requested_seq, last_wake_seq) {
             (Some(requested), Some(woke)) => requested > woke,
             (Some(_), None) => true,
             (None, _) => false,
@@ -745,6 +760,11 @@ mod tests {
                 "loop.rotation_requested",
                 vec![],
             ),
+            (
+                EventPayload::LoopNudgeRequested { why: None },
+                "loop.nudge_requested",
+                vec![],
+            ),
         ];
 
         for (payload, type_name, references) in cases {
@@ -802,6 +822,19 @@ mod tests {
         assert!(control(Some(5), Some(4)).rotate_pending());
         assert!(!control(Some(4), Some(4)).rotate_pending());
         assert!(!control(Some(3), Some(4)).rotate_pending());
+
+        // A nudge is the same derivation over its own request seq.
+        let nudge = |requested, woke| LoopControl {
+            nudge_requested_seq: requested,
+            last_wake_seq: woke,
+            ..LoopControl::default()
+        };
+        assert!(!nudge(None, None).nudge_pending());
+        assert!(!nudge(None, Some(4)).nudge_pending());
+        assert!(nudge(Some(3), None).nudge_pending());
+        assert!(nudge(Some(5), Some(4)).nudge_pending());
+        assert!(!nudge(Some(4), Some(4)).nudge_pending());
+        assert!(!nudge(Some(3), Some(4)).nudge_pending());
 
         assert_eq!(PassTrigger::Log.as_str(), "log");
         assert_eq!(PassTrigger::Observations.as_str(), "observations");

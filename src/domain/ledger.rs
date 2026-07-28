@@ -534,6 +534,11 @@ impl<S: Log> Ledger<S> {
         self.append_payload(&snapshot, EventPayload::LoopRotationRequested { why })
     }
 
+    pub fn request_nudge(&self, why: Option<String>) -> Result<AppendResult> {
+        let snapshot = self.snapshot()?;
+        self.append_payload(&snapshot, EventPayload::LoopNudgeRequested { why })
+    }
+
     fn draft(&self, payload: EventPayload) -> EventDraft {
         self.draft_at(Utc::now(), payload)
     }
@@ -1078,10 +1083,12 @@ mod tests {
             .unwrap();
         ledger.select_engine("codex".to_owned()).unwrap();
         ledger.request_rotation(None).unwrap();
+        ledger.request_nudge(None).unwrap();
         let state = ledger.snapshot().unwrap().state;
         assert!(state.loop_control.paused);
         assert_eq!(state.loop_control.engine.as_deref(), Some("codex"));
         assert!(state.loop_control.rotate_pending());
+        assert!(state.loop_control.nudge_pending());
 
         ledger.resume_loop().unwrap();
         assert!(!ledger.snapshot().unwrap().state.loop_control.paused);

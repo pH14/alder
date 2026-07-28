@@ -14,6 +14,7 @@ use crate::{config::Config, loop_state::LoopState};
 /// are informational provenance, never a limit on what the pass must do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Trigger {
+    Manual,
     Log,
     Observations,
     Due,
@@ -22,6 +23,7 @@ pub enum Trigger {
 impl Trigger {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Manual => "manual",
             Self::Log => "log",
             Self::Observations => "observations",
             Self::Due => "due",
@@ -55,6 +57,9 @@ pub enum Decision {
 /// Which trigger kinds currently hold. Empty means nothing has happened.
 pub fn triggers(config: &Config, state: &LoopState, poll: &Poll) -> Vec<Trigger> {
     let mut triggers = Vec::new();
+    if state.nudge_pending {
+        triggers.push(Trigger::Manual);
+    }
     if log_advanced(state) {
         triggers.push(Trigger::Log);
     }
@@ -114,15 +119,16 @@ pub fn decide(config: &Config, state: &LoopState, poll: &Poll) -> Decision {
         return Decision::Idle("nothing changed");
     }
     // The ceiling overrides both deferrals: a loop that never runs is worse
-    // than an injection landing under someone's cursor.
-    let overdue = max_interval_elapsed(config, state, poll.now);
-    if poll.attached_client && !overdue {
+    // than an injection landing under someone's cursor. A pending nudge does
+    // the same, because a nudge is the human overriding that politeness.
+    let urgent = max_interval_elapsed(config, state, poll.now) || state.nudge_pending;
+    if poll.attached_client && !urgent {
         return Decision::Hold("a client is attached to the session");
     }
     let settled = poll
         .pending_since
         .is_none_or(|since| poll.now >= since + TimeDelta::seconds(config.debounce_seconds as i64));
-    if !settled && !overdue {
+    if !settled && !urgent {
         return Decision::Hold("debouncing");
     }
     Decision::Fire(triggers)
@@ -390,14 +396,26 @@ mod tests {
             vec![Trigger::Due]
         );
 
+        // A pending nudge is the manual trigger, ahead of everything else.
+        let mut nudged = ran(0);
+        nudged.nudge_pending = true;
+        assert_eq!(triggers(&config, &nudged, &poll(1)), vec![Trigger::Manual]);
+
         let mut all = ran(0);
         all.head = 41;
+        all.nudge_pending = true;
         let mut everything = poll(30);
         everything.refresh_changed = true;
         assert_eq!(
             triggers(&config, &all, &everything),
-            vec![Trigger::Log, Trigger::Observations, Trigger::Due]
+            vec![
+                Trigger::Manual,
+                Trigger::Log,
+                Trigger::Observations,
+                Trigger::Due
+            ]
         );
+        assert_eq!(Trigger::Manual.as_str(), "manual");
         assert_eq!(Trigger::Log.as_str(), "log");
         assert_eq!(Trigger::Observations.as_str(), "observations");
         assert_eq!(Trigger::Due.as_str(), "due");
@@ -466,6 +484,42 @@ mod tests {
         assert_eq!(
             decide(&config, &moved, &overdue),
             Decision::Fire(vec![Trigger::Log, Trigger::Due])
+        );
+    }
+
+    #[test]
+    fn a_nudge_fires_through_both_deferrals_but_respects_pause_and_open_pass() {
+        let config = config_for(&[("claude", "claude")]);
+        let mut nudged = ran(0);
+        nudged.nudge_pending = true;
+
+        // Debounce has not settled and a client is attached; a nudge fires
+        // anyway, because it is the human overriding the driver's politeness.
+        let mut held = poll(1);
+        held.pending_since = Some(at(1));
+        held.attached_client = true;
+        assert_eq!(
+            decide(&config, &nudged, &held),
+            Decision::Fire(vec![Trigger::Manual])
+        );
+
+        // Pause and an open pass still outrank it.
+        let mut paused = nudged.clone();
+        paused.paused = true;
+        assert_eq!(
+            decide(&config, &paused, &held),
+            Decision::Idle("the loop is paused")
+        );
+        let mut open = nudged.clone();
+        open.open_pass = Some(OpenPass {
+            id: "hm-pass-2".to_owned(),
+            engine: "claude".to_owned(),
+            handle: "tmux:alder-leader".to_owned(),
+            started_at: at(1),
+        });
+        assert_eq!(
+            decide(&config, &open, &held),
+            Decision::Idle("a pass is already open")
         );
     }
 

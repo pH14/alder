@@ -165,6 +165,15 @@ being later in the log, so there is no clearing write, no window in which the
 flag is stale, and no way for two drivers to disagree about whether a rotation
 already happened.
 
+**Nudge.** The identical derivation over its own request kind:
+
+> A nudge is pending when the sequence of the most recent
+> `loop.nudge_requested` event is greater than the sequence of the most recent
+> `pass.started`, or when a nudge has been requested and no wake has ever
+> happened.
+
+The next wake consumes it by log order alone, exactly as with rotation.
+
 ## Eras and rotation
 
 A **session era** is one engine process serving a run of passes. An era ends
@@ -189,6 +198,18 @@ infers.
 
 Rotation is *not* an emergency stop. It changes which process serves the next
 pass; it does not stop passes. `loop pause` stops passes.
+
+## Nudging
+
+A nudge is the operator's "wake it now". The last pass may have picked a long
+wake honestly and then the world changed — an answer landed, a handoff is
+waiting — and `loop nudge` asks the driver to run the next pass ahead of that
+schedule. The driver reports a pending nudge as the `manual` trigger and lets
+it override both of its deferrals, the debounce and the attached-client hold,
+the way the `maxIntervalSeconds` ceiling does: a nudge is the human overriding
+the driver's politeness. It does not override `loop pause`, and it cannot open
+a second pass while one is open. A nudge changes *when* the next pass runs,
+never *what* it does.
 
 ## The trigger-message contract
 

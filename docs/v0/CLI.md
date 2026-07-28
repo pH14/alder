@@ -40,7 +40,7 @@ The complete surface:
 | `next` | `start` | | | | `resume` | |
 | `show` | `finish` | | | | `use` | |
 | `refresh` | `drop` | | | | `rotate` | |
-| `reconcile` | `reopen` | | | | | |
+| `reconcile` | `reopen` | | | | `nudge` | |
 | `debug` | `block` | | | | | |
 | | `unblock` | | | | | |
 | | `ask` | | | | | |
@@ -680,6 +680,21 @@ rotation requested
 A one-shot request that the next wake start on a fresh session. Rotation is
 pending exactly when a rotation request is later in the log than the most
 recent wake, so the next wake consumes it. There is no flag to clear.
+
+### `alder loop nudge [--why <reason>]`
+
+```text
+$ alder loop nudge --why "answered the release question"
+nudge requested
+```
+
+A one-shot request that the driver wake the loop now rather than at the next
+scheduled trigger. A nudge follows the identical pending rule as rotation —
+pending exactly when its request is later in the log than the most recent
+wake, consumed by the next wake, no flag to clear. The driver reports a
+pending nudge as the `manual` trigger and fires through its own deferrals; it
+does not override `loop pause`, and it cannot open a second pass while one is
+open.
 
 ## Repair
 

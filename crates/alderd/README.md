@@ -82,6 +82,7 @@ properties of the box, not durable project facts.
    recovers. Nothing else happens while a pass is open.
 3. If the loop is paused, idle.
 4. Refresh observations, then compute the trigger kinds that hold:
+   `manual` (a nudge is pending),
    `log` (the head advanced past the last pass's `ended_seq`),
    `observations` (refresh reported a change), and
    `due` (a requested wake time arrived, or `maxIntervalSeconds` elapsed).
@@ -124,13 +125,14 @@ rules above.
 - **Attached client.** If `tmux list-clients` shows someone watching, the
   injection waits so it does not land under their cursor.
 
-Neither deferral survives `maxIntervalSeconds`. A loop that never runs is worse
-than an inconvenient injection.
+Neither deferral survives `maxIntervalSeconds` — a loop that never runs is
+worse than an inconvenient injection — and neither survives a pending nudge,
+because a nudge is the human overriding this politeness on purpose.
 
 ## Trigger kinds are not scope
 
-`log`, `observations`, and `due` are provenance recorded on the pass and
-repeated in the injection. They never narrow the pass. A pass woken by
+`manual`, `log`, `observations`, and `due` are provenance recorded on the pass
+and repeated in the injection. They never narrow the pass. A pass woken by
 `observations` still runs its complete sync, because the driver cannot know
 what else changed and is not allowed to guess.
 

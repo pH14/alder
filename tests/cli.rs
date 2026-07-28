@@ -974,6 +974,30 @@ fn a_rotation_is_pending_only_until_the_next_wake() {
 }
 
 #[test]
+fn a_nudge_is_pending_only_until_the_next_wake() {
+    let project = TestProject::new();
+    let requested = project.success(&["loop", "nudge", "--why", "an answer landed"]);
+    assert_eq!(requested["schema"], "alder.loop.nudge.v0");
+    assert_eq!(project.success(&["status"])["loop"]["nudge_pending"], true);
+    assert!(project.human(&["status"]).contains("nudge pending"));
+    // A nudge is not a rotation; each is pending on its own request.
+    assert_eq!(
+        project.success(&["status"])["loop"]["rotate_pending"],
+        false
+    );
+
+    project.success(&[
+        "loop",
+        "wake",
+        "--engine",
+        "codex",
+        "--handle",
+        "tmux:alder-leader",
+    ]);
+    assert_eq!(project.success(&["status"])["loop"]["nudge_pending"], false);
+}
+
+#[test]
 fn refresh_reports_change_without_counting_metadata_churn() {
     let project = TestProject::new();
     let work = string(

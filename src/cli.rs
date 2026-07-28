@@ -290,6 +290,8 @@ pub enum LoopCommand {
     Use(LoopUseArgs),
     /// Ask the next wake to start a fresh session.
     Rotate(OptionalReasonArgs),
+    /// Ask the driver to wake the loop now, ahead of any schedule.
+    Nudge(OptionalReasonArgs),
 }
 
 #[derive(Debug, Args)]
