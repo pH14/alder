@@ -301,6 +301,24 @@ pub enum WorkState {
     Dropped,
 }
 
+impl WorkState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Dropped => "dropped",
+        }
+    }
+
+    /// `done` and `dropped` are the states a work item leaves only by being
+    /// reopened. Nothing subordinate to the work is actionable while it is in
+    /// one of them.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Dropped)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkStateChange {

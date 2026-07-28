@@ -523,7 +523,7 @@ impl ProjectState {
                     .get(work_id)
                     .ok_or_else(|| AlderError::not_found("work", work_id))?
                     .state;
-                if !matches!(state, WorkState::Done | WorkState::Dropped) {
+                if !state.is_terminal() {
                     return Err(AlderError::with_context(
                         "invalid_transition",
                         format!("work `{work_id}` is not terminal"),
@@ -549,7 +549,7 @@ impl ProjectState {
                     .work
                     .get_mut(&question.work_id)
                     .ok_or_else(|| AlderError::not_found("work", &question.work_id))?;
-                if !matches!(work.state, WorkState::Open | WorkState::Blocked) {
+                if work.state.is_terminal() {
                     return Err(AlderError::validation(format!(
                         "questions cannot be asked against terminal work `{}`",
                         question.work_id
@@ -864,6 +864,35 @@ impl ProjectState {
                 .then_with(|| left.id.cmp(&right.id))
         });
         ready
+    }
+
+    /// The terminal work state that has stranded this question, if any.
+    ///
+    /// A question is actionable only while its work is live. Once the work is
+    /// done or dropped there is no requirement left to decide about, so the
+    /// question stops asking anyone for anything. Nothing is stored: the
+    /// derivation reverses itself when the work is reopened, and answering a
+    /// stranded question remains legal because a late ruling is harmless.
+    pub fn stranded(&self, question: &Question) -> Option<WorkState> {
+        self.work
+            .get(&question.work_id)
+            .map(|work| work.state)
+            .filter(|state| state.is_terminal())
+    }
+
+    /// Unanswered questions on one work item, in the order they were asked.
+    /// A transition to `done` or `dropped` strands exactly these.
+    pub fn unanswered_questions(&self, work_id: &str) -> Vec<String> {
+        let mut questions: Vec<_> = self
+            .questions
+            .values()
+            .filter(|question| question.work_id == work_id && question.answer.is_none())
+            .collect();
+        questions.sort_by_key(|question| question.asked_seq);
+        questions
+            .into_iter()
+            .map(|question| question.id.clone())
+            .collect()
     }
 
     pub fn downstream(&self, work_id: &str) -> Vec<String> {
