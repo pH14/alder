@@ -230,7 +230,7 @@ impl Projection {
 /// from the log, or for observations from the running world — so the honest
 /// response to a schema change is to drop it all and let the next sync and
 /// sweep refill it.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 fn reset_if_schema_changed(connection: &Connection) -> Result<()> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -293,7 +293,8 @@ fn create_schema(connection: &Connection) -> Result<()> {
             state TEXT NOT NULL,
             submitted_seq INTEGER NOT NULL,
             work_id TEXT,
-            integrated_seq INTEGER
+            integrated_seq INTEGER,
+            withdrawn_seq INTEGER
         );
         CREATE TABLE IF NOT EXISTS dependencies (
             work_id TEXT NOT NULL,
@@ -557,8 +558,9 @@ fn insert_state(transaction: &Transaction<'_>, state: &ProjectState) -> Result<(
     for handoff in state.handoffs.values() {
         transaction.execute(
             "INSERT INTO handoffs
-             (id, title, artifact_ref, note, state, submitted_seq, work_id, integrated_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (id, title, artifact_ref, note, state, submitted_seq, work_id, integrated_seq,
+              withdrawn_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 handoff.id,
                 handoff.title,
@@ -568,6 +570,7 @@ fn insert_state(transaction: &Transaction<'_>, state: &ProjectState) -> Result<(
                 handoff.submitted_seq,
                 handoff.work_id,
                 handoff.integrated_seq,
+                handoff.withdrawn_seq,
             ],
         )?;
     }

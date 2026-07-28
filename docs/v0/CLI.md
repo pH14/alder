@@ -36,7 +36,7 @@ The complete surface:
 | Global | Work | Attempt | Question | Handoff | Loop | Pass |
 | --- | --- | --- | --- | --- | --- | --- |
 | `init` | `add` | `edit` | `answer` | `add` | `wake` | `end` |
-| `status` | `edit` | `end` | | | `pause` | |
+| `status` | `edit` | `end` | | `withdraw` | `pause` | |
 | `next` | `start` | | | | `resume` | |
 | `show` | `finish` | | | | `use` | |
 | `refresh` | `drop` | | | | `rotate` | |
@@ -278,8 +278,24 @@ The handoff's title and reference become the defaults for the new work.
 Integration atomically creates the work and changes the handoff from
 `submitted` to `integrated`. Failed validation changes nothing.
 
-There is no decline command or additional handoff state in v0. An
-unintegrated handoff remains visible.
+### `alder handoff withdraw <handoff> --why <reason>`
+
+Retire a submitted handoff without admitting it:
+
+```text
+$ alder handoff withdraw hm-handoff-f27 --why "superseded by hm-handoff-f31"
+hm-handoff-f27  withdrawn
+```
+
+Withdrawal is the noun-preserving verb: it never becomes a `work` command
+because it does not create work. `--why` is required, mirroring `work drop`
+and `work reopen`.
+
+Only a `submitted` handoff can be withdrawn; an already-`integrated` or
+already-`withdrawn` handoff rejects with `invalid_transition`. Withdrawal is
+terminal in v0 — there is no un-withdraw — and a withdrawn handoff remains
+visible through `show` but drops out of `status`'s handoff inbox the same way
+an integrated one does.
 
 ## Admission and editing
 
