@@ -98,10 +98,17 @@ impl Project {
             &self.config.store.remote,
             &self.config.store.reference,
         )
+        .with_cache(self.store_cache())
     }
 
     pub fn state_db(&self) -> PathBuf {
         self.root.join(".alder/state.db")
+    }
+
+    /// Decoded events of the last read log revision. Like the projection this
+    /// is derived local data: deleting it costs one slower read.
+    pub fn store_cache(&self) -> PathBuf {
+        self.root.join(".alder/cache")
     }
 
     /// The local append marker. The CLI touches it after every confirmed
