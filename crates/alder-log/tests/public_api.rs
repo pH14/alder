@@ -346,6 +346,104 @@ fn a_record_cache_is_only_trusted_for_the_revision_that_wrote_it() {
     );
 }
 
+#[test]
+fn concurrent_readers_racing_for_the_anchor_ref_all_read_the_log() {
+    let (_temporary, _remote, local) = setup_git();
+    let head = GitLog::new(&local, "origin", "refs/heads/log")
+        .append(&Head::empty(), &draft("one", 1))
+        .unwrap()
+        .observed_head;
+
+    // Every reader of one log fetches into one private ref, and readers in one
+    // repository share it, so they contend for it on every read.
+    let barrier = Arc::new(Barrier::new(9));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let log = GitLog::new(&local, "origin", "refs/heads/log");
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                (0..8).map(|_| log.head()).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    barrier.wait();
+    for handle in handles {
+        for observed in handle.join().unwrap() {
+            assert_eq!(observed.unwrap(), head);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reader_that_loses_the_anchor_ref_race_still_reads_the_log() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (temporary, _remote, local) = setup_git();
+    let log = GitLog::new(&local, "origin", "refs/heads/log");
+    let first = log.append(&Head::empty(), &draft("one", 1)).unwrap();
+    log.head().unwrap();
+    let anchor = local.join(".git").join(anchor_reference(&local));
+    // This append leaves the remote one record ahead of the anchor, so the
+    // read below has to move it. A read with nothing to update takes no ref
+    // lock at all, and so cannot lose the race for one.
+    let head = log
+        .append(&first.observed_head, &draft("two", 2))
+        .unwrap()
+        .observed_head;
+
+    // Take the lock the read needs, as a concurrent reader of this log does
+    // while it updates the anchor. Nobody releases this one, so the read
+    // cannot be rescued and reports that it could not read the log.
+    let lock = anchor.with_extension("lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+    assert!(matches!(
+        log.head(),
+        Err(alder_log::LogError::Unavailable { .. })
+    ));
+
+    // Release that lock one round trip after the one it fails, as the reader
+    // holding it does once its own update lands. Git runs the remote's
+    // `upload-pack` once per round trip, which makes it the one point where
+    // the repository can change under a fetch in flight.
+    let counter = temporary.path().join("round-trips");
+    let script = temporary.path().join("upload-pack");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             echo . >> '{counter}'\n\
+             if [ \"$(wc -l < '{counter}')\" -gt 1 ]; then\n\
+             \trm -f '{lock}'\n\
+             fi\n\
+             exec git upload-pack \"$@\"\n",
+            counter = counter.display(),
+            lock = lock.display(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    run(
+        &local,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            script.to_str().unwrap(),
+        ],
+    );
+
+    let observed = log.head().unwrap();
+    assert_eq!(observed, head);
+    assert_eq!(log.read_all(&observed).unwrap().len(), 2);
+    // A read that took one round trip never met the held lock at all.
+    assert!(std::fs::read_to_string(&counter).unwrap().lines().count() > 1);
+    assert!(!lock.exists());
+}
+
 struct TestDirectory(std::path::PathBuf);
 
 impl TestDirectory {
@@ -411,6 +509,23 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// The private ref one log fetches into, as one read of it left behind.
+fn anchor_reference(directory: &Path) -> String {
+    let output = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/alder-log/"])
+        .current_dir(directory)
+        .output()
+        .unwrap();
+    let refs = String::from_utf8_lossy(&output.stdout);
+    let mut names = refs.lines();
+    let name = names
+        .next()
+        .expect("a read leaves one anchor ref")
+        .to_owned();
+    assert_eq!(names.next(), None, "one log fetches into one anchor ref");
+    name
 }
 
 fn reference(directory: &Path, name: &str) -> Option<String> {
