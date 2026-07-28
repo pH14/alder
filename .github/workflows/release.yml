@@ -1,0 +1,92 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Check the Linux binaries are static
+        if: contains(matrix.target, 'musl')
+        run: |
+          for bin in alder alderd; do
+            if ldd "target/${{ matrix.target }}/release/$bin" 2>&1 | grep -q "not a dynamic executable"; then
+              echo "$bin is static"
+            else
+              echo "$bin is not statically linked" >&2
+              ldd "target/${{ matrix.target }}/release/$bin" >&2 || true
+              exit 1
+            fi
+          done
+
+      - name: Package
+        run: |
+          staging="alder-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/alder" \
+             "target/${{ matrix.target }}/release/alderd" \
+             LICENSE README.md "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alder-${{ matrix.target }}
+          path: alder-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum alder-*.tar.gz > SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag \
+            artifacts/alder-*.tar.gz artifacts/SHA256SUMS
