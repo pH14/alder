@@ -10,7 +10,7 @@ fn main() -> ExitCode {
     let cli = match Cli::try_parse_from(arguments) {
         Ok(cli) => cli,
         Err(error) => {
-            if wants_json {
+            if wants_json && error.use_stderr() {
                 let value = json!({
                     "schema": "alder.error.v0",
                     "code": "invalid_command",
@@ -24,7 +24,7 @@ fn main() -> ExitCode {
             } else {
                 let _ = error.print();
             }
-            return ExitCode::from(2);
+            return ExitCode::from(error.exit_code() as u8);
         }
     };
     match App::run(&cli.command) {

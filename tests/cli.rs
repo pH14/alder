@@ -526,6 +526,29 @@ fn invalid_commands_and_errors_use_the_requested_output_channel() {
 }
 
 #[test]
+fn help_and_version_exit_successfully() {
+    let mut help_command = Command::cargo_bin("alder").unwrap();
+    let help_output = help_command.arg("--help").output().unwrap();
+    assert_eq!(help_output.status.code(), Some(0));
+    assert!(help_output.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&help_output.stdout).contains("Usage:"));
+
+    let mut version_command = Command::cargo_bin("alder").unwrap();
+    let version_output = version_command.arg("--version").output().unwrap();
+    assert_eq!(version_output.status.code(), Some(0));
+    assert!(version_output.stderr.is_empty());
+
+    let mut json_help_command = Command::cargo_bin("alder").unwrap();
+    let json_help_output = json_help_command
+        .args(["--json", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(json_help_output.status.code(), Some(0));
+    assert!(json_help_output.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&json_help_output.stdout).contains("Usage:"));
+}
+
+#[test]
 fn mutually_exclusive_edit_and_finish_arguments_are_all_rejected() {
     let project = TestProject::new();
     let added = project.success(&["work", "add", "--title", "work"]);
