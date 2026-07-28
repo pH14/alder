@@ -298,6 +298,54 @@ fn an_inconclusive_rejected_push_is_resolved_without_partial_visibility() {
     assert_eq!(log.read_all(&observed).unwrap().len(), 1);
 }
 
+#[test]
+fn a_record_cache_is_only_trusted_for_the_revision_that_wrote_it() {
+    let (temporary, _remote, local) = setup_git();
+    let cache = temporary.path().join("cache");
+    let cached = || GitLog::new(&local, "origin", "refs/heads/log").with_cache(&cache);
+    let first = cached().append(&Head::empty(), &draft("one", 1)).unwrap();
+    let second = cached()
+        .append(&first.observed_head, &draft("two", 2))
+        .unwrap();
+    let head = second.observed_head.clone();
+    let revision = head.revision().unwrap().to_owned();
+
+    // A later process reads the recorded revision back rather than the tree.
+    let file = cache.join("records.json");
+    assert!(file.is_file());
+    assert_eq!(cached().read_all(&head).unwrap().len(), 2);
+
+    // A cache naming a different revision describes a different tree, so it
+    // is ignored and the records are read from Git again.
+    let recorded = std::fs::read_to_string(&file).unwrap();
+    let misfiled = recorded.replace(&revision, &"0".repeat(revision.len()));
+    assert_ne!(misfiled, recorded);
+    std::fs::write(&file, &misfiled).unwrap();
+    assert_eq!(cached().read_all(&head).unwrap().len(), 2);
+
+    // So is a cache from another log in the same directory, and one that is
+    // not readable at all. Neither can answer for this revision.
+    std::fs::write(
+        &file,
+        recorded.replace("refs/heads/log", "refs/heads/other"),
+    )
+    .unwrap();
+    assert_eq!(cached().read_all(&head).unwrap().len(), 2);
+    std::fs::write(&file, b"not a cache").unwrap();
+    assert_eq!(cached().read_all(&head).unwrap().len(), 2);
+
+    // A good cache is rewritten over any of that, and still describes the log.
+    assert_eq!(
+        cached()
+            .read_all(&head)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.id().as_str().to_owned())
+            .collect::<Vec<_>>(),
+        ["one", "two"]
+    );
+}
+
 struct TestDirectory(std::path::PathBuf);
 
 impl TestDirectory {
