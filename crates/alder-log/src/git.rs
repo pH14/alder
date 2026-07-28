@@ -136,35 +136,50 @@ impl GitLog {
     ///
     /// Every reader of one log shares this name — worktrees of a repository
     /// share its refs — so concurrent reads race to update it. Git waits out
-    /// a held ref lock rather than failing (`core.filesRefLockTimeout`, 100ms
-    /// by default), and whichever revision wins is authoritative either way,
-    /// so the race has no loser.
+    /// a held ref lock (`core.filesRefLockTimeout`, 100ms by default) and then
+    /// fails the update, and fails outright on one whose ref moved under it,
+    /// so a read can lose that race. Whichever revision wins came from this
+    /// same remote, so a loser loses nothing but the retry in
+    /// `authoritative_revision`.
     fn anchor(&self) -> String {
         format!(
             "refs/alder-log/{:016x}",
             store_digest(&self.remote, &self.reference)
         )
     }
-    /// Bring the authoritative ref local and return the revision it names.
-    ///
-    /// One fetch does both jobs, so an ordinary read costs a single remote
-    /// round trip instead of the `ls-remote` plus `fetch` pair it replaces.
-    /// `ls-remote` runs only when that fetch fails, to separate an empty
-    /// remote log from an unreachable one.
-    fn authoritative_revision(&self) -> Result<Option<String>, LogError> {
-        let anchor = self.anchor();
-        let fetched = self.command([
+    fn fetch_anchor(&self, anchor: &str) -> Result<Output, LogError> {
+        self.command([
             "fetch",
             "--no-tags",
             "--quiet",
             &self.remote,
             &format!("+{}:{anchor}", self.reference),
-        ])?;
+        ])
+    }
+    /// Bring the authoritative ref local and return the revision it names.
+    ///
+    /// One fetch does both jobs, so an ordinary read costs a single remote
+    /// round trip instead of the `ls-remote` plus `fetch` pair it replaces.
+    /// `ls-remote` runs only when that fetch fails, to separate an empty
+    /// remote log from an unreachable one — and, between those, from a
+    /// transfer that reached the log and failed on the anchor behind it.
+    fn authoritative_revision(&self) -> Result<Option<String>, LogError> {
+        let anchor = self.anchor();
+        let mut fetched = self.fetch_anchor(&anchor)?;
         if !fetched.status.success() {
-            return match self.remote_revision()? {
-                None => Ok(None),
-                Some(_) => Err(self.git_error("fetch the shared log", &fetched)),
-            };
+            if self.remote_revision()?.is_none() {
+                return Ok(None);
+            }
+            // The remote answered, so that fetch read the log and failed
+            // updating the anchor every reader of it shares: a concurrent read
+            // took that ref first, and Git fails the losing update rather than
+            // the transfer behind it. Nothing is lost by losing — the winner
+            // read this same remote — so fetch once more, now from the value
+            // that won.
+            fetched = self.fetch_anchor(&anchor)?;
+            if !fetched.status.success() {
+                return Err(self.git_error("fetch the shared log", &fetched));
+            }
         }
         let output = self.successful(
             ["rev-parse", "--verify", &format!("{anchor}^{{commit}}")],
