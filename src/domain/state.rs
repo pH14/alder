@@ -303,11 +303,10 @@ impl ProjectState {
                 metadata,
             } => {
                 validate_handle(handle)?;
-                if self
-                    .attempts
-                    .values()
-                    .any(|attempt| attempt.handle.as_deref() == Some(handle))
-                {
+                if self.attempts.values().any(|attempt| {
+                    attempt.state != AttemptState::Ended
+                        && attempt.handle.as_deref() == Some(handle)
+                }) {
                     return Err(AlderError::validation(format!(
                         "handle `{handle}` is already attached"
                     )));
@@ -1586,6 +1585,95 @@ mod tests {
                 .unwrap_err()
                 .message,
             "an attempt update must change metadata, a note, or a check"
+        );
+    }
+
+    #[test]
+    fn a_handle_held_only_by_ended_attempts_may_be_rebound() {
+        let mut state = ProjectState::default();
+        state
+            .apply(&event(
+                1,
+                EventPayload::WorkChanged {
+                    why: None,
+                    operations: vec![add("hm-a", &[], &[]), add("hm-b", &[], &[])],
+                },
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                2,
+                EventPayload::AttemptStarted {
+                    attempt: AttemptDefinition {
+                        id: "hm-a-attempt-1".to_owned(),
+                        work_id: "hm-a".to_owned(),
+                        metadata: BTreeMap::new(),
+                    },
+                },
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                3,
+                EventPayload::AttemptBound {
+                    attempt_id: "hm-a-attempt-1".to_owned(),
+                    handle: "tmux:worker".to_owned(),
+                    metadata: BTreeMap::new(),
+                },
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                4,
+                EventPayload::AttemptStarted {
+                    attempt: AttemptDefinition {
+                        id: "hm-b-attempt-1".to_owned(),
+                        work_id: "hm-b".to_owned(),
+                        metadata: BTreeMap::new(),
+                    },
+                },
+            ))
+            .unwrap();
+
+        // A live attempt still holds the handle: a second attempt cannot
+        // bind the same one.
+        let rejected = state
+            .clone()
+            .apply(&event(
+                5,
+                EventPayload::AttemptBound {
+                    attempt_id: "hm-b-attempt-1".to_owned(),
+                    handle: "tmux:worker".to_owned(),
+                    metadata: BTreeMap::new(),
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(rejected.message, "handle `tmux:worker` is already attached");
+
+        // Once the holding attempt ends, the same handle is free to reuse.
+        state
+            .apply(&event(
+                5,
+                EventPayload::AttemptEnded {
+                    attempt_id: "hm-a-attempt-1".to_owned(),
+                    outcome: AttemptOutcome::Failed,
+                    why: "worker crashed".to_owned(),
+                },
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                6,
+                EventPayload::AttemptBound {
+                    attempt_id: "hm-b-attempt-1".to_owned(),
+                    handle: "tmux:worker".to_owned(),
+                    metadata: BTreeMap::new(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            state.attempts["hm-b-attempt-1"].handle.as_deref(),
+            Some("tmux:worker")
         );
     }
 
