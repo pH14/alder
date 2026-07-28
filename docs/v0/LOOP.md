@@ -218,15 +218,22 @@ never *what* it does.
 
 ## Workers
 
-A project may run the leader as a foreman that dispatches implementation to
-worker sessions — one work item per worker, each in its own git worktree and
-tmux session, stamped with its attempt ID and bound to the attempt through
-the ordinary handle. This is entirely process layer: Alder stores attempts,
+A leader may dispatch implementation to worker sessions rather than doing it
+itself — one work item per worker, each in its own git worktree and tmux
+session, stamped with its attempt ID and bound to the attempt through the
+ordinary handle. This is entirely process layer: Alder stores attempts,
 handles, questions, and observations exactly as before, the tmux observer
 lists worker sessions like any other observed object, and `reconcile`
 catches dead ones with the same rules. No Alder mechanism knows the word
 "worker". See `PASS.md`, `WORKER.md`, and `scripts/worker-spawn.sh` in the
 repository for the process itself.
+
+Two conventions in that process are worth naming here because they show up
+in the log rather than in the repository. A worker records an up-tier
+consult as `consulted` metadata on its own attempt, and a dispatch records
+the tier it launched at as `engine` metadata; between them, an item resent
+up the ladder carries the whole climb. Both are ordinary open-ended
+metadata: Alder stores and displays them and reads nothing into them.
 
 ## The trigger-message contract
 
