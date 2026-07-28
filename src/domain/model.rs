@@ -4,21 +4,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Head {
-    pub revision: Option<String>,
-    pub seq: u64,
-}
-
-impl Head {
-    pub fn empty() -> Self {
-        Self {
-            revision: None,
-            seq: 0,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub id: String,
@@ -405,6 +390,7 @@ pub struct QuestionAnswer {
 
 #[cfg(test)]
 mod tests {
+    use alder_log::Head;
     use chrono::Utc;
 
     use super::*;
@@ -422,13 +408,7 @@ mod tests {
 
     #[test]
     fn heads_and_drafts_materialize_exact_event_data() {
-        assert_eq!(
-            Head::empty(),
-            Head {
-                revision: None,
-                seq: 0,
-            }
-        );
+        assert!(Head::empty().is_empty());
         let at = Utc::now();
         let draft = EventDraft {
             id: "event".to_owned(),

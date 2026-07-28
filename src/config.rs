@@ -5,13 +5,13 @@ use std::{
     process::Command,
 };
 
+use alder_log::{GitLog, Log};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
     domain::{ProjectState, valid_name},
     error::{AlderError, Result},
-    store::{GitStore, Store},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,8 +92,8 @@ impl Project {
         ))
     }
 
-    pub fn store(&self) -> GitStore {
-        GitStore::new(
+    pub fn store(&self) -> GitLog {
+        GitLog::new(
             &self.root,
             &self.config.store.remote,
             &self.config.store.reference,
@@ -150,7 +150,7 @@ pub fn initialize(start: &Path, prefix: &str, remote: &str, reference: &str) -> 
         validate_config(&config).map_err(|error| {
             AlderError::with_context("config_conflict", error.message, error.context)
         })?;
-        let store = GitStore::new(&root, remote, reference);
+        let store = GitLog::new(&root, remote, reference);
         let head = verify_store(&store, prefix)?;
         return Ok(InitResult {
             project: Project {
@@ -172,7 +172,7 @@ pub fn initialize(start: &Path, prefix: &str, remote: &str, reference: &str) -> 
         },
         observers: Vec::new(),
     };
-    let store = GitStore::new(&root, remote, reference);
+    let store = GitLog::new(&root, remote, reference);
     let head = verify_store(&store, prefix)?;
     let directory = config_path
         .parent()
@@ -192,9 +192,13 @@ pub fn initialize(start: &Path, prefix: &str, remote: &str, reference: &str) -> 
     })
 }
 
-fn verify_store(store: &GitStore, prefix: &str) -> Result<u64> {
-    let head = store.current_head()?;
-    let events = store.read_events(&head)?;
+fn verify_store(store: &GitLog, prefix: &str) -> Result<u64> {
+    let head = store.head()?;
+    let events = store
+        .read_all(&head)?
+        .iter()
+        .map(crate::domain::decode_record)
+        .collect::<Result<Vec<_>>>()?;
     let state = ProjectState::fold(&events).map_err(|error| {
         AlderError::with_context(
             "config_conflict",
@@ -206,7 +210,7 @@ fn verify_store(store: &GitStore, prefix: &str) -> Result<u64> {
         )
     })?;
     state.validate_prefix(prefix)?;
-    Ok(head.seq)
+    Ok(head.sequence())
 }
 
 fn validate_config(config: &Config) -> Result<()> {

@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "A durable work-and-attempt ledger for autonomous engineering workflows"
 
 [dependencies]
+alder-log = { path = "crates/alder-log" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled", "serde_json"] }
@@ -27,3 +28,7 @@ lto = "thin"
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[workspace]
+members = ["crates/alder-log"]
+resolver = "3"

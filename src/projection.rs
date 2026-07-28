@@ -107,8 +107,8 @@ impl Projection {
         }
         Ok(json!({
             "valid": true,
-            "head": head.seq,
-            "revision": head.revision,
+            "head": head.sequence(),
+            "revision": head.revision(),
             "work_rows": work_count,
             "attempt_rows": attempt_count,
         }))
@@ -376,12 +376,12 @@ fn represented_head(connection: &Connection) -> Result<Option<Head>> {
         .optional()?;
     match (revision, seq) {
         (None, None) => Ok(None),
-        (Some(revision), Some(seq)) => Ok(Some(Head {
-            revision: (!revision.is_empty()).then_some(revision),
-            seq: seq.parse().map_err(|_| {
+        (Some(revision), Some(seq)) => Ok(Some(Head::try_from_parts(
+            seq.parse().map_err(|_| {
                 AlderError::new("database_error", "projection head sequence is invalid")
             })?,
-        })),
+            (!revision.is_empty()).then_some(revision),
+        )?)),
         _ => Err(AlderError::new(
             "database_error",
             "projection head metadata is incomplete",
@@ -414,11 +414,11 @@ fn rebuild(
     insert_state(&transaction, state)?;
     transaction.execute(
         "INSERT INTO projection_meta(key, value) VALUES ('revision', ?1)",
-        [head.revision.as_deref().unwrap_or("")],
+        [head.revision().unwrap_or("")],
     )?;
     transaction.execute(
         "INSERT INTO projection_meta(key, value) VALUES ('seq', ?1)",
-        [head.seq.to_string()],
+        [head.sequence().to_string()],
     )?;
     transaction.commit()?;
     Ok(())
@@ -656,13 +656,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{
-        domain::{
-            CheckDefinition, CheckStatus, CheckUpdate, EventPayload, HandoffDefinition, Ledger,
-            WorkState,
-        },
-        store::MemoryStore,
+    use crate::domain::{
+        CheckDefinition, CheckStatus, CheckUpdate, EventPayload, HandoffDefinition, Ledger,
+        WorkState,
     };
+    use alder_log::MemoryLog as MemoryStore;
 
     #[test]
     fn rebuild_preserves_observations() {
@@ -705,10 +703,7 @@ mod tests {
         let state = ProjectState::fold(std::slice::from_ref(&event)).unwrap();
         projection
             .rebuild(
-                &Head {
-                    revision: Some("one".to_owned()),
-                    seq: 1,
-                },
+                &Head::try_from_parts(1, Some("one".to_owned())).unwrap(),
                 &[event],
                 &state,
             )
@@ -835,10 +830,8 @@ mod tests {
         projection
             .rebuild(&snapshot.head, &snapshot.events, &snapshot.state)
             .unwrap();
-        let wrong_head = Head {
-            revision: Some("other".to_owned()),
-            seq: snapshot.head.seq,
-        };
+        let wrong_head =
+            Head::try_from_parts(snapshot.head.sequence(), Some("other".to_owned())).unwrap();
         assert_eq!(
             projection
                 .verify(&wrong_head, &snapshot.state)

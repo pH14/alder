@@ -5,4 +5,3 @@ pub mod domain;
 pub mod error;
 pub mod observer;
 pub mod projection;
-pub mod store;

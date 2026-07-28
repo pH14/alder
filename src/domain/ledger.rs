@@ -4,10 +4,8 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use ulid::Ulid;
 
-use crate::{
-    error::{AlderError, Result},
-    store::{AppendResult, Store},
-};
+use crate::error::{AlderError, Result};
+use alder_log::{AppendReceipt, Log, LogError};
 
 use super::{
     AttemptDefinition, AttemptOutcome, CheckUpdate, Event, EventDraft, EventPayload,
@@ -24,13 +22,20 @@ pub struct Snapshot {
     pub state: ProjectState,
 }
 
+/// The typed work event result of an application mutation.
+#[derive(Debug, Clone)]
+pub struct AppendResult {
+    pub head: Head,
+    pub event: Event,
+}
+
 pub struct Ledger<S> {
     store: S,
     prefix: String,
     actor: String,
 }
 
-impl<S: Store> Ledger<S> {
+impl<S: Log> Ledger<S> {
     pub fn new(store: S, prefix: impl Into<String>, actor: impl Into<String>) -> Self {
         Self {
             store,
@@ -44,8 +49,13 @@ impl<S: Store> Ledger<S> {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let head = self.store.current_head()?;
-        let events = self.store.read_events(&head)?;
+        let head = self.store.head()?;
+        let events = self
+            .store
+            .read_all(&head)?
+            .iter()
+            .map(super::decode_record)
+            .collect::<Result<Vec<_>>>()?;
         let state = ProjectState::fold(&events)?;
         state.validate_prefix(&self.prefix)?;
         Ok(Snapshot {
@@ -61,11 +71,14 @@ impl<S: Store> Ledger<S> {
         payload: EventPayload,
     ) -> Result<AppendResult> {
         let draft = self.draft(payload);
-        let candidate = draft.materialize(snapshot.head.seq.saturating_add(1));
+        let candidate = draft.materialize(snapshot.head.sequence().saturating_add(1));
         let mut state = snapshot.state.clone();
         state.apply(&candidate)?;
         state.validate_prefix(&self.prefix)?;
-        self.store.append(&snapshot.head, &draft)
+        let receipt = self
+            .store
+            .append(&snapshot.head, &super::encode_draft(&draft)?)?;
+        Ok(append_result(receipt)?)
     }
 
     pub fn commit_change(
@@ -165,12 +178,15 @@ impl<S: Store> Ledger<S> {
         });
         let mut snapshot = initial;
         for _ in 0..16 {
-            let candidate = draft.materialize(snapshot.head.seq.saturating_add(1));
+            let candidate = draft.materialize(snapshot.head.sequence().saturating_add(1));
             let mut state = snapshot.state.clone();
             state.apply(&candidate)?;
-            match self.store.append(&snapshot.head, &draft) {
-                Ok(result) => return Ok((result, id)),
-                Err(error) if error.code == "head_conflict" => {
+            match self
+                .store
+                .append(&snapshot.head, &super::encode_draft(&draft)?)
+            {
+                Ok(result) => return Ok((append_result(result)?, id)),
+                Err(LogError::HeadConflict { .. }) => {
                     snapshot = self.snapshot()?;
                     if let Some(event) = snapshot.events.iter().find(|event| event.id == draft.id) {
                         return Ok((
@@ -182,7 +198,7 @@ impl<S: Store> Ledger<S> {
                         ));
                     }
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
         Err(AlderError::with_context(
@@ -446,6 +462,13 @@ impl<S: Store> Ledger<S> {
     }
 }
 
+fn append_result(receipt: AppendReceipt) -> Result<AppendResult> {
+    Ok(AppendResult {
+        head: receipt.observed_head,
+        event: super::decode_record(&receipt.record)?,
+    })
+}
+
 fn id_allocation_error(kind: &str) -> AlderError {
     AlderError::with_context(
         "id_allocation_failed",
@@ -476,7 +499,9 @@ mod tests {
     use crate::domain::{
         ChangeMode, CheckDefinition, CheckStatus, EditWorkInput, GraphChangeDocument,
     };
-    use crate::store::{AppendResult, MemoryStore, Store};
+    use alder_log::{
+        AppendReceipt, Log as Store, LogError, MemoryLog as MemoryStore, Record, RecordDraft,
+    };
 
     #[derive(Debug, Clone, Copy)]
     enum ConflictBehavior {
@@ -506,21 +531,28 @@ mod tests {
             *self.append_calls.lock().unwrap()
         }
 
-        fn conflict() -> AlderError {
-            AlderError::with_context("head_conflict", "simulated conflict", json!({}))
+        fn conflict() -> LogError {
+            LogError::HeadConflict {
+                expected: Head::empty(),
+                observed: Head::empty(),
+            }
         }
     }
 
     impl Store for ConflictStore {
-        fn current_head(&self) -> Result<Head> {
-            self.inner.current_head()
+        fn head(&self) -> std::result::Result<Head, LogError> {
+            self.inner.head()
         }
 
-        fn read_events(&self, head: &Head) -> Result<Vec<Event>> {
-            self.inner.read_events(head)
+        fn read(&self, head: &Head, after: u64) -> std::result::Result<Vec<Record>, LogError> {
+            self.inner.read(head, after)
         }
 
-        fn append(&self, expected: &Head, draft: &EventDraft) -> Result<AppendResult> {
+        fn append(
+            &self,
+            expected: &Head,
+            draft: &RecordDraft,
+        ) -> std::result::Result<AppendReceipt, LogError> {
             let mut calls = self.append_calls.lock().unwrap();
             *calls += 1;
             let call = *calls;
@@ -532,9 +564,9 @@ mod tests {
                     Err(Self::conflict())
                 }
                 (ConflictBehavior::Always, _) => Err(Self::conflict()),
-                (ConflictBehavior::OtherError, _) => {
-                    Err(AlderError::new("store_unavailable", "simulated outage"))
-                }
+                (ConflictBehavior::OtherError, _) => Err(LogError::Unavailable {
+                    message: "simulated outage".to_owned(),
+                }),
                 _ => self.inner.append(expected, draft),
             }
         }
@@ -777,7 +809,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retry.store().calls(), 2);
-        assert_eq!(result.head.seq, 1);
+        assert_eq!(result.head.sequence(), 1);
         assert!(id.starts_with("hm-handoff-"));
         assert_eq!(id.len(), "hm-handoff-".len() + 6);
         assert_eq!(result.event.actor, "side-channel");

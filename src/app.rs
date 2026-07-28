@@ -13,14 +13,15 @@ use crate::{
     },
     config::{Project, initialize},
     domain::{
-        AttemptOutcome, ChangeMode, CheckDefinition, CheckStatus, CheckUpdate, Event, EventPayload,
-        GraphChangeDocument, Ledger, NullableString, ProjectState, Snapshot, prepare_change,
+        AppendResult, AttemptOutcome, ChangeMode, CheckDefinition, CheckStatus, CheckUpdate, Event,
+        EventPayload, GraphChangeDocument, Ledger, NullableString, ProjectState, Snapshot,
+        prepare_change,
     },
     error::{AlderError, Result},
     observer,
     projection::Projection,
-    store::{AppendResult, GitStore},
 };
+use alder_log::GitLog;
 
 #[derive(Debug)]
 pub struct Output {
@@ -41,7 +42,7 @@ pub struct App;
 
 struct Context {
     project: Project,
-    ledger: Ledger<GitStore>,
+    ledger: Ledger<GitLog>,
     projection: Projection,
     snapshot: Snapshot,
 }
@@ -559,8 +560,8 @@ fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
         .collect();
     let json = json!({
         "schema": "alder.status.v0",
-        "head": context.snapshot.head.seq,
-        "revision": context.snapshot.head.revision,
+        "head": context.snapshot.head.sequence(),
+        "revision": context.snapshot.head.revision(),
         "hypothetical": hypothetical,
         "source": source,
         "observations": {
@@ -580,11 +581,11 @@ fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
     if hypothetical {
         lines.push(format!(
             "hypothetical · based on head {} · {} · not written",
-            context.snapshot.head.seq,
+            context.snapshot.head.sequence(),
             source.clone().unwrap_or_default()
         ));
     } else {
-        lines.push(format!("head {}", context.snapshot.head.seq));
+        lines.push(format!("head {}", context.snapshot.head.sequence()));
     }
     if let Some(latest) = runs.iter().map(|run| run.observed_at.as_str()).max() {
         lines[0].push_str(&format!(" · observations refreshed {latest}"));
@@ -688,8 +689,8 @@ fn next(context: &mut Context, changes: Option<&str>) -> Result<Output> {
     let ready: Vec<_> = state.ready().into_iter().cloned().collect();
     let json = json!({
         "schema": "alder.next.v0",
-        "head": context.snapshot.head.seq,
-        "revision": context.snapshot.head.revision,
+        "head": context.snapshot.head.sequence(),
+        "revision": context.snapshot.head.revision(),
         "hypothetical": hypothetical,
         "source": source,
         "work": ready,
@@ -698,7 +699,7 @@ fn next(context: &mut Context, changes: Option<&str>) -> Result<Output> {
     if hypothetical {
         lines.push(format!(
             "hypothetical · based on head {} · {} · not written",
-            context.snapshot.head.seq,
+            context.snapshot.head.sequence(),
             source.unwrap_or_default()
         ));
     }
@@ -736,7 +737,7 @@ fn overlay_state(
     let mut state = context.snapshot.state.clone();
     let event = Event {
         id: "hypothetical".to_owned(),
-        seq: context.snapshot.head.seq.saturating_add(1),
+        seq: context.snapshot.head.sequence().saturating_add(1),
         at: chrono::Utc::now(),
         actor: "hypothetical".to_owned(),
         payload: EventPayload::WorkChanged {
@@ -806,7 +807,7 @@ fn show(context: &Context, id: &str) -> Result<Output> {
     Ok(Output::new(
         json!({
             "schema": "alder.show.v0",
-            "head": context.snapshot.head.seq,
+            "head": context.snapshot.head.sequence(),
             "id": id,
             "kind": kind,
             "current": current,
@@ -849,7 +850,7 @@ fn refresh(context: &Context) -> Result<Output> {
     Ok(Output::new(
         json!({
             "schema": "alder.refresh.v0",
-            "head": context.snapshot.head.seq,
+            "head": context.snapshot.head.sequence(),
             "result": result,
         }),
         lines.join("\n"),
@@ -912,7 +913,7 @@ fn reconcile(context: &Context, refresh_first: bool) -> Result<Output> {
     Ok(Output::new(
         json!({
             "schema": "alder.reconcile.v0",
-            "head": context.snapshot.head.seq,
+            "head": context.snapshot.head.sequence(),
             "refreshed": refresh_first,
             "refresh_result": refreshed,
             "observation_runs": runs,
@@ -936,13 +937,13 @@ fn debug(context: &Context, command: &DebugCommand) -> Result<Output> {
                     json!({
                         "schema": "alder.debug.db.v0",
                         "operation": "rebuild",
-                        "head": context.snapshot.head.seq,
+                        "head": context.snapshot.head.sequence(),
                         "path": context.projection.path(),
                     }),
                     format!(
                         "rebuilt {} at head {}",
                         context.projection.path().display(),
-                        context.snapshot.head.seq
+                        context.snapshot.head.sequence()
                     ),
                 ))
             }
@@ -952,14 +953,17 @@ fn debug(context: &Context, command: &DebugCommand) -> Result<Output> {
                     .verify(&context.snapshot.head, &context.snapshot.state)?;
                 Ok(Output::new(
                     json!({"schema": "alder.debug.db.v0", "operation": "verify", "result": result}),
-                    format!("projection valid at head {}", context.snapshot.head.seq),
+                    format!(
+                        "projection valid at head {}",
+                        context.snapshot.head.sequence()
+                    ),
                 ))
             }
         },
         DebugCommand::Query(args) => {
             let result = context.projection.raw_query(&args.sql)?;
             Ok(Output::new(
-                json!({"schema": "alder.debug.query.v0", "head": context.snapshot.head.seq, "result": result}),
+                json!({"schema": "alder.debug.query.v0", "head": context.snapshot.head.sequence(), "result": result}),
                 serde_json::to_string_pretty(&result)?,
             ))
         }
@@ -973,8 +977,8 @@ fn debug_log(context: &Context, command: &DebugLogCommand) -> Result<Output> {
             json!({
                 "schema": "alder.debug.log.v0",
                 "operation": "head",
-                "head": context.snapshot.head.seq,
-                "revision": context.snapshot.head.revision,
+                "head": context.snapshot.head.sequence(),
+                "revision": context.snapshot.head.revision(),
             }),
             debug_log_head(context),
         )),
@@ -1022,12 +1026,12 @@ fn debug_log(context: &Context, command: &DebugLogCommand) -> Result<Output> {
                     "operation": "verify",
                     "valid": true,
                     "events": context.snapshot.events.len(),
-                    "head": context.snapshot.head.seq,
+                    "head": context.snapshot.head.sequence(),
                 }),
                 format!(
                     "log valid · {} events · head {}",
                     context.snapshot.events.len(),
-                    context.snapshot.head.seq
+                    context.snapshot.head.sequence()
                 ),
             ))
         }
@@ -1037,8 +1041,8 @@ fn debug_log(context: &Context, command: &DebugLogCommand) -> Result<Output> {
 fn debug_log_head(context: &Context) -> String {
     format!(
         "head {}  {}",
-        context.snapshot.head.seq,
-        context.snapshot.head.revision.as_deref().unwrap_or("empty")
+        context.snapshot.head.sequence(),
+        context.snapshot.head.revision().unwrap_or("empty")
     )
 }
 
@@ -1157,8 +1161,8 @@ fn mutation_output(
         _ => serde_json::Map::new(),
     };
     object.insert("schema".to_owned(), json!(schema));
-    object.insert("head".to_owned(), json!(result.head.seq));
-    object.insert("revision".to_owned(), json!(result.head.revision));
+    object.insert("head".to_owned(), json!(result.head.sequence()));
+    object.insert("revision".to_owned(), json!(result.head.revision()));
     object.insert("event_id".to_owned(), json!(result.event.id));
     Output::new(Value::Object(object), human)
 }

@@ -1,6 +1,8 @@
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use alder_log::LogError;
+
 pub type Result<T> = std::result::Result<T, AlderError>;
 
 #[derive(Debug, Error)]
@@ -67,6 +69,35 @@ impl From<serde_json::Error> for AlderError {
             value.to_string(),
             json!({"line": value.line(), "column": value.column()}),
         )
+    }
+}
+
+impl From<LogError> for AlderError {
+    fn from(value: LogError) -> Self {
+        match value {
+            LogError::InvalidRecord { message } => Self::new("invalid_record", message),
+            LogError::InvalidHead { message } => Self::new("invalid_head", message),
+            LogError::InvalidRange { after, through } => Self::with_context(
+                "invalid_range",
+                format!("read offset {after} exceeds head sequence {through}"),
+                json!({"after": after, "through": through}),
+            ),
+            LogError::HeadConflict { expected, observed } => Self::with_context(
+                "head_conflict",
+                "the shared log advanced before the record was appended",
+                json!({"expected_head": expected, "current_head": observed}),
+            ),
+            LogError::RecordIdCollision { id } => Self::with_context(
+                "record_id_collision",
+                format!("record ID `{id}` already exists with different content"),
+                json!({"record_id": id.as_str()}),
+            ),
+            LogError::UnknownOutcome { message } => Self::new("unknown_append_outcome", message),
+            LogError::InvalidLog { message } => Self::new("invalid_log", message),
+            LogError::Unavailable { message } => Self::new("store_unavailable", message),
+            LogError::Io { message } => Self::new("io_error", message),
+            LogError::Serialization { message } => Self::new("serialization_error", message),
+        }
     }
 }
 

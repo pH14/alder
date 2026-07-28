@@ -15,6 +15,7 @@ dependencies = [
 name = "alder"
 version = "0.1.0"
 dependencies = [
+ "alder-log",
  "assert_cmd",
  "chrono",
  "clap",
@@ -27,6 +28,16 @@ dependencies = [
  "thiserror",
  "ulid",
  "wait-timeout",
+]
+
+[[package]]
+name = "alder-log"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
