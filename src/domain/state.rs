@@ -554,10 +554,19 @@ impl ProjectState {
                     ));
                 }
                 self.reject_active_downstream(work_id)?;
+                let surviving = self.unanswered_questions(work_id).into_iter().next();
                 let work = self.work.get_mut(work_id).expect("checked above");
-                work.state = WorkState::Open;
                 work.outcome = None;
-                work.block_reason = None;
+                match surviving {
+                    Some(question_id) => {
+                        work.state = WorkState::Blocked;
+                        work.block_reason = Some(format!("question {question_id}"));
+                    }
+                    None => {
+                        work.state = WorkState::Open;
+                        work.block_reason = None;
+                    }
+                }
                 work.changed_seq = seq;
             }
             EventPayload::QuestionAsked { question } => {

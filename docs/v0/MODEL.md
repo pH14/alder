@@ -282,6 +282,10 @@ but Alder does not define or validate its schema.
 - Work with an unanswered question cannot be unblocked.
 - Done or dropped work can be reopened with a reason when the requirement is
   still the same.
+- Reopening lands in `open`, unless an unanswered question survives the
+  transition, in which case it lands in `blocked` with `block_reason` set to
+  that question — the same rule `unblock` already enforces, so the two paths
+  back to `open` agree instead of one silently dropping a pending question.
 - Reopening preserves all prior attempts and outcomes.
 - Work with an active attempt cannot be edited in ways that change its
   dependencies or checks.
@@ -535,8 +539,12 @@ question, stranded or not, with its complete history.
 
 Stranding is derived from the current work state, never stored. There is no
 event kind, flag, or repair step for it, which is what makes reopening correct
-for free: `work reopen` returns the work to `open` and its unanswered questions
-become actionable again in the same fold.
+for free: `work reopen` returns the work to a non-terminal state and its
+unanswered questions become actionable again in the same fold. That state is
+`open`, unless a question is still unanswered, in which case it is `blocked`
+on that question — reopening never hands back work that looks actionable but
+has a decision silently pending, matching what `unblock` already refuses to
+do.
 
 Answering a stranded question remains legal. Recording a late ruling is
 harmless, and answers already support revision. `work drop` and `work finish`

@@ -857,8 +857,13 @@ fn terminal_work_strands_its_questions_until_it_is_reopened() {
     assert!(project.human(&["show", &question]).contains("stranded"));
 
     // Reopening is the whole round trip: no repair event, and the question is
-    // actionable again because visibility was never stored.
+    // actionable again because visibility was never stored. The question
+    // survives unanswered, so the work lands in `blocked` rather than `open`.
     project.success(&["work", "reopen", &work, "--why", "requirement stands"]);
+    assert_eq!(
+        project.success(&["show", &work])["current"]["state"],
+        "blocked"
+    );
     let status = project.success(&["status"]);
     assert_eq!(status["waiting_on_human"][0]["id"], question);
     assert_eq!(
@@ -872,6 +877,47 @@ fn terminal_work_strands_its_questions_until_it_is_reopened() {
     let shown = project.success(&["show", &question]);
     assert_eq!(shown["current"]["answer"], "masked digest");
     assert_eq!(shown["current"]["stranded"], "work dropped");
+}
+
+#[test]
+fn reopen_lands_in_blocked_when_an_unanswered_question_survives() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&["work", "add", "--title", "Ship the digest"]),
+        "work_id",
+    );
+    let question = string(
+        &project.success(&["work", "ask", &work, "Masked digest, or wait for AA-6?"]),
+        "question_id",
+    );
+    project.success(&["work", "drop", &work, "--why", "requirement withdrawn"]);
+
+    // The question survives the reopen unanswered, so the work must not come
+    // back as plain `open` the way it would if nothing were pending: that
+    // would let a dropped-with-a-question item lose the outstanding decision,
+    // disagreeing with `work unblock`'s rejection for the identical situation.
+    let reopened = project.success(&["work", "reopen", &work, "--why", "requirement stands"]);
+    assert_eq!(reopened["schema"], "alder.work.reopen.v0");
+    let shown = project.success(&["show", &work]);
+    assert_eq!(shown["current"]["state"], "blocked");
+    assert_eq!(
+        shown["current"]["block_reason"],
+        format!("question {question}")
+    );
+
+    // The surviving question blocks progress exactly like `work unblock` does.
+    assert_eq!(
+        project.failure(&["work", "unblock", &work, "--why", "guessing"])["code"],
+        "unanswered_question"
+    );
+
+    // Once answered, the ordinary unblock path returns the work to `open`.
+    project.success(&["question", "answer", &question, "masked digest"]);
+    project.success(&["work", "unblock", &work, "--why", "decided"]);
+    assert_eq!(
+        project.success(&["show", &work])["current"]["state"],
+        "open"
+    );
 }
 
 #[test]
