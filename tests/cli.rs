@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command as ProcessCommand,
+    process::{Command as ProcessCommand, Output},
 };
 
 use assert_cmd::Command;
@@ -130,6 +130,95 @@ impl TestProject {
             .map(ToOwned::to_owned)
             .collect();
         (serde_json::from_slice(&output.stdout).unwrap(), recorded)
+    }
+
+    /// A second working copy of the same shared log, adopted through `init`.
+    /// It is a genuinely separate writer: its own repository, its own process,
+    /// the same remote ref.
+    fn rival(&self) -> PathBuf {
+        let rival = self.temporary.path().join("rival");
+        let remote = self.temporary.path().join("remote.git");
+        git(self.temporary.path(), &["init", "--quiet", path(&rival)]);
+        git(&rival, &["remote", "add", "origin", path(&remote)]);
+        let initialized = Command::cargo_bin("alder")
+            .unwrap()
+            .current_dir(&rival)
+            .args(["init", "--prefix", "hm", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            initialized.status.success(),
+            "{}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+        rival
+    }
+
+    /// Run `arguments` and let a rival writer append at the exact moment this
+    /// command reaches its linearization point.
+    ///
+    /// The shim is a real `git` first on the child's PATH. When it sees the
+    /// push that publishes this command's event commit, it runs the rival's
+    /// whole command to completion and only then hands the push to the real
+    /// Git — which finds the ref moved and rejects it. That is the live race:
+    /// a writer reads a head, validates against it, builds its commit, and
+    /// loses the compare-and-append to someone who got there first.
+    fn losing(&self, arguments: &[&str], rival: &Path, rival_arguments: &[&str]) -> Output {
+        let shim = self.temporary.path().join("race-shim");
+        fs::create_dir_all(&shim).unwrap();
+        let script = self.temporary.path().join("rival.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncd '{}' || exit 1\nexec '{}' {}\n",
+                path(rival),
+                path(&assert_cmd::cargo::cargo_bin("alder")),
+                rival_arguments
+                    .iter()
+                    .map(|argument| format!("'{argument}'"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            shim.join("git"),
+            "#!/bin/sh\n\
+             case \" $* \" in\n\
+             *\" push \"*)\n\
+             if [ ! -e \"$ALDER_RACE_MARKER\" ]; then\n\
+             : > \"$ALDER_RACE_MARKER\"\n\
+             PATH=\"$ALDER_INHERITED_PATH\" sh \"$ALDER_RACE_RIVAL\" >/dev/null 2>&1 || exit 1\n\
+             fi\n\
+             ;;\n\
+             esac\n\
+             PATH=\"$ALDER_INHERITED_PATH\" exec git \"$@\"\n",
+        )
+        .unwrap();
+        let mode = ProcessCommand::new("chmod")
+            .args(["+x", path(&shim.join("git"))])
+            .status()
+            .unwrap();
+        assert!(mode.success());
+        let marker = self.temporary.path().join("race-marker");
+        let _ = fs::remove_file(&marker);
+
+        let inherited = std::env::var("PATH").unwrap();
+        let output = self
+            .command()
+            .args(arguments)
+            .env("PATH", format!("{}:{inherited}", path(&shim)))
+            .env("ALDER_INHERITED_PATH", &inherited)
+            .env("ALDER_RACE_RIVAL", &script)
+            .env("ALDER_RACE_MARKER", &marker)
+            .output()
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "the rival never ran, so nothing raced: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
     }
 
     /// Discard the record cache, so the next read has to decode event bodies
@@ -1580,6 +1669,125 @@ fn refresh_reports_change_without_counting_metadata_churn() {
             .contains("changed since the previous refresh")
     );
     assert_eq!(project.success(&["refresh"])["changed"], false);
+}
+
+/// The live incident of al-pass-64, reproduced and pinned exactly as it
+/// behaves today: the leader ran `pass end` while a worker was appending its
+/// own milestones, lost the compare-and-append, and got a failure shaped like
+/// a receipt — a line about the log, then a pretty JSON object whose last
+/// field is the sequence it lost at. Nothing is written, the pass stays open,
+/// and a caller reading the terminal has to already know what it is looking
+/// at to see that.
+#[test]
+fn a_pass_end_that_loses_the_race_writes_nothing() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&["work", "add", "--title", "Raced"]),
+        "work_id",
+    );
+    let attempt = string(&project.success(&["work", "start", &work]), "attempt_id");
+    let pass = string(
+        &project.success(&[
+            "loop",
+            "wake",
+            "--engine",
+            "claude",
+            "--handle",
+            "tmux:alder-leader",
+        ]),
+        "pass_id",
+    );
+    let rival = project.rival();
+
+    let lost = project.losing(
+        &[
+            "pass",
+            "end",
+            "--outcome",
+            "ok",
+            "--report",
+            "swept the frontier",
+            "--wake",
+            "20m",
+        ],
+        &rival,
+        &["attempt", "edit", &attempt, "--note", "worker milestone"],
+    );
+    assert_eq!(lost.status.code(), Some(1));
+    assert!(lost.stdout.is_empty());
+    let stderr = String::from_utf8(lost.stderr).unwrap();
+    let (first, rest) = stderr.split_once('\n').unwrap();
+    // The message describes the log, not the command: it never says that this
+    // mutation wrote nothing.
+    assert_eq!(
+        first,
+        "error [head_conflict]: the shared log advanced before the record was appended"
+    );
+    // And the rest is a pretty JSON document — the same shape a successful
+    // command prints — whose last field is the sequence the writer lost at.
+    let context: Value = serde_json::from_str(rest).unwrap();
+    assert_eq!(context["expected_head"]["seq"], 3);
+    assert_eq!(context["current_head"]["seq"], 4);
+    assert_eq!(rest.trim_end().lines().last().unwrap(), "}");
+
+    // Nothing was written, so the pass is still open and unreported.
+    let open = project.success(&["status"])["loop"].clone();
+    assert_eq!(open["open_pass"]["id"], pass);
+    assert!(open["last_pass"].is_null());
+
+    // The same loss over the JSON channel: one document on standard output,
+    // per the output contract, carrying nothing that marks it as a failure
+    // beyond its schema and code.
+    let structured = project.losing(
+        &[
+            "pass",
+            "end",
+            "--outcome",
+            "ok",
+            "--report",
+            "swept the frontier",
+            "--wake",
+            "20m",
+            "--json",
+        ],
+        &rival,
+        &["attempt", "edit", &attempt, "--note", "another milestone"],
+    );
+    assert_eq!(structured.status.code(), Some(1));
+    assert!(structured.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&structured.stdout).unwrap();
+    assert_eq!(document["schema"], "alder.error.v0");
+    assert!(document.get("ok").is_none());
+    assert_eq!(document["code"], "head_conflict");
+    assert_eq!(document["context"]["expected_head"]["seq"], 4);
+    assert_eq!(document["context"]["current_head"]["seq"], 5);
+
+    // A33: rereading and rerunning settles it, and records exactly one ending.
+    let ended = project.success(&[
+        "pass",
+        "end",
+        "--outcome",
+        "ok",
+        "--report",
+        "swept the frontier",
+        "--wake",
+        "20m",
+    ]);
+    assert_eq!(ended["pass_id"], pass);
+    let last = project.success(&["status"])["loop"]["last_pass"].clone();
+    assert_eq!(last["id"], pass);
+    assert_eq!(last["report_line"], "swept the frontier");
+    let endings = project.success(&["show", &pass])["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "pass.ended")
+        .count();
+    assert_eq!(endings, 1);
+    assert_eq!(
+        project.failure(&["pass", "end", "--outcome", "ok"])["code"],
+        "no_open_pass"
+    );
 }
 
 /// The Git subcommand of each recorded call, which is what a cost assertion
