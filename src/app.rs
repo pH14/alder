@@ -61,7 +61,7 @@ impl App {
                 &mut context,
                 args.changes.as_deref(),
                 args.full,
-                args.section,
+                &args.section,
             ),
             Command::Next(args) => next(&mut context, args.changes.as_deref()),
             Command::Show(args) => show(&context, &args.id),
@@ -639,7 +639,7 @@ fn status(
     context: &mut Context,
     changes: Option<&str>,
     full: bool,
-    section: Option<StatusSection>,
+    sections: &[StatusSection],
 ) -> Result<Output> {
     let (state, hypothetical, source) = overlay_state(context, changes)?;
     let mut observations = context.projection.observations()?;
@@ -755,16 +755,18 @@ fn status(
             .map(event_summary)
             .collect();
         object.insert("recent_events".to_owned(), json!(recent_events));
-    } else if let Some(section) = section {
-        let value = match section {
-            StatusSection::Attention => json!(findings),
-            StatusSection::Handoffs => json!(handoffs),
-            StatusSection::InFlight => json!(in_flight),
-            StatusSection::Ready => json!(ready),
-            StatusSection::WaitingOnHuman => json!(questions),
-            StatusSection::Blocked => json!(blocked),
-        };
-        object.insert(section.as_str().to_owned(), value);
+    } else {
+        for section in selected_status_sections(sections) {
+            let value = match section {
+                StatusSection::Attention => json!(findings),
+                StatusSection::Handoffs => json!(handoffs),
+                StatusSection::InFlight => json!(in_flight),
+                StatusSection::Ready => json!(ready),
+                StatusSection::WaitingOnHuman => json!(questions),
+                StatusSection::Blocked => json!(blocked),
+            };
+            object.insert(section.as_str().to_owned(), value);
+        }
     }
     let mut lines = Vec::new();
     if hypothetical {
@@ -866,16 +868,22 @@ fn status(
             }),
         );
         human_section(&mut lines, "blocked", blocked_lines());
-    } else if let Some(section) = section {
-        match section {
-            StatusSection::Attention => human_section(&mut lines, "attention", attention_lines()),
-            StatusSection::Handoffs => human_section(&mut lines, "handoffs", handoffs_lines()),
-            StatusSection::InFlight => human_section(&mut lines, "in flight", in_flight_lines()),
-            StatusSection::Ready => human_section(&mut lines, "ready", ready_lines()),
-            StatusSection::WaitingOnHuman => {
-                human_section(&mut lines, "waiting on human", waiting_on_human_lines())
+    } else if !sections.is_empty() {
+        for section in selected_status_sections(sections) {
+            match section {
+                StatusSection::Attention => {
+                    human_section(&mut lines, "attention", attention_lines())
+                }
+                StatusSection::Handoffs => human_section(&mut lines, "handoffs", handoffs_lines()),
+                StatusSection::InFlight => {
+                    human_section(&mut lines, "in flight", in_flight_lines())
+                }
+                StatusSection::Ready => human_section(&mut lines, "ready", ready_lines()),
+                StatusSection::WaitingOnHuman => {
+                    human_section(&mut lines, "waiting on human", waiting_on_human_lines())
+                }
+                StatusSection::Blocked => human_section(&mut lines, "blocked", blocked_lines()),
             }
-            StatusSection::Blocked => human_section(&mut lines, "blocked", blocked_lines()),
         }
     } else {
         human_section(
@@ -892,6 +900,21 @@ fn status(
         );
     }
     Ok(Output::new(json, lines.join("\n")))
+}
+
+fn selected_status_sections(
+    requested: &[StatusSection],
+) -> impl Iterator<Item = StatusSection> + '_ {
+    [
+        StatusSection::Attention,
+        StatusSection::Handoffs,
+        StatusSection::InFlight,
+        StatusSection::Ready,
+        StatusSection::WaitingOnHuman,
+        StatusSection::Blocked,
+    ]
+    .into_iter()
+    .filter(move |section| requested.contains(section))
 }
 
 /// The loop's desired state and its two interesting passes. The driver reads

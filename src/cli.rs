@@ -60,17 +60,18 @@ pub struct OverlayArgs {
 }
 
 /// `status` is the index by default: the loop line plus a per-section count.
-/// `--full` expands every section back in, `--section` expands exactly one.
+/// `--full` expands every section back in, `--section` expands requested
+/// sections.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
     #[arg(long = "with", value_name = "CHANGES")]
     pub changes: Option<String>,
     /// Show every section in full, as well as recent events.
-    #[arg(long, conflicts_with = "section")]
+    #[arg(long)]
     pub full: bool,
-    /// Show one section in full alongside the counts.
-    #[arg(long, value_enum)]
-    pub section: Option<StatusSection>,
+    /// Show one or more sections in full, replacing the counts index.
+    #[arg(long, value_enum, action = clap::ArgAction::Append)]
+    pub section: Vec<StatusSection>,
 }
 
 /// The six sections `status` counts by default. Names match the JSON keys

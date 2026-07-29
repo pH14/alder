@@ -133,7 +133,7 @@ present the local projection as current.
 
 ## Orientation
 
-### `alder status [--with <changes>] [--full | --section <name>]`
+### `alder status [--with <changes>] [--full] [--section <name> ...]`
 
 The default output is an index, not a report: the loop line plus a count for
 each of six sections. A drained log — nothing anywhere — costs a few dozen
@@ -195,13 +195,14 @@ attention
 ```
 
 In `--json`, that adds a matching top-level key — here, `attention` — holding
-the array. The other five section keys stay absent; a caller that wants more
-than one issues more than one `--section` call, or reaches for `--full`.
+the array. The other five section keys stay absent. Repeat `--section` to add
+several keys at once; they are rendered in canonical order and duplicate names
+are ignored.
 
 `--full` expands every section, matching today's full pack, and is the only
 way to see `recent_events` — the last ten log entries, dropped from the
 default pack entirely because the six sections already fold events into
-state. `--full` and `--section` are mutually exclusive.
+state. If combined with `--section`, `--full` wins.
 
 `status` shows observation times and command failures. Alder does not derive a
 stale-attempt classification; the caller judges elapsed time. A failed refresh
