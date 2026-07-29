@@ -524,9 +524,40 @@ fn status_defaults_to_counts_and_expands_only_on_request() {
         assert!(sectioned.get("recent_events").is_none());
     }
 
-    // `--full` and `--section` name mutually exclusive levels of detail.
-    let conflict = project.failure(&["status", "--full", "--section", "ready"]);
-    assert_eq!(conflict["code"], "invalid_command");
+    // Repeated sections are deduplicated and rendered in canonical order,
+    // regardless of the order in which the flags were supplied.
+    let selected = project.success(&[
+        "status",
+        "--section",
+        "blocked",
+        "--section",
+        "ready",
+        "--section",
+        "blocked",
+    ]);
+    assert_eq!(selected["ready"], full["ready"]);
+    assert_eq!(selected["blocked"], full["blocked"]);
+    for other in ["attention", "handoffs", "in_flight", "waiting_on_human"] {
+        assert!(selected.get(other).is_none(), "{other} leaked");
+    }
+    let selected_human = project.human(&[
+        "status",
+        "--section",
+        "blocked",
+        "--section",
+        "ready",
+        "--section",
+        "blocked",
+    ]);
+    let ready_at = selected_human.find("\nready\n").unwrap();
+    let blocked_at = selected_human.find("\nblocked\n").unwrap();
+    assert!(ready_at < blocked_at);
+    assert_eq!(selected_human.matches("\nblocked\n").count(), 1);
+
+    // `--full` remains the all-sections view and wins when section flags are
+    // also present.
+    let full_with_section = project.success(&["status", "--full", "--section", "ready"]);
+    assert_eq!(full_with_section, full);
 }
 
 #[test]

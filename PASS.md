@@ -16,9 +16,10 @@ Use `./target/debug/alder` for every alder command.
 1. **Sync.** `alder status --json` reads as an index: the loop line plus a
    count for `attention`, `handoffs`, `in_flight`, `ready`,
    `waiting_on_human`, and `blocked`. Any nonzero count obligates fetching
-   that section — `alder status --section <name>`, or `--full` for more than
-   one — before this pass may end. `alder refresh` runs the tmux observer,
-   so status reflects live worker sessions.
+   that section — `alder status --section <name>` (repeatable for several,
+   in canonical order), or `--full` for all — before this pass may end.
+   `--full` wins if combined with `--section`. `alder refresh` runs the tmux
+   observer, so status reflects live worker sessions.
 2. **Reconcile.** `alder reconcile`. Apply repairs through the commands it
    names: a `missing` finding means the worker session died — end the
    attempt as it suggests; a `bindable` finding means a session lost its
