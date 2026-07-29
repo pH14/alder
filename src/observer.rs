@@ -15,7 +15,7 @@ use wait_timeout::ChildExt;
 
 use crate::{
     config::ObserverConfig,
-    domain::{AttemptState, ProjectState, validate_handle},
+    domain::{AttemptState, ProjectState, WorkState, validate_handle},
     error::{AlderError, Result},
     projection::{
         ObservationRun, ObservationStatus, ObservedHandle, Projection, replace_observation_kind,
@@ -557,6 +557,30 @@ pub fn reconcile(
                     metadata: observation.metadata.clone(),
                 });
             } else if all_configured_known {
+                // An attempt that has never held a handle is not a worker that
+                // died; it is a worker that was never launched — a `work
+                // start` from a phone, or a crash between recording the
+                // attempt and spawning. While its work is still live the
+                // repair is to launch one, so the suggestion is the dispatch
+                // rather than a funeral. (A worker that *was* bound and then
+                // vanished is the `missing` finding, and still is.)
+                let spawnable = attempt.bound_seq.is_none()
+                    && state.work.get(&attempt.work_id).is_some_and(|work| {
+                        matches!(work.state, WorkState::Open | WorkState::Blocked)
+                    });
+                if spawnable {
+                    findings.push(ReconcileFinding {
+                        kind: "unspawned".to_owned(),
+                        attempt_id: Some(attempt.id.clone()),
+                        handle: None,
+                        status: "absent".to_owned(),
+                        detail: "an open attempt has never been bound to a handle; no worker was launched"
+                            .to_owned(),
+                        suggested_command: Some(format!("alderd spawn {}", attempt.work_id)),
+                        metadata: json!({}),
+                    });
+                    continue;
+                }
                 findings.push(ReconcileFinding {
                     kind: "not_started".to_owned(),
                     attempt_id: Some(attempt.id.clone()),
@@ -662,6 +686,22 @@ mod tests {
             metadata: json!({"source": "test"}),
             observed_at: "2026-01-01T00:00:00Z".to_owned(),
             detail: None,
+        }
+    }
+
+    fn work(id: &str, state: WorkState) -> crate::domain::Work {
+        crate::domain::Work {
+            id: id.to_owned(),
+            title: format!("work {id}"),
+            spec: None,
+            priority: 0,
+            state,
+            block_reason: None,
+            outcome: None,
+            opened_seq: 1,
+            changed_seq: 1,
+            requires: Vec::new(),
+            checks: Vec::new(),
         }
     }
 
@@ -1094,6 +1134,77 @@ mod tests {
                 &known,
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_attempt_that_was_never_bound_is_told_to_spawn_one() {
+        let configured = BTreeSet::from(["tmux".to_owned()]);
+        let known = configured.clone();
+        let mut state = ProjectState::default();
+        state.attempts.insert(
+            "active".to_owned(),
+            attempt("active", AttemptState::Starting, None),
+        );
+        state.work.insert(
+            "active-work".to_owned(),
+            work("active-work", WorkState::Open),
+        );
+
+        let findings = reconcile(&state, &[], &configured, &known);
+        assert_eq!(finding_kinds(&findings), vec!["unspawned"]);
+        assert_eq!(
+            findings[0].suggested_command.as_deref(),
+            Some("alderd spawn active-work")
+        );
+
+        // Blocked work is spawnable too: a ruling arrives with the launch.
+        state.work.insert(
+            "active-work".to_owned(),
+            work("active-work", WorkState::Blocked),
+        );
+        assert_eq!(
+            finding_kinds(&reconcile(&state, &[], &configured, &known)),
+            vec!["unspawned"]
+        );
+
+        // Work that is over is not: end the attempt instead.
+        state.work.insert(
+            "active-work".to_owned(),
+            work("active-work", WorkState::Done),
+        );
+        let over = reconcile(&state, &[], &configured, &known);
+        assert_eq!(finding_kinds(&over), vec!["not_started"]);
+        assert!(
+            over[0]
+                .suggested_command
+                .as_deref()
+                .is_some_and(|command| command.starts_with("alder attempt end"))
+        );
+
+        // A handle that was bound and then vanished stays `missing`: the
+        // worker existed, so spawning a second one is not the repair.
+        let mut died = ProjectState::default();
+        died.attempts.insert(
+            "active".to_owned(),
+            attempt("active", AttemptState::Active, Some("tmux:gone")),
+        );
+        died.work.insert(
+            "active-work".to_owned(),
+            work("active-work", WorkState::Open),
+        );
+        assert_eq!(
+            finding_kinds(&reconcile(
+                &died,
+                &[observation(
+                    "tmux:gone",
+                    Some("active"),
+                    ObservationStatus::Absent
+                )],
+                &configured,
+                &known,
+            )),
+            vec!["missing"]
         );
     }
 }

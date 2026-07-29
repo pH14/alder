@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# End-to-end check of goal-mode spawn, in a sandbox of its own.
+# End-to-end check of `alderd spawn`, in a sandbox of its own.
 #
-#   scripts/tests/verify-goal-mode.sh [repo-under-test] [alder-binary]
+#   scripts/tests/verify-spawn.sh [repo-under-test] [alder-binary] [alderd-binary]
 #
-# Both arguments default to this checkout: the repository this script lives
-# in, and its target/debug/alder, built if it is not there yet. A clean
-# checkout therefore runs it with no arguments and no setup beyond a Rust
+# All three arguments default to this checkout: the repository this script
+# lives in and its target/debug binaries, built if they are not there yet. A
+# clean checkout therefore runs it with no arguments and no setup beyond a Rust
 # toolchain, git, tmux and jq.
+#
+# What it proves, which unit tests cannot: that a real tmux pane really does
+# receive the goal as one argv element, that the pane outlives a one-shot
+# engine, that the worktree is really cut and really carries `alder`, that the
+# attempt is really bound with its tier stamped — and that the whole dispatch
+# types nothing and waits for nothing.
 #
 # Everything happens under one throwaway directory: its own git repo, its own
 # bare "remote" holding the alder log, its own work item, and its own tmux
@@ -21,8 +27,10 @@
 # server and killed every session on the machine.
 #
 # So: one explicit private socket (tmux -S "$SOCK"), $TMUX unset on every tmux
-# call, and that includes the calls made by worker-spawn.sh itself — a PATH
-# shim puts them on the same socket without editing the script under test.
+# call, and that includes the calls made by alderd itself — a PATH shim puts
+# them on the same socket without editing the binary under test. That shim also
+# logs every tmux invocation, which is how "injects nothing via send-keys" is
+# checked rather than asserted.
 #
 # Teardown is narrow on purpose. It kills ONE session, by exact name, and only
 # after asserting that the sandbox server holds nothing but that session — if
@@ -41,16 +49,19 @@ done
 
 REPO_UNDER_TEST=$(cd "${1:-$ROOT}" && pwd)
 ALDER=${2:-$REPO_UNDER_TEST/target/debug/alder}
-if [ ! -x "$ALDER" ]; then
+ALDERD=${3:-$REPO_UNDER_TEST/target/debug/alderd}
+for binary in "$ALDER" "$ALDERD"; do
+  [ -x "$binary" ] && continue
   if [ -n "${2:-}" ]; then
-    echo "not an executable: $ALDER" >&2
+    echo "not an executable: $binary" >&2
     exit 2
   fi
-  echo "building $ALDER"
-  (cd "$REPO_UNDER_TEST" && cargo build --bin alder)
-fi
+  echo "building $binary"
+  (cd "$REPO_UNDER_TEST" && cargo build --bin "$(basename "$binary")")
+done
 # Absolute, because the run works from inside the sandbox.
 ALDER=$(cd "$(dirname "$ALDER")" && pwd)/$(basename "$ALDER")
+ALDERD=$(cd "$(dirname "$ALDERD")" && pwd)/$(basename "$ALDERD")
 
 REAL_TMUX=$(command -v tmux)
 # The real server's socket, so the run can prove it left it alone. Empty when
@@ -102,6 +113,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+fail() {
+  echo "FAIL: $1" >&2
+  exit 1
+}
+
 # What the real server looked like before we touched anything. Read-only, and
 # compared again at the end: the regression this run exists to disprove is
 # "the sandbox reached the real server".
@@ -109,10 +125,13 @@ REAL_BEFORE=$(real_sessions)
 
 mkdir -p "$SB/bin"
 
-# Every tmux call worker-spawn.sh makes lands on the sandbox server. The shim
-# is what lets the script under test run unmodified.
+# Every tmux call alderd makes lands on the sandbox server, and every one of
+# them is logged: what alderd does to a terminal is an assertion here, not a
+# claim.
+TMUX_LOG=$SB/tmux-calls.log
 cat >"$SB/bin/tmux" <<SHIM
 #!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$TMUX_LOG"
 unset TMUX TMUX_PANE
 exec "$REAL_TMUX" -S "$SOCK" "\$@"
 SHIM
@@ -127,8 +146,6 @@ export TMUX_TMPDIR=$SOCKDIR
 git init -q --bare "$SB/store.git"
 
 git init -q -b main "$SB/repo"
-mkdir -p "$SB/repo/scripts"
-cp "$REPO_UNDER_TEST/scripts/worker-spawn.sh" "$SB/repo/scripts/"
 cp "$REPO_UNDER_TEST/WORKER.md" "$SB/repo/"
 git -C "$SB/repo" add -A
 git -C "$SB/repo" -c user.email=v@x -c user.name=v commit -qm "sandbox"
@@ -137,83 +154,125 @@ git -C "$SB/repo" remote add scratch "$SB/store.git"
 cd "$SB/repo"
 "$ALDER" init --prefix wv --remote scratch >/dev/null
 
-WORK=$("$ALDER" work add --title "Sandbox item for goal-mode verification" \
+WORK=$("$ALDER" work add --title "Sandbox item for spawn verification" \
   --spec "docs/SANDBOX.md" \
   --check "tests:the sandbox check description reaches the worker" \
   --check "report:the second check reaches the worker too" \
   --json | jq -r '.work_id')
-ATTEMPT=$("$ALDER" work start "$WORK" --json | jq -r '.attempt_id')
-echo "sandbox work=$WORK attempt=$ATTEMPT"
+echo "sandbox work=$WORK"
 echo "sandbox tree=$SB"
 echo "sandbox tmux socket=$SOCK (real server socket=$REAL_SOCK)"
 
-# The stub engine reads exactly the line that is typed at it and records it,
-# then stays alive so the session is observable like any live worker.
+# The stub engine records the argv it was handed — one line per argument, so
+# a goal that arrived as several arguments is visible as several lines — and
+# then EXITS. What happens after it exits is the point: the pane must survive.
 cat >"$SB/stub.sh" <<STUB
 #!/usr/bin/env bash
-IFS= read -r line
-printf '%s\n' "\$line" >"$SB/received.txt"
-sleep 300
+printf '%s\n' "\$#" >"$SB/argc.txt"
+printf '%s\n' "\$@" >"$SB/argv.txt"
 STUB
 chmod +x "$SB/stub.sh"
+
+# An unknown tier must be refused before anything exists. No attempt, no
+# worktree, no session — this is the check that a typo cannot silently launch
+# a worker at whatever the CLI defaults to.
+if ALDER_BIN=$ALDER "$ALDERD" spawn "$WORK" gpt-5.6-luna >"$SB/bogus.out" 2>&1; then
+  fail "an unknown tier was accepted: $(cat "$SB/bogus.out")"
+fi
+grep -q "unknown tier" "$SB/bogus.out" ||
+  fail "the unknown-tier error does not say so: $(cat "$SB/bogus.out")"
+for rung in luna terra sol sonnet opus fable; do
+  grep -q "$rung" "$SB/bogus.out" || fail "the unknown-tier error omits $rung"
+done
+[ "$("$ALDER" status --section in_flight --json | jq '.in_flight | length')" -eq 0 ] ||
+  fail "a rejected tier still recorded an attempt"
+[ -d "$SB/alder-work-$WORK" ] && fail "a rejected tier still cut a worktree"
+[ -s "$TMUX_LOG" ] && fail "a rejected tier still touched tmux"
 
 # From here on there is a session teardown may kill — and only this one.
 SESSION_NAME=alder-work-$WORK
 
+STARTED=$(date +%s)
 ALDER_BIN=$ALDER ALDER_WORKER_CMD="$SB/stub.sh" \
-  "$SB/repo/scripts/worker-spawn.sh" "$WORK" "$ATTEMPT" claude-opus-5
+  "$ALDERD" spawn "$WORK" luna
+ELAPSED=$(( $(date +%s) - STARTED ))
 
+# The stub exits immediately, so its argv file appears at once. Waiting for it
+# is not a sleep in the spawn path; it is this script waiting for a process
+# alderd deliberately does not wait for.
 for _ in $(seq 1 20); do
-  [ -s "$SB/received.txt" ] && break
-  sleep 1
+  [ -s "$SB/argv.txt" ] && break
+  sleep 0.2
 done
+
+ATTEMPT=$("$ALDER" status --section in_flight --json | jq -r '.in_flight[0].id')
 
 echo "=== session list (sandbox tmux server) ==="
 tmux list-sessions -F '#{session_name}'
-echo "=== goal the session actually received ==="
-cat "$SB/received.txt"
-echo "=== pane ==="
-tmux capture-pane -pt "alder-work-$WORK" | head -5
+echo "=== argv the engine actually received ==="
+cat "$SB/argv.txt"
+echo "=== every tmux call alderd made ==="
+cat "$TMUX_LOG"
 echo "=== attempt after spawn ==="
 "$ALDER" show "$ATTEMPT" --json | jq -c '.current | {handle, metadata}'
 
-fail() {
-  echo "FAIL: $1" >&2
-  exit 1
-}
-[ -s "$SB/received.txt" ] || fail "the session received no goal"
-received=$(cat "$SB/received.txt")
-[ "$(wc -l <"$SB/received.txt")" -eq 1 ] || fail "goal was not a single line"
-case $received in
-*"$WORK"*) ;; *) fail "goal omits the work id" ;;
-esac
-case $received in
-*"$ATTEMPT"*) ;; *) fail "goal omits the attempt id" ;;
-esac
-case $received in
-*"Sandbox item for goal-mode verification"*) ;; *) fail "goal omits the title" ;;
-esac
-case $received in
-*"docs/SANDBOX.md"*) ;; *) fail "goal omits the spec" ;;
-esac
-case $received in
-*"the sandbox check description reaches the worker"*) ;; *) fail "goal omits check tests" ;;
-esac
-case $received in
-*"the second check reaches the worker too"*) ;; *) fail "goal omits check report" ;;
-esac
-case $received in
-*"cargo clippy --workspace --all-targets"*) ;; *) fail "goal omits the gates" ;;
-esac
+# The goal is one argument, and it is the whole brief.
+[ -s "$SB/argv.txt" ] || fail "the engine received no goal"
+[ "$(cat "$SB/argc.txt")" = "1" ] ||
+  fail "the goal arrived as $(cat "$SB/argc.txt") arguments, not one"
+[ "$(wc -l <"$SB/argv.txt")" -eq 1 ] || fail "the goal was not a single line"
+received=$(cat "$SB/argv.txt")
+for part in "$WORK" "$ATTEMPT" "Sandbox item for spawn verification" \
+  "docs/SANDBOX.md" "the sandbox check description reaches the worker" \
+  "the second check reaches the worker too" "cargo clippy --workspace --all-targets" \
+  "Read WORKER.md"; do
+  case $received in
+  *"$part"*) ;;
+  *) fail "goal omits: $part" ;;
+  esac
+done
+
+# Nothing was typed at the session, and nothing waited for it to boot.
+if grep -q "send-keys" "$TMUX_LOG"; then
+  fail "the spawn used send-keys: $(grep send-keys "$TMUX_LOG")"
+fi
+[ "$ELAPSED" -lt 5 ] ||
+  fail "the spawn took ${ELAPSED}s: something on the path is sleeping"
+
+# The pane outlives the engine: the stub has exited, and the session is still
+# there for the observer to see and for a ruling to be relayed into. Half a
+# second of settling is what makes this an assertion rather than a race — tmux
+# is not slow about destroying a session whose last pane exited.
+[ ! -s "$SB/argc.txt" ] && fail "the stub never ran"
+sleep 0.5
+tmux has-session -t "=$SESSION_NAME" 2>/dev/null ||
+  fail "the session died with the engine; the pane does not end '; exec bash'"
+
+# The worktree, the branch, and what the worker was given to reach the log.
 [ -d "$SB/alder-work-$WORK" ] || fail "worktree missing"
 [ "$(git -C "$SB/repo" rev-parse --abbrev-ref "work/$WORK")" = "work/$WORK" ] ||
   fail "branch missing"
+[ -x "$SB/alder-work-$WORK/.alder/bin/alder" ] || fail "the worker has no alder"
+[ -f "$SB/alder-work-$WORK/.alder/config.json" ] || fail "the worker has no config"
+[ -e "$SB/alder-work-$WORK/.alder/bin/alderd" ] &&
+  fail "the worker was given alderd: workers cannot dispatch"
+
+# The attempt carries the handle and the whole tier, model and effort both.
 "$ALDER" show "$ATTEMPT" --json |
   jq -e '.current.handle == "tmux:alder-work-'"$WORK"'"' >/dev/null ||
   fail "handle not bound"
 "$ALDER" show "$ATTEMPT" --json |
-  jq -e '.current.metadata.engine == "claude-opus-5"' >/dev/null ||
-  fail "engine metadata not stamped"
+  jq -e '.current.metadata | .engine == "gpt-5.6-luna" and .effort == "high" and .tier == "luna"' \
+    >/dev/null ||
+  fail "the attempt does not carry model, effort and tier"
+
+# A second spawn at a live worker is refused, and changes nothing.
+if ALDER_BIN=$ALDER ALDER_WORKER_CMD="$SB/stub.sh" \
+  "$ALDERD" spawn "$WORK" luna >"$SB/second.out" 2>&1; then
+  fail "a second worker was spawned onto a live one"
+fi
+[ "$("$ALDER" status --section in_flight --json | jq '.in_flight | length')" -eq 1 ] ||
+  fail "the refused second spawn left an extra attempt"
 
 # The sandbox session exists on the sandbox server, alone, and nowhere else.
 # This is the same assertion teardown makes before it kills anything.
@@ -231,4 +290,5 @@ echo "=== real tmux server, unchanged across the run ==="
 printf '%s\n' "$REAL_AFTER"
 echo
 RUN_STATUS=pass
-echo "PASS: goal-mode spawn delivered spec, checks and gates to a live session"
+echo "PASS: alderd spawn delivered the goal as argv in ${ELAPSED}s, typed nothing," \
+  "left a live pane behind, and stamped luna/gpt-5.6-luna/high on the attempt"
