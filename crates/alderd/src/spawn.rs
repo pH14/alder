@@ -246,13 +246,39 @@ pub fn pane_command(engine: &[String], goal: &str) -> String {
 
 /// The engine invocation, before the goal is appended: the tier's own command,
 /// or whatever [`WORKER_CMD_ENV`] replaced it with.
-pub fn engine_command(tier: &'static Tier, override_command: Option<&str>) -> Vec<String> {
+pub fn engine_command(
+    tier: &'static Tier,
+    git_common_dir: Option<&str>,
+    override_command: Option<&str>,
+) -> Vec<String> {
     match override_command {
         Some(command) => command.split_whitespace().map(str::to_owned).collect(),
         None => {
-            let mut words = tier.command("");
+            let mut words = tier.command("", git_common_dir);
             words.pop();
             words
+        }
+    }
+}
+
+/// The dispatching project's `.git`, which a worker's linked worktree keeps
+/// its index, objects and branch ref inside. Absolute, because it is handed to
+/// a sandbox that has no idea what the worker's working directory is.
+///
+/// Falling back to `<root>/.git` if git cannot answer is deliberate: a worker
+/// that cannot commit is useless, and the fallback is right for every ordinary
+/// checkout.
+fn git_common_dir(host: &impl SpawnHost) -> String {
+    let answer = host.git(&["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    match answer {
+        Ok(run) if run.ok && !run.stdout.trim().is_empty() => run.stdout.trim().to_owned(),
+        _ => {
+            let fallback = host.root().join(".git");
+            host.log(&format!(
+                "git could not name its common directory; assuming {}",
+                fallback.display()
+            ));
+            fallback.display().to_string()
         }
     }
 }
@@ -450,7 +476,11 @@ fn launch(host: &impl SpawnHost, launch: &Launch<'_>, made: &mut Made) -> Result
     host.copy_file(&host.alder_binary(), &worktree.join(".alder/bin/alder"))?;
 
     let goal = launch.brief.goal(launch.attempt_id);
-    let engine = engine_command(launch.tier, launch.override_command);
+    let engine = engine_command(
+        launch.tier,
+        Some(&git_common_dir(host)),
+        launch.override_command,
+    );
     host.tmux_new_session(launch.session, worktree, &pane_command(&engine, &goal))?;
     made.session = true;
     // The stamp the tmux observer reads to say which attempt a session is.
@@ -640,6 +670,13 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("git {}", args.join(" ")));
+            if args.contains(&"--git-common-dir") {
+                return Ok(Run {
+                    ok: true,
+                    stdout: "/projects/alder/.git\n".to_owned(),
+                    stderr: String::new(),
+                });
+            }
             if args.first() == Some(&"rev-parse") {
                 let branch = args.last().copied().unwrap_or_default();
                 let ok = self
@@ -785,6 +822,28 @@ mod tests {
         }
         // Nothing is typed at the session, and nothing waits for it to boot.
         assert!(!host.called("send-keys"));
+    }
+
+    #[test]
+    fn a_codex_worker_is_given_the_git_common_dir_it_must_commit_through() {
+        let host = Fake::new();
+        spawn(&host, "al-1", tier("luna").unwrap(), None).unwrap();
+        let pane = host
+            .calls()
+            .into_iter()
+            .find(|call| call.starts_with("tmux new-session"))
+            .expect("a session is created");
+        // Without this the worker's first commit dies on index.lock: its
+        // worktree keeps index, objects and branch ref in the project's .git.
+        assert!(
+            pane.contains(r#"'sandbox_workspace_write.writable_roots=["/projects/alder/.git"]'"#),
+            "{pane}"
+        );
+
+        // A claude worker is not sandboxed this way and is given no such root.
+        let host = Fake::new();
+        spawn(&host, "al-1", tier("opus").unwrap(), None).unwrap();
+        assert!(!host.called("writable_roots"));
     }
 
     #[test]

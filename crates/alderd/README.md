@@ -86,7 +86,18 @@ falling through would launch a worker at an unknown model and record nothing.
 | `fable` | claude | `claude-fable-5` | xhigh | `sol` |
 
 A rung whose provider is currently rate-limited is served by its counterpart
-on the other ladder. `ALDER_WORKER_CMD` replaces the whole engine invocation,
+on the other ladder.
+
+Codex rungs run `codex exec` with `approval_policy=never`,
+`sandbox_mode=workspace-write`, network access on — `alder` appends by pushing
+to the store remote — and one extra writable root: the dispatching project's
+`.git`. That last one is not optional. A worker lives in a *linked* worktree,
+whose index, objects and branch ref all live in the project's `.git`, outside
+the sandbox's workspace; without it the worker's first commit dies on
+`Unable to create '…/index.lock': Operation not permitted`. It does not make
+the leader's working tree writable, which is the part that matters.
+
+`ALDER_WORKER_CMD` replaces the whole engine invocation,
 which is how the verification tests spawn a stub instead of a model; the goal
 is still appended as its final argument, and the tier is still what the attempt
 records.

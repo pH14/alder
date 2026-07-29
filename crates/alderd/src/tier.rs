@@ -133,7 +133,10 @@ impl Tier {
     /// final argument. Nothing here is typed into a terminal: the words become
     /// argv, so a goal containing quotes, semicolons or the word `Enter` is
     /// just a string.
-    pub fn command(&self, goal: &str) -> Vec<String> {
+    ///
+    /// `git_common_dir` is the dispatching project's own `.git`, which a
+    /// codex worker needs as a second writable root — see [`writable_roots`].
+    pub fn command(&self, goal: &str, git_common_dir: Option<&str>) -> Vec<String> {
         let mut words: Vec<String> = match self.provider {
             // approval_policy=never and workspace-write let the worker commit
             // on its branch unattended; network access lets it reach the log
@@ -151,6 +154,8 @@ impl Tier {
                 "sandbox_mode=workspace-write",
                 "-c",
                 "sandbox_workspace_write.network_access=true",
+                "-c",
+                &writable_roots(git_common_dir),
             ]
             .iter()
             .map(|word| (*word).to_owned())
@@ -173,6 +178,28 @@ impl Tier {
     }
 }
 
+/// The second writable root a codex worker cannot commit without.
+///
+/// A worker lives in a linked git worktree, whose `.git` is a *file* pointing
+/// into the dispatching project's `.git/worktrees/<name>`. The index, the
+/// objects and the branch ref all live over there, outside the sandbox's
+/// workspace, so a `workspace-write` worker that is given only its own
+/// checkout fails on the first commit with
+/// `Unable to create '…/index.lock': Operation not permitted`. Naming the
+/// common dir writable fixes exactly that and nothing else: the leader's
+/// working tree stays read-only to the worker, which is the part that matters.
+fn writable_roots(git_common_dir: Option<&str>) -> String {
+    let roots: Vec<&str> = git_common_dir.into_iter().collect();
+    format!(
+        "sandbox_workspace_write.writable_roots={}",
+        // Serialized rather than interpolated: the value is parsed as TOML,
+        // and a path is not guaranteed to be free of characters that matter
+        // there. JSON string escaping is TOML string escaping for anything a
+        // path can contain.
+        serde_json::to_string(&roots).expect("a list of strings serializes")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,7 +211,7 @@ mod tests {
             assert!(!rung.model.is_empty(), "{} has no model", rung.name);
             assert!(!rung.effort.is_empty(), "{} has no effort", rung.name);
             // The command carries both, so neither can be left to the CLI.
-            let command = rung.command("goal");
+            let command = rung.command("goal", Some("/projects/alder/.git"));
             assert!(
                 command.iter().any(|word| word.contains(rung.model)),
                 "{} does not pass its model: {command:?}",
@@ -265,7 +292,9 @@ mod tests {
 
     #[test]
     fn each_provider_runs_its_own_cli_with_the_pinned_policy() {
-        let luna = tier("luna").unwrap().command("do the thing");
+        let luna = tier("luna")
+            .unwrap()
+            .command("do the thing", Some("/projects/alder/.git"));
         assert_eq!(
             luna,
             [
@@ -281,10 +310,14 @@ mod tests {
                 "sandbox_mode=workspace-write",
                 "-c",
                 "sandbox_workspace_write.network_access=true",
+                "-c",
+                r#"sandbox_workspace_write.writable_roots=["/projects/alder/.git"]"#,
                 "do the thing",
             ]
         );
-        let opus = tier("opus").unwrap().command("do the thing");
+        let opus = tier("opus")
+            .unwrap()
+            .command("do the thing", Some("/projects/alder/.git"));
         assert_eq!(
             opus,
             [
