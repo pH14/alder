@@ -176,6 +176,63 @@ impl Tier {
         words.push(goal.to_owned());
         words
     }
+
+    /// The script that relays a ruling back into a one-shot worker, or `None`
+    /// for a provider whose workers sit at an interactive prompt and are
+    /// simply typed at.
+    ///
+    /// `codex exec resume` inherits *nothing* from the session it resumes: no
+    /// model, no reasoning effort, no sandbox. Resuming a luna worker with a
+    /// bare `codex exec resume <id> "<ruling>"` silently continues it at
+    /// whatever model the CLI defaults to — it says so, in a warning nobody is
+    /// watching for — with a sandbox that has neither network access nor the
+    /// git common dir, so the resumed worker can neither commit nor append.
+    ///
+    /// So the flags are not documented for a leader to retype. They are
+    /// written into the worktree at spawn, by the same table that built the
+    /// launch, and the relay is one short command.
+    pub fn resume_script(&self, git_common_dir: Option<&str>) -> Option<String> {
+        if self.provider != Provider::Codex {
+            return None;
+        }
+        let mut words = self.command("", git_common_dir);
+        words.pop(); // the empty goal
+        // `codex exec` becomes `codex exec resume "$session"`; the rest of the
+        // invocation is repeated exactly as the worker was launched with.
+        let flags: Vec<String> = words
+            .drain(2..)
+            .map(|word| crate::effects::quote(&word))
+            .collect();
+        Some(format!(
+            r#"#!/bin/sh
+# Resume this worker's codex session with a ruling from the leader.
+#
+#     .alder/resume [<codex-session-id>] "<the ruling>"
+#
+# With no session ID it resumes the most recent codex session started in this
+# directory, which is this worker's own unless it has run consults of its own
+# since. The attempt's `codex-session` metadata is the exact answer.
+#
+# `codex exec resume` inherits nothing from the session it resumes, so the
+# model, the effort and the sandbox are repeated here exactly as this worker
+# was spawned with them ({tier}: {model}, effort {effort}). A resume without
+# them runs at another model's default, cannot commit, and cannot reach the
+# log.
+set -eu
+if [ $# -ge 2 ]; then
+  session=$1
+  shift
+else
+  session=--last
+fi
+exec codex exec resume "$session" {flags} "$1"
+"#,
+            tier = self.name,
+            model = self.model,
+            effort = self.effort,
+            flags = flags.join(" "),
+        ))
+    }
 }
 
 /// The second writable root a codex worker cannot commit without.
@@ -331,6 +388,39 @@ mod tests {
                 "do the thing",
             ]
         );
+    }
+
+    #[test]
+    fn a_codex_rung_writes_a_resume_that_repeats_its_whole_invocation() {
+        let script = tier("luna")
+            .unwrap()
+            .resume_script(Some("/projects/alder/.git"))
+            .expect("codex rungs relay by resuming");
+        assert!(script.starts_with("#!/bin/sh"), "{script}");
+        assert!(
+            script.contains("codex exec resume \"$session\""),
+            "{script}"
+        );
+        // Everything the launch pinned, pinned again: resume inherits none of
+        // it, and a resumed worker at the wrong model or without the sandbox
+        // roots is worse than no relay at all.
+        for flag in [
+            "'-m' 'gpt-5.6-luna'",
+            "'model_reasoning_effort=high'",
+            "'approval_policy=never'",
+            "'sandbox_mode=workspace-write'",
+            "'sandbox_workspace_write.network_access=true'",
+            r#"'sandbox_workspace_write.writable_roots=["/projects/alder/.git"]'"#,
+        ] {
+            assert!(script.contains(flag), "the resume drops {flag}: {script}");
+        }
+        // The goal placeholder never reaches it; the ruling does.
+        assert!(script.trim_end().ends_with("\"$1\""), "{script}");
+        assert!(!script.contains("''"), "an empty goal leaked in: {script}");
+
+        // A claude worker sits at a prompt and is typed at, so there is
+        // nothing to write.
+        assert!(tier("opus").unwrap().resume_script(None).is_none());
     }
 
     #[test]

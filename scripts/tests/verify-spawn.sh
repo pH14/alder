@@ -257,6 +257,19 @@ tmux has-session -t "=$SESSION_NAME" 2>/dev/null ||
 [ -e "$SB/alder-work-$WORK/.alder/bin/alderd" ] &&
   fail "the worker was given alderd: workers cannot dispatch"
 
+# The relay back into a one-shot worker: written at spawn, runnable as it
+# stands, and carrying the whole rung, because `codex exec resume` inherits
+# none of it.
+RESUME=$SB/alder-work-$WORK/.alder/resume
+[ -x "$RESUME" ] || fail "a codex worker has no executable .alder/resume"
+sh -n "$RESUME" || fail "the resume script is not valid sh"
+for part in "codex exec resume" "gpt-5.6-luna" "model_reasoning_effort=high" \
+  "sandbox_workspace_write.network_access=true" "writable_roots"; do
+  grep -q -- "$part" "$RESUME" || fail "the resume script omits: $part"
+done
+grep -q -- "$SB/repo/.git" "$RESUME" ||
+  fail "the resume script does not name this project's git dir"
+
 # The attempt carries the handle and the whole tier, model and effort both.
 "$ALDER" show "$ATTEMPT" --json |
   jq -e '.current.handle == "tmux:alder-work-'"$WORK"'"' >/dev/null ||

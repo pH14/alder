@@ -65,6 +65,7 @@ pub trait SpawnHost {
     fn path_exists(&self, path: &Path) -> bool;
     fn create_dir_all(&self, path: &Path) -> Result<()>;
     fn copy_file(&self, from: &Path, to: &Path) -> Result<()>;
+    fn write_executable(&self, path: &Path, body: &str) -> Result<()>;
     fn log(&self, message: &str);
 }
 
@@ -476,11 +477,15 @@ fn launch(host: &impl SpawnHost, launch: &Launch<'_>, made: &mut Made) -> Result
     host.copy_file(&host.alder_binary(), &worktree.join(".alder/bin/alder"))?;
 
     let goal = launch.brief.goal(launch.attempt_id);
-    let engine = engine_command(
-        launch.tier,
-        Some(&git_common_dir(host)),
-        launch.override_command,
-    );
+    let git_common_dir = git_common_dir(host);
+    let engine = engine_command(launch.tier, Some(&git_common_dir), launch.override_command);
+    // How a ruling gets back into a worker that ran one shot and exited. It
+    // lives in the worktree because that is where the pane's shell is sitting,
+    // and it is written by the table that built the launch so the two cannot
+    // drift apart.
+    if let Some(script) = launch.tier.resume_script(Some(&git_common_dir)) {
+        host.write_executable(&worktree.join(".alder/resume"), &script)?;
+    }
     host.tmux_new_session(launch.session, worktree, &pane_command(&engine, &goal))?;
     made.session = true;
     // The stamp the tmux observer reads to say which attempt a session is.
@@ -749,6 +754,13 @@ mod tests {
             Ok(())
         }
 
+        fn write_executable(&self, path: &Path, body: &str) -> Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("write {} {body}", path.display()));
+            Ok(())
+        }
+
         fn log(&self, message: &str) {
             self.calls.borrow_mut().push(format!("log {message}"));
         }
@@ -840,10 +852,17 @@ mod tests {
             "{pane}"
         );
 
-        // A claude worker is not sandboxed this way and is given no such root.
+        // The relay back into a one-shot worker is written where its shell
+        // will be sitting, carrying the same rung.
+        assert!(host.called("write /projects/alder-work-al-1/.alder/resume"));
+        assert!(host.called("codex exec resume"));
+
+        // A claude worker is not sandboxed this way and is given no such root,
+        // and nothing to resume: it sits at a prompt and is typed at.
         let host = Fake::new();
         spawn(&host, "al-1", tier("opus").unwrap(), None).unwrap();
         assert!(!host.called("writable_roots"));
+        assert!(!host.called(".alder/resume"));
     }
 
     #[test]

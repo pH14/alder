@@ -37,11 +37,14 @@ Use `./target/debug/alder` for every alder command.
      `tmux send-keys -t alder-work-<id> Enter`.
    - **A codex worker** ran one shot and left a shell in its worktree, so
      the answer is a *command* typed at that shell — the same two sends,
-     with `codex exec resume <codex-session-uuid> "<the ruling>"` as the
-     literal text, or `codex exec resume --last "<the ruling>"` when the
-     attempt carries no `codex-session` (resume picks the newest session in
-     that directory, so check `tmux capture-pane` first if the worker has
-     been running consults of its own).
+     with `.alder/resume <codex-session-uuid> "<the ruling>"` as the literal
+     text. That script is written into the worktree at spawn and repeats the
+     model, effort and sandbox the worker was launched with, because
+     `codex exec resume` inherits none of them; do not hand-write the
+     `codex exec resume` line. The UUID is the attempt's `codex-session`
+     metadata; without it, `.alder/resume "<the ruling>"` resumes the newest
+     codex session in that directory, which is the worker's own unless it
+     has been running consults.
 
    A worker with no live session gets a fresh spawn instead — and a fresh
    spawn is launched on the *item*, not on the Q&A, which is why an answer

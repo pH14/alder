@@ -61,8 +61,14 @@ Three rules make that ordering worth having:
   can read as a key name. There is no sleep on the path.
 - **The pane outlives the engine.** The command ends `; exec bash`, so a
   one-shot `codex exec` leaves a live session behind: the handle stays
-  observable, and a ruling can be relayed into the shell afterwards with
-  `codex exec resume`.
+  observable, and a ruling can be relayed into the shell afterwards. For a
+  codex rung the spawn also writes `<worktree>/.alder/resume`, which is how
+  that relay is typed — `.alder/resume [<session-id>] "<the ruling>"`. It
+  exists because `codex exec resume` inherits *nothing* from the session it
+  resumes: no model, no effort, no sandbox. Resumed by hand, a luna worker
+  quietly continues at another model, with no network access and no writable
+  git dir, and can neither commit nor reach the log. The script repeats the
+  launch exactly, because the same table writes both.
 - **No phantom workers.** Everything knowable beforehand — unknown item,
   session or worktree already there, unknown tier — fails with nothing
   created. After the attempt exists, any failure ends it with the error as its

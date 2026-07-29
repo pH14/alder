@@ -288,6 +288,41 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         !worktree.join(".alder/bin/alderd").exists(),
         "the worker was given alderd: workers cannot dispatch"
     );
+
+    // The relay back into a one-shot worker, written where its shell sits and
+    // runnable as it stands.
+    let resume = worktree.join(".alder/resume");
+    assert!(resume.is_file(), "a codex worker has nothing to resume it");
+    assert!(
+        resume
+            .metadata()
+            .expect("the resume script is statable")
+            .permissions()
+            .mode()
+            & 0o111
+            != 0,
+        "the resume script is not executable"
+    );
+    let script = fs::read_to_string(&resume).expect("the resume script is readable");
+    for part in [
+        "codex exec resume",
+        "-m",
+        "gpt-5.6-luna",
+        "model_reasoning_effort=high",
+        "sandbox_workspace_write.network_access=true",
+        "writable_roots",
+    ] {
+        assert!(
+            script.contains(part),
+            "the resume script omits {part}: {script}"
+        );
+    }
+    let checked = Command::new("sh")
+        .args(["-n"])
+        .arg(&resume)
+        .status()
+        .expect("sh runs");
+    assert!(checked.success(), "the resume script is not valid sh");
     assert_eq!(
         run(
             &root,

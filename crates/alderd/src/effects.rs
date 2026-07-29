@@ -11,6 +11,7 @@
 
 use std::{
     io::Write,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -327,6 +328,14 @@ impl SpawnHost for Host {
                 to.display()
             ))
         })
+    }
+
+    fn write_executable(&self, path: &Path, body: &str) -> Result<()> {
+        std::fs::write(path, body)
+            .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)))
+            .map_err(|error| {
+                DriverError::new(format!("cannot write `{}`: {error}", path.display()))
+            })
     }
 
     fn log(&self, message: &str) {
