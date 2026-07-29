@@ -631,6 +631,15 @@ and returns a head conflict. Ordinary mutations are not reapplied to the new
 head; the caller must reread and decide again. Submission of a uniquely
 identified, inert handoff is the only automatic reconsideration in v0.
 
+Reapplying is not withheld out of caution. A mutation is validated against one
+projection and materialized at one sequence, so replaying it against a log
+that has moved would append a decision nobody made — and the decision is
+sometimes the whole payload, as with a `pass end` whose report describes the
+state the leader read. Because reconsideration is the caller's, a loss is
+reported as a fact about the command: nothing was appended, and this is the
+event that was not written. See [CLI.md](CLI.md) for how that reaches each
+output channel.
+
 The expected head is internal to the command. There is no public `--if-head`
 option. A change committed before a command begins is part of the state
 against which that command is validated. A repository skill may still assign

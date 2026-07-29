@@ -52,8 +52,14 @@ default; JSON is the only structured output format in v0.
 
 With `--json`, standard output contains exactly one JSON document. This applies
 to reads, successful mutations, and expected failures. A failure still returns
-a nonzero process status. JSON output contains no tables, color, progress
+a nonzero process status, and its document carries `"ok": false`, which no
+successful document carries. JSON output contains no tables, color, progress
 indicators, or surrounding prose.
+
+Without `--json`, a failure goes to standard error as an `error [<code>]:`
+line and one indented `key: value` line per context field. It is never a JSON
+document: a printed object is the shape of a result, and a caller skimming a
+terminal reads it as one.
 
 Each result carries a command-specific schema identifier, which follows the
 grammar: `alder.<noun>.<verb>.v0` for mutations, `alder.<query>.v0` for
@@ -114,6 +120,14 @@ projection, and conditionally appends to it. If another writer advances the
 log first, the command changes nothing and returns a structured head-conflict
 error. Ordinary mutations are not retried against the new state; the caller
 rereads and decides again.
+
+Because the caller is the one that has to reconsider, losing says so in terms
+of the command rather than of the log. A head conflict reports that nothing
+was appended, names the event that was not written, and carries
+`"appended": false`; the JSON envelope carries `"ok": false`. Nothing on the
+loser's output has the shape of a receipt, in either channel. That matters
+most for `pass end`, where a loss read as success leaves the pass open and its
+report unwritten.
 
 The head comes from the configured remote ref, not a local branch or
 remote-tracking ref. Every ordinary read and mutation contacts that remote;

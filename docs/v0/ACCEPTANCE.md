@@ -26,6 +26,8 @@ attempt to append them concurrently.
 - the winning append is not durable until its event commit has been pushed to
   the remote ref;
 - the loser must receive a structured head conflict and change nothing;
+- the loser's own output must say that nothing was appended, rather than only
+  what happened to the log;
 - the losing mutation must not be replayed automatically against the new
   state;
 - after rereading, the loser must see the winner's event and may form a new
@@ -513,6 +515,10 @@ While a pass is open, have the leader run `pass end` at the same moment another
 writer appends an ordinary mutation such as `work finish`.
 
 - one append wins and the other receives a head conflict;
+- a losing `pass end` must report that nothing was appended and name
+  `pass.ended` as the event it did not write, in whichever output channel was
+  asked for. A caller that reads only the command's output must not be able to
+  take the loss for a receipt;
 - if `pass end` loses, rerunning it after rereading must succeed and must
   produce exactly one `pass.ended`;
 - if `pass end` wins, the other writer's reread must show the ended pass and

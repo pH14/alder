@@ -97,7 +97,8 @@ impl<S: Log> Ledger<S> {
         state.validate_prefix(&self.prefix)?;
         let receipt = self
             .store
-            .append(&snapshot.head, &super::encode_draft(&draft)?)?;
+            .append(&snapshot.head, &super::encode_draft(&draft)?)
+            .map_err(|error| lost_append(draft.payload.type_name(), error))?;
         if let Some(hook) = &self.on_append {
             hook();
         }
@@ -237,8 +238,9 @@ impl<S: Log> Ledger<S> {
         }
         Err(AlderError::with_context(
             "head_conflict",
-            "handoff submission could not settle after repeated concurrent appends",
-            json!({"handoff_id": id}),
+            "nothing was appended: handoff submission could not settle after repeated \
+             concurrent appends; reread and run the command again",
+            json!({"appended": false, "event": "handoff.submitted", "handoff_id": id}),
         ))
     }
 
@@ -624,6 +626,23 @@ impl<S: Log> Ledger<S> {
     }
 }
 
+/// Name the event a losing writer did not append.
+///
+/// Every mutation but `add_handoff` reaches the store through one call, so
+/// this is the single place a lost compare-and-append is described — and it
+/// describes the command's effect, not the log's. Retrying here is deliberately
+/// not an option: the draft was validated against one projection and
+/// materialized at one sequence, so replaying it against a log that has moved
+/// would append a decision nobody made. Reconsideration belongs to the caller.
+fn lost_append(event: &'static str, error: LogError) -> AlderError {
+    match error {
+        LogError::HeadConflict { expected, observed } => {
+            AlderError::lost_append(Some(event), expected.sequence(), observed.sequence())
+        }
+        other => other.into(),
+    }
+}
+
 fn append_result(receipt: AppendReceipt) -> Result<AppendResult> {
     Ok(AppendResult {
         head: receipt.observed_head,
@@ -655,10 +674,11 @@ fn random_token() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Mutex;
 
     use super::*;
-    use crate::domain::{CheckDefinition, CheckStatus};
+    use crate::domain::{ChangeMode, CheckDefinition, CheckStatus};
     use alder_log::{
         AppendReceipt, Log as Store, LogError, MemoryLog as MemoryStore, Record, RecordDraft,
     };
@@ -669,6 +689,9 @@ mod tests {
         CommitThenReport,
         Always,
         OtherError,
+        /// Append normally until armed, then lose every compare-and-append.
+        /// This is how a fixture gets built and then raced.
+        WhenArmed,
     }
 
     #[derive(Debug)]
@@ -676,6 +699,7 @@ mod tests {
         inner: MemoryStore,
         behavior: ConflictBehavior,
         append_calls: Mutex<usize>,
+        armed: Mutex<bool>,
     }
 
     impl ConflictStore {
@@ -684,11 +708,16 @@ mod tests {
                 inner: MemoryStore::new(),
                 behavior,
                 append_calls: Mutex::new(0),
+                armed: Mutex::new(false),
             }
         }
 
         fn calls(&self) -> usize {
             *self.append_calls.lock().unwrap()
+        }
+
+        fn arm(&self, armed: bool) {
+            *self.armed.lock().unwrap() = armed;
         }
 
         fn conflict() -> LogError {
@@ -717,7 +746,10 @@ mod tests {
             *calls += 1;
             let call = *calls;
             drop(calls);
+            let armed = *self.armed.lock().unwrap();
             match (self.behavior, call) {
+                (ConflictBehavior::WhenArmed, _) if armed => Err(Self::conflict()),
+                (ConflictBehavior::WhenArmed, _) => self.inner.append(expected, draft),
                 (ConflictBehavior::Once, 1) => Err(Self::conflict()),
                 (ConflictBehavior::CommitThenReport, 1) => {
                     self.inner.append(expected, draft)?;
@@ -1182,6 +1214,276 @@ mod tests {
                 .unwrap_err()
                 .code,
             "not_found"
+        );
+    }
+
+    /// One leader-side mutation, ready to be raced.
+    type Mutation<'a> = Box<dyn Fn() -> Result<AppendResult> + 'a>;
+
+    /// Every event a mutation can append, so the sweep below can prove it
+    /// reached all of them. `EventPayload::type_name` is the compiler-checked
+    /// list; this is the copy the sweep is measured against.
+    const EVERY_EVENT: [&str; 20] = [
+        "handoff.submitted",
+        "handoff.integrated",
+        "handoff.withdrawn",
+        "work.changed",
+        "work.finished",
+        "work.dropped",
+        "work.reopened",
+        "attempt.started",
+        "attempt.bound",
+        "attempt.updated",
+        "attempt.ended",
+        "question.asked",
+        "question.answered",
+        "pass.started",
+        "pass.ended",
+        "loop.paused",
+        "loop.resumed",
+        "loop.engine_selected",
+        "loop.rotation_requested",
+        "loop.nudge_requested",
+    ];
+
+    /// `pass end` is only the mutation that happened to collide. Every one of
+    /// them reaches the store through the same call, so every one of them has
+    /// to lose the same way: nothing appended, said so first, and named.
+    #[test]
+    fn every_mutation_that_loses_the_race_says_it_appended_nothing() {
+        let ledger = Ledger::new(
+            ConflictStore::new(ConflictBehavior::WhenArmed),
+            "hm",
+            "leader",
+        );
+        // A fixture rich enough that every mutation gets past its own
+        // preconditions and fails only on the append.
+        let add = |title: &str| {
+            ledger
+                .add_work(title.to_owned(), None, 0, vec![], vec![])
+                .unwrap()
+                .1
+        };
+        let work = add("work");
+        let idle = add("idle");
+        let asked = add("asked");
+        let finished = add("finished");
+        let (_, attempt) = ledger.start(&work, BTreeMap::new()).unwrap();
+        let (_, done_attempt) = ledger.start(&finished, BTreeMap::new()).unwrap();
+        ledger
+            .finish(&finished, Some(done_attempt), false, None)
+            .unwrap();
+        let (_, question) = ledger.ask(&asked, "which path?".to_owned()).unwrap();
+        let (_, handoff) = ledger
+            .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
+            .unwrap();
+        let settled = ledger.snapshot().unwrap();
+        let addition = GraphChangeDocument {
+            why: Some("replan".to_owned()),
+            add: vec![serde_json::from_value(json!({"title": "added"})).unwrap()],
+            edit: vec![],
+        };
+        let prepared = ledger
+            .allocate_change(&settled, &addition, ChangeMode::AddOnly)
+            .unwrap();
+
+        let losing: Vec<(&str, Mutation<'_>)> = vec![
+            (
+                "work.changed",
+                Box::new(|| {
+                    ledger
+                        .add_work("raced".to_owned(), None, 0, vec![], vec![])
+                        .map(|(result, _)| result)
+                }),
+            ),
+            (
+                "work.changed",
+                Box::new(|| ledger.commit_change(&settled, &addition, prepared.clone())),
+            ),
+            (
+                "work.changed",
+                Box::new(|| {
+                    ledger.set_work_state(
+                        &idle,
+                        WorkStateChange::Block {
+                            reason: "raced".to_owned(),
+                        },
+                    )
+                }),
+            ),
+            (
+                "handoff.integrated",
+                Box::new(|| {
+                    ledger
+                        .integrate_handoff(&handoff, None, None, 0, vec![], vec![])
+                        .map(|(result, _)| result)
+                }),
+            ),
+            (
+                "handoff.withdrawn",
+                Box::new(|| ledger.withdraw_handoff(&handoff, "raced".to_owned())),
+            ),
+            (
+                "attempt.started",
+                Box::new(|| {
+                    ledger
+                        .start(&idle, BTreeMap::new())
+                        .map(|(result, _)| result)
+                }),
+            ),
+            (
+                "attempt.bound",
+                Box::new(|| {
+                    ledger.bind_attempt(&attempt, "tmux:worker".to_owned(), BTreeMap::new())
+                }),
+            ),
+            (
+                "attempt.updated",
+                Box::new(|| {
+                    ledger.update_attempt(
+                        &attempt,
+                        BTreeMap::new(),
+                        Some("raced".to_owned()),
+                        vec![],
+                    )
+                }),
+            ),
+            (
+                "attempt.ended",
+                Box::new(|| {
+                    ledger.end_attempt(&attempt, AttemptOutcome::Cancelled, "raced".to_owned())
+                }),
+            ),
+            (
+                "work.finished",
+                Box::new(|| ledger.finish(&work, Some(attempt.clone()), false, None)),
+            ),
+            (
+                "work.dropped",
+                Box::new(|| {
+                    ledger.drop_work(
+                        &work,
+                        Some(attempt.clone()),
+                        Some(AttemptOutcome::Cancelled),
+                        "raced".to_owned(),
+                    )
+                }),
+            ),
+            (
+                "work.reopened",
+                Box::new(|| ledger.reopen(&finished, "raced".to_owned())),
+            ),
+            (
+                "question.asked",
+                Box::new(|| {
+                    ledger
+                        .ask(&work, "another?".to_owned())
+                        .map(|(result, _)| result)
+                }),
+            ),
+            (
+                "question.answered",
+                Box::new(|| ledger.answer(&question, "path A".to_owned())),
+            ),
+            (
+                "pass.started",
+                Box::new(|| {
+                    ledger
+                        .wake_loop(
+                            "claude".to_owned(),
+                            "tmux:alder-leader".to_owned(),
+                            vec![PassTrigger::Log],
+                        )
+                        .map(|(result, _)| result)
+                }),
+            ),
+            (
+                "loop.paused",
+                Box::new(|| ledger.pause_loop(Some("raced".to_owned()))),
+            ),
+            ("loop.resumed", Box::new(|| ledger.resume_loop())),
+            (
+                "loop.engine_selected",
+                Box::new(|| ledger.select_engine("codex".to_owned())),
+            ),
+            (
+                "loop.rotation_requested",
+                Box::new(|| ledger.request_rotation(None)),
+            ),
+            (
+                "loop.nudge_requested",
+                Box::new(|| ledger.request_nudge(None)),
+            ),
+        ];
+
+        let mut covered = BTreeSet::new();
+        ledger.store().arm(true);
+        for (event, mutation) in &losing {
+            let error = mutation().unwrap_err();
+            assert_eq!(error.code, "head_conflict", "{event}");
+            assert_eq!(error.context["appended"], json!(false), "{event}");
+            assert_eq!(error.context["event"], json!(event), "{event}");
+            assert!(
+                error.message.starts_with("nothing was appended: "),
+                "{event}: {}",
+                error.message
+            );
+            assert!(error.message.contains(event), "{event}: {}", error.message);
+            covered.insert(*event);
+        }
+
+        // A pass has to be open for `pass end` to reach its append, and no
+        // pass may be open for `loop wake` to reach its own, so this one is
+        // raced after the fixture opens a pass for real.
+        ledger.store().arm(false);
+        ledger
+            .wake_loop(
+                "claude".to_owned(),
+                "tmux:alder-leader".to_owned(),
+                vec![PassTrigger::Log],
+            )
+            .unwrap();
+        ledger.store().arm(true);
+        let error = ledger
+            .end_pass(None, PassOutcome::Ok, None, None, false, None)
+            .unwrap_err();
+        assert_eq!(error.code, "head_conflict");
+        assert_eq!(error.context["appended"], json!(false));
+        assert_eq!(error.context["event"], json!("pass.ended"));
+        covered.insert("pass.ended");
+
+        // `handoff add` is the one mutation allowed to reconsider on its own,
+        // because its submission is inert and uniquely identified. It still
+        // has to fail loudly once it has exhausted that, and it still may not
+        // report an append it did not make.
+        let error = ledger
+            .add_handoff("raced".to_owned(), "branch:raced".to_owned(), None)
+            .unwrap_err();
+        assert_eq!(error.code, "head_conflict");
+        assert_eq!(error.context["appended"], json!(false));
+        covered.insert("handoff.submitted");
+
+        assert_eq!(
+            covered,
+            EVERY_EVENT.into_iter().collect::<BTreeSet<_>>(),
+            "every event a mutation can append has to be swept"
+        );
+        // Losing changed nothing: only the one pass the sweep opened for real
+        // is on the log, and every raced object is as the fixture left it.
+        let after = ledger.snapshot().unwrap();
+        assert_eq!(after.head.sequence(), settled.head.sequence() + 1);
+        assert_eq!(
+            after.state.work[&work].state,
+            settled.state.work[&work].state
+        );
+        assert_eq!(after.state.work[&idle].state, WorkState::Open);
+        assert_eq!(after.state.work[&asked].state, WorkState::Blocked);
+        assert_eq!(after.state.work[&finished].state, WorkState::Done);
+        assert!(after.state.attempts[&attempt].outcome.is_none());
+        assert!(after.state.questions[&question].answer.is_none());
+        assert_eq!(
+            after.state.handoffs[&handoff].state,
+            crate::domain::HandoffState::Submitted
         );
     }
 

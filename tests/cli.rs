@@ -794,10 +794,12 @@ fn invalid_commands_and_errors_use_the_requested_output_channel() {
         .args(["show", "missing"])
         .output()
         .unwrap();
-    let stderr = String::from_utf8(contextual.stderr).unwrap();
-    assert!(stderr.contains("error [not_found]"));
-    assert!(stderr.contains("\"kind\": \"object\""));
-    assert!(stderr.contains("\"id\": \"missing\""));
+    // Context reaches the human channel as fields under the error line, never
+    // as a JSON document — a failure must not have the shape of a result.
+    assert_eq!(
+        String::from_utf8(contextual.stderr).unwrap(),
+        "error [not_found]: object `missing` was not found\n  id: missing\n  kind: object\n"
+    );
 }
 
 #[test]
@@ -1673,13 +1675,14 @@ fn refresh_reports_change_without_counting_metadata_churn() {
 
 /// The live incident of al-pass-64, reproduced and pinned exactly as it
 /// behaves today: the leader ran `pass end` while a worker was appending its
-/// own milestones, lost the compare-and-append, and got a failure shaped like
-/// a receipt — a line about the log, then a pretty JSON object whose last
-/// field is the sequence it lost at. Nothing is written, the pass stays open,
-/// and a caller reading the terminal has to already know what it is looking
-/// at to see that.
+/// own milestones and lost the compare-and-append.
+///
+/// The loss itself is correct and stays: an ordinary mutation validated
+/// against one head is never replayed against another. What is under test is
+/// that losing announces the command's effect — nothing — in a form no caller
+/// can read as success, and that rereading and rerunning is what settles it.
 #[test]
-fn a_pass_end_that_loses_the_race_writes_nothing() {
+fn a_pass_end_that_loses_the_race_says_it_wrote_nothing() {
     let project = TestProject::new();
     let work = string(
         &project.success(&["work", "add", "--title", "Raced"]),
@@ -1716,19 +1719,27 @@ fn a_pass_end_that_loses_the_race_writes_nothing() {
     assert_eq!(lost.status.code(), Some(1));
     assert!(lost.stdout.is_empty());
     let stderr = String::from_utf8(lost.stderr).unwrap();
-    let (first, rest) = stderr.split_once('\n').unwrap();
-    // The message describes the log, not the command: it never says that this
-    // mutation wrote nothing.
+    let mut lines = stderr.lines();
+    // The first line states the effect on the command, not on the log, and
+    // names the event that was not written.
     assert_eq!(
-        first,
-        "error [head_conflict]: the shared log advanced before the record was appended"
+        lines.next().unwrap(),
+        "error [head_conflict]: nothing was appended: `pass.ended` lost the \
+         compare-and-append to another writer, which moved the shared log from 3 to 4; \
+         reread and run the command again"
     );
-    // And the rest is a pretty JSON document — the same shape a successful
-    // command prints — whose last field is the sequence the writer lost at.
-    let context: Value = serde_json::from_str(rest).unwrap();
-    assert_eq!(context["expected_head"]["seq"], 3);
-    assert_eq!(context["current_head"]["seq"], 4);
-    assert_eq!(rest.trim_end().lines().last().unwrap(), "}");
+    // Nothing under it has the shape of a result document: the receipt-shaped
+    // JSON object that read as success is gone, and the context survives it.
+    assert_eq!(
+        lines.collect::<Vec<_>>(),
+        [
+            "  appended: false",
+            "  current_head: 4",
+            "  event: pass.ended",
+            "  expected_head: 3",
+        ]
+    );
+    assert!(!stderr.contains('{'), "{stderr}");
 
     // Nothing was written, so the pass is still open and unreported.
     let open = project.success(&["status"])["loop"].clone();
@@ -1736,8 +1747,8 @@ fn a_pass_end_that_loses_the_race_writes_nothing() {
     assert!(open["last_pass"].is_null());
 
     // The same loss over the JSON channel: one document on standard output,
-    // per the output contract, carrying nothing that marks it as a failure
-    // beyond its schema and code.
+    // per the output contract, but one no reader can take for a mutation
+    // result.
     let structured = project.losing(
         &[
             "pass",
@@ -1757,10 +1768,17 @@ fn a_pass_end_that_loses_the_race_writes_nothing() {
     assert!(structured.stderr.is_empty());
     let document: Value = serde_json::from_slice(&structured.stdout).unwrap();
     assert_eq!(document["schema"], "alder.error.v0");
-    assert!(document.get("ok").is_none());
+    assert_eq!(document["ok"], false);
     assert_eq!(document["code"], "head_conflict");
-    assert_eq!(document["context"]["expected_head"]["seq"], 4);
-    assert_eq!(document["context"]["current_head"]["seq"], 5);
+    assert_eq!(
+        document["context"],
+        json!({
+            "appended": false,
+            "event": "pass.ended",
+            "expected_head": 4,
+            "current_head": 5,
+        })
+    );
 
     // A33: rereading and rerunning settles it, and records exactly one ending.
     let ended = project.success(&[

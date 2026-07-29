@@ -167,6 +167,10 @@ Ordinary mutations are never silently replayed against the new head.
 `handoff add` is the exception because submission is inert and uniquely
 identified, making reconsideration automatic and safe.
 
+A caller can only reconsider a loss it recognizes, so losing is reported as a
+fact about the command — nothing was appended, and here is the event that was
+not written — and never in a form that reads as a receipt.
+
 The expected head is internal to the command. V0 has no public `--if-head`
 option. A repository skill that wants one operational leader must ensure that
 role above Alder; an older agent that later reads current state is technically
