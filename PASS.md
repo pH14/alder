@@ -151,7 +151,11 @@ Always end with:
 Pick `--wake` honestly: ~10m with workers in flight, 30m–1h when only waiting
 on a human answer, longer when the frontier is empty and no one is working.
 Add `--rotate` if your context feels heavy or degraded. The report is read on
-a phone — write it for a reader who saw nothing else.
+a phone — write it for a reader who saw nothing else. A bare ID is noise to
+that reader: every ID you name carries a short human label — the work item's
+title, or for a question a plain gloss of what it asks and what answering it
+unblocks, e.g. `al-3v5d0n-question-1 (may I git merge locally? gates five
+branches)`. Paul must never need the log open to know what you want from him.
 
 ## Ground rules
 
