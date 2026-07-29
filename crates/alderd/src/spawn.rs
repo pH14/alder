@@ -38,6 +38,16 @@ use crate::{
 /// states the same list for a worker that needs it after its launch turn.
 pub const GATES: &str = "cargo fmt --check, cargo clippy --workspace --all-targets with zero warnings, cargo test --workspace green";
 
+/// Checks the leader records from outside the worker's session, so a goal must
+/// not present them as the worker's own.
+///
+/// A worker stops when every check it was given is satisfied. A check only the
+/// leader can satisfy — a cross-review is one by construction, since its whole
+/// point is that the author did not run it — would therefore strand every
+/// worker one step short of the marker the leader is waiting for. Naming these
+/// separately is what keeps "every check" true for both readers.
+pub const LEADER_CHECKS: [&str; 1] = ["cross-review"];
+
 /// Replaces the whole engine invocation, so a test can spawn a stub instead of
 /// a model. The goal is still appended as the final argument.
 pub const WORKER_CMD_ENV: &str = "ALDER_WORKER_CMD";
@@ -199,20 +209,42 @@ impl Brief {
         if self.checks.is_empty() {
             parts.push("No acceptance checks are recorded; the spec is the whole bar.".to_owned());
         } else {
-            let checks: Vec<_> = self
+            let (leaders, mine): (Vec<_>, Vec<_>) = self
                 .checks
                 .iter()
-                .map(|(key, description)| format!("{key} — {description}"))
-                .collect();
-            parts.push(format!(
-                "Done when every check is satisfied: {}.",
-                checks.join("; ")
-            ));
+                .partition(|(key, _)| LEADER_CHECKS.contains(&key.as_str()));
+            if mine.is_empty() {
+                parts.push(
+                    "No acceptance check is yours to satisfy; the spec is the whole bar."
+                        .to_owned(),
+                );
+            } else {
+                parts.push(format!(
+                    "Done when every check is satisfied: {}.",
+                    listed(&mine)
+                ));
+            }
+            if !leaders.is_empty() {
+                parts.push(format!(
+                    "The leader records these from outside your session, after you stop: {}. \
+                     They are not yours to satisfy and not a reason to withhold the marker.",
+                    listed(&leaders)
+                ));
+            }
         }
         parts.push(format!("Gates: {GATES}."));
         parts.push("Read WORKER.md for the protocol, then begin.".to_owned());
         collapse(&parts.join(" "))
     }
+}
+
+/// One `key — description` clause per check, in the order the item lists them.
+fn listed(checks: &[&(String, String)]) -> String {
+    checks
+        .iter()
+        .map(|(key, description)| format!("{key} — {description}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Collapse every run of whitespace to one space.
@@ -1006,6 +1038,48 @@ mod tests {
         assert!(goal.contains("No acceptance checks are recorded"), "{goal}");
         assert!(!goal.contains("Spec:"), "{goal}");
         assert!(goal.contains(GATES), "{goal}");
+    }
+
+    #[test]
+    fn a_leader_owned_check_is_not_presented_as_the_workers() {
+        let brief = Brief::from_show(&json!({"current": {
+            "id": "al-5",
+            "title": "Do the thing",
+            "spec": null,
+            "checks": [
+                {"key": "cross-review", "description": "read by the other ladder"},
+                {"key": "gates", "description": "fmt, clippy, tests"},
+            ],
+        }}))
+        .unwrap();
+        let goal = brief.goal("al-5-attempt-1");
+        let (mine, leaders) = goal
+            .split_once("The leader records these")
+            .expect("a leader-owned check is named separately");
+        assert!(
+            mine.contains("Done when every check is satisfied: gates —"),
+            "{goal}"
+        );
+        assert!(!mine.contains("cross-review"), "{goal}");
+        assert!(leaders.contains("cross-review"), "{goal}");
+        assert!(leaders.contains("not yours to satisfy"), "{goal}");
+    }
+
+    /// The deadlock this avoids: a worker told to stop when every check is
+    /// satisfied, whose only check is one it cannot satisfy, never stops.
+    #[test]
+    fn an_item_whose_only_check_is_the_leaders_leaves_the_worker_none() {
+        let brief = Brief::from_show(&json!({"current": {
+            "id": "al-6",
+            "title": "Do the thing",
+            "spec": null,
+            "checks": [{"key": "cross-review", "description": "read by the other ladder"}],
+        }}))
+        .unwrap();
+        let goal = brief.goal("al-6-attempt-1");
+        assert!(goal.contains("No acceptance check is yours"), "{goal}");
+        assert!(!goal.contains("Done when every check"), "{goal}");
+        assert!(goal.contains("cross-review"), "{goal}");
     }
 
     #[test]
