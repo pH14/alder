@@ -1,9 +1,13 @@
-//! Everything the driver does to the world, behind one thin trait.
+//! Everything the daemon does to the world, behind two thin traits.
 //!
-//! The daemon holds no Alder code, no Git library, and no Git shell-out. It
-//! reads the log by running `alder … --json` and it drives the leader by
-//! running `tmux`. That coupling is deliberately loose: Alder's stable agent
-//! surface is its CLI.
+//! The daemon holds no Alder code and no Git library. It reads the log by
+//! running `alder … --json`, it drives sessions by running `tmux`, and — only
+//! on the dispatch path, where a worker needs a worktree of its own — it runs
+//! `git`. That coupling is deliberately loose: Alder's stable agent surface is
+//! its CLI, and the daemon stays domain-free.
+//!
+//! The driving loop itself still runs no Git command: its log trigger is a
+//! sequence number read from `alder status`.
 
 use std::{
     io::Write,
@@ -19,6 +23,7 @@ use serde_json::Value;
 use crate::{
     config::{Config, Engine},
     error::{DriverError, Result},
+    spawn::{Run, SpawnHost},
 };
 
 pub trait Effects {
@@ -60,6 +65,17 @@ impl Host {
         }
     }
 
+    /// A host for a one-shot command, which needs the `alder` binary and the
+    /// project and nothing else. `.alder/driver.json` describes the driving
+    /// loop, so a dispatch must not require one to exist.
+    pub fn for_command(root: PathBuf, alder: String) -> Self {
+        Self {
+            root,
+            alder,
+            notify: None,
+        }
+    }
+
     fn run(&self, program: &str, args: &[&str]) -> Result<std::process::Output> {
         Command::new(program)
             .args(args)
@@ -68,14 +84,9 @@ impl Host {
             .output()
             .map_err(|error| DriverError::new(format!("cannot run `{program}`: {error}")))
     }
-}
 
-impl Effects for Host {
-    fn now(&self) -> DateTime<Utc> {
-        Utc::now()
-    }
-
-    fn alder(&self, args: &[&str]) -> Result<Value> {
+    /// Run `alder <args> --json` and read its one JSON document.
+    fn run_alder(&self, args: &[&str]) -> Result<Value> {
         let mut full: Vec<&str> = args.to_vec();
         full.push("--json");
         let output = self.run(&self.alder, &full)?;
@@ -99,11 +110,56 @@ impl Effects for Host {
         Err(DriverError::coded(code, message))
     }
 
-    fn tmux_session_exists(&self, session: &str) -> Result<bool> {
+    fn session_exists(&self, session: &str) -> Result<bool> {
         Ok(self
             .run("tmux", &["has-session", "-t", session])?
             .status
             .success())
+    }
+
+    fn kill_session(&self, session: &str) -> Result<()> {
+        self.run("tmux", &["kill-session", "-t", session])?;
+        Ok(())
+    }
+
+    fn say(&self, message: &str) {
+        let mut stderr = std::io::stderr();
+        let _ = writeln!(stderr, "{} alderd: {message}", Utc::now().to_rfc3339());
+    }
+
+    /// The `alder` binary as a path something can be copied from. A configured
+    /// name with no separator is looked up on `PATH`, the way running it does.
+    fn alder_path(&self) -> PathBuf {
+        let configured = Path::new(&self.alder);
+        if configured.components().count() > 1 {
+            return if configured.is_absolute() {
+                configured.to_path_buf()
+            } else {
+                self.root.join(configured)
+            };
+        }
+        std::env::var_os("PATH")
+            .map(|path| {
+                std::env::split_paths(&path)
+                    .map(|directory| directory.join(&self.alder))
+                    .find(|candidate| candidate.is_file())
+                    .unwrap_or_else(|| configured.to_path_buf())
+            })
+            .unwrap_or_else(|| configured.to_path_buf())
+    }
+}
+
+impl Effects for Host {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    fn alder(&self, args: &[&str]) -> Result<Value> {
+        self.run_alder(args)
+    }
+
+    fn tmux_session_exists(&self, session: &str) -> Result<bool> {
+        self.session_exists(session)
     }
 
     fn tmux_new_session(&self, session: &str, engine: &Engine) -> Result<()> {
@@ -127,8 +183,7 @@ impl Effects for Host {
     }
 
     fn tmux_kill_session(&self, session: &str) -> Result<()> {
-        self.run("tmux", &["kill-session", "-t", session])?;
-        Ok(())
+        self.kill_session(session)
     }
 
     fn tmux_send_keys(&self, session: &str, text: &str) -> Result<()> {
@@ -171,7 +226,7 @@ impl Effects for Host {
     }
 
     fn notify(&self, message: &str) {
-        self.log(message);
+        self.say(message);
         if let Some(command) = self.notify.as_deref() {
             let _ = Command::new("/bin/sh")
                 .args(["-c", command, "alderd", message])
@@ -186,13 +241,101 @@ impl Effects for Host {
     }
 
     fn log(&self, message: &str) {
-        let mut stderr = std::io::stderr();
-        let _ = writeln!(stderr, "{} alderd: {message}", Utc::now().to_rfc3339());
+        self.say(message);
+    }
+}
+
+/// The dispatch path. Same host, same shell-outs, plus the two things only a
+/// spawn needs: a git worktree and a pane started in it.
+impl SpawnHost for Host {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn alder_binary(&self) -> PathBuf {
+        self.alder_path()
+    }
+
+    fn alder(&self, args: &[&str]) -> Result<Value> {
+        self.run_alder(args)
+    }
+
+    fn git(&self, args: &[&str]) -> Result<Run> {
+        let output = self.run("git", args)?;
+        Ok(Run {
+            ok: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn tmux_session_exists(&self, session: &str) -> Result<bool> {
+        self.session_exists(session)
+    }
+
+    fn tmux_new_session(&self, session: &str, cwd: &Path, command: &str) -> Result<()> {
+        let cwd = cwd.display().to_string();
+        let output = self.run(
+            "tmux",
+            &["new-session", "-d", "-s", session, "-c", &cwd, command],
+        )?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(DriverError::new(format!(
+                "tmux new-session failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    fn tmux_set_environment(&self, session: &str, name: &str, value: &str) -> Result<()> {
+        let output = self.run("tmux", &["set-environment", "-t", session, name, value])?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(DriverError::new(format!(
+                "tmux set-environment failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    fn tmux_kill_session(&self, session: &str) -> Result<()> {
+        self.kill_session(session)
+    }
+
+    fn path_exists(&self, path: &Path) -> bool {
+        path.symlink_metadata().is_ok()
+    }
+
+    fn create_dir_all(&self, path: &Path) -> Result<()> {
+        std::fs::create_dir_all(path).map_err(|error| {
+            DriverError::new(format!("cannot create `{}`: {error}", path.display()))
+        })
+    }
+
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<()> {
+        std::fs::copy(from, to).map(|_| ()).map_err(|error| {
+            DriverError::new(format!(
+                "cannot copy `{}` to `{}`: {error}",
+                from.display(),
+                to.display()
+            ))
+        })
+    }
+
+    fn log(&self, message: &str) {
+        self.say(message);
     }
 }
 
 /// Single-quote one shell word for the command tmux will run.
-fn quote(value: &str) -> String {
+pub(crate) fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
