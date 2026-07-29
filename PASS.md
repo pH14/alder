@@ -117,16 +117,24 @@ the weaker of them ends up run wrong:
 
       codex review --base main \
         -c model=gpt-5.6-sol -c model_reasoning_effort=xhigh \
+        -c approval_policy=never -c sandbox_mode=workspace-write \
         "<the item's spec and checks>"
 
-  Both settings are explicit because neither is defaulted anywhere worth
-  trusting. `codex review` takes no `-m` — that is `codex exec` — so the model
-  is pinned with `-c model=` exactly as the effort is, and a run that omits
-  either is a review by whatever `~/.codex/config.toml` said that week, which
-  the log would then record as `sol`. The repository's own `AGENTS.md` is the
-  standing review lens and `codex review` reads it unprompted; the prompt
-  argument carries what that file cannot know — what *this* item was asked to
-  do, and what it must satisfy.
+  Every one of those is explicit because none of them is defaulted anywhere
+  worth trusting. The model and the effort say what reviewed the branch; a run
+  that omits either is a review by whatever `~/.codex/config.toml` said that
+  week, which the log would then record as `sol`. The other two say it runs
+  unattended: nobody is sitting at that pane, and a review stopped on an
+  approval request is indistinguishable from a slow one.
+
+  The model is pinned with `-c model=` and not with `-m` because `codex
+  review` has no `-m` — that flag is `codex exec`'s, and review rejects it
+  outright with `error: unexpected argument '-m' found`. This is written from
+  a run, not from the manual; do not "correct" it back.
+
+  The repository's own `AGENTS.md` is the standing review lens and `codex
+  review` reads it unprompted. The prompt argument carries what that file
+  cannot know — what *this* item was asked to do, and what it must satisfy.
 - **codex-authored** — a fresh leader subagent at the matching claude rung,
   handed the diff (`git diff main...work/<id>`), the item's spec, and its
   checks. Fresh because the point is a second reading: a subagent carrying this
