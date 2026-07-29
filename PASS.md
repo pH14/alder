@@ -22,16 +22,30 @@ Use `./target/debug/alder` for every alder command.
 2. **Reconcile.** `alder reconcile`. Apply repairs through the commands it
    names: a `missing` finding means the worker session died — end the
    attempt as it suggests; a `bindable` finding means a session lost its
-   handle — rebind it.
+   handle — rebind it; an `unspawned` finding means an attempt exists that
+   never had a worker — `alderd spawn <id>` adopts it rather than opening a
+   second one.
 3. **Triage questions.** For every *unanswered* question, decide which of
    four kinds it is before you decide anything else. See "Triage" below.
 4. **Relay answers.** For each answered question whose work has an active
    attempt: read the answer (`alder show <question>`), send it into the
-   worker's session —
-   `tmux send-keys -t alder-work-<id> -l -- "<the answer>"` then
-   `tmux send-keys -t alder-work-<id> Enter` —
-   then `alder work unblock <work> --why "<the ruling>"`. A worker with no
-   live session gets a fresh spawn instead (the answer rides the injection).
+   worker's session, then `alder work unblock <work> --why "<the ruling>"`.
+   How the answer is sent depends on what is holding the pane, which the
+   attempt's `engine` metadata names:
+   - **A claude worker** is an interactive session waiting on a prompt:
+     `tmux send-keys -t alder-work-<id> -l -- "<the answer>"` then
+     `tmux send-keys -t alder-work-<id> Enter`.
+   - **A codex worker** ran one shot and left a shell in its worktree, so
+     the answer is a *command* typed at that shell — the same two sends,
+     with `codex exec resume <codex-session-uuid> "<the ruling>"` as the
+     literal text, or `codex exec resume --last "<the ruling>"` when the
+     attempt carries no `codex-session` (resume picks the newest session in
+     that directory, so check `tmux capture-pane` first if the worker has
+     been running consults of its own).
+
+   A worker with no live session gets a fresh spawn instead — and a fresh
+   spawn is launched on the *item*, not on the Q&A, which is why an answer
+   that amounts to a ruling has to be folded into the item to survive.
    When an answer amounts to a spec ruling, fold it into the item with
    `alder work edit --spec/--add-check --why "<the ruling>"` so it outlives
    the Q&A and survives a respawn.
@@ -54,13 +68,22 @@ Use `./target/debug/alder` for every alder command.
    (`alder work add --handoff <id>` with real priority/checks). Workers
    cannot admit work; you are the only gate.
 7. **Dispatch.** While fewer than 2 workers are live, take the top item from
-   `alder next`, then: `alder work start <id>` and
-   `scripts/worker-spawn.sh <id> <attempt> [model]`. The script reads the
-   item and launches the worker on its **goal** — spec, checks, and gates —
-   so keep specs and check descriptions worth reading; they are the brief.
-   Choose the tier: claude-sonnet-5 for narrow well-specified items,
-   claude-opus-5 for ordinary work, claude-fable-5 only for the genuinely
-   hard. A dispatch round counts as the pass's heavy op if it spawns anyone.
+   `alder next`, then: `alderd spawn <id> [tier]`. That one command records
+   the attempt, cuts the worktree and branch, and launches the worker on its
+   **goal** — spec, checks, and gates — so keep specs and check descriptions
+   worth reading; they are the brief. A dispatch round counts as the pass's
+   heavy op if it spawns anyone. Choosing the rung is yours:
+   - **Default `terra`.** Ordinary work.
+   - **`luna`** for narrow, well-specified items; **`sol`** only for the
+     genuinely hard.
+   - **A capability gap climbs one rung on the same provider** — the ladders
+     are luna → terra → sol and sonnet → opus → fable.
+   - **The same root cause failing twice switches provider** at the
+     equivalent rung: luna↔sonnet, terra↔opus, sol↔fable.
+   - `alderd budget` shows trailing spend per provider and any rate limit.
+     A rung whose provider is rate-limited is served by its counterpart
+     automatically; `alderd limit <provider> --minutes <n>` is how a limit
+     gets recorded when a spawn or a worker dies on one.
 8. **Nudge stalls.** For each in-flight attempt with no milestone in a long
    while, look before poking: `tmux capture-pane -pt alder-work-<id> | tail`.
    Genuinely stalled: nudge once through send-keys. Stalled again next pass:
@@ -87,11 +110,11 @@ actually asking, not by how hard it looks.
   the question: end the attempt (`alder attempt end <attempt> --outcome
   cancelled --why "capability gap — task goes up a tier"`), close the
   question with the routing rather than the answer (`alder question answer
-  <question> "not a decision — respawning at claude-opus-5"`),
-  `alder work unblock`, then `work start` and spawn one tier higher.
+  <question> "not a decision — respawning at sol"`), `alder work unblock`,
+  then `alderd spawn <id> <one rung higher>`.
   Closing it with routing is deliberate: it keeps an *unanswered* question
-  meaning exactly one thing — Paul. The attempts' `engine` metadata records
-  the ladder the item has climbed.
+  meaning exactly one thing — Paul. The attempts' `tier`, `engine` and
+  `effort` metadata records the ladder the item has climbed.
 - **A consequential ruling inside your authority** — a call you can make but
   would rather not make thinly. You MAY consult one high-tier subagent
   first; then rule yourself and say in the answer that you consulted.

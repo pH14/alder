@@ -49,8 +49,9 @@ rewrites.
 Record `attempt.started`, then simulate a process crash before the worker is
 created.
 
-Reconciliation must find a starting attempt with no matching worker and allow
-it to end as `not_started`.
+Reconciliation must find a starting attempt with no matching worker and
+propose the repair: launching one while its work is still live, and otherwise
+allowing the attempt to end as `not_started`.
 
 ### A4. Crash after launch
 

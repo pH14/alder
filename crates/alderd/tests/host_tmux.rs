@@ -1,7 +1,7 @@
 //! The tmux shell-outs, against a real tmux server that is nobody else's.
 //!
 //! `Host` runs a bare `tmux`, so the only way to reach a private server
-//! without editing what ships is the shim scripts/tests/verify-goal-mode.sh
+//! without editing what ships is the shim scripts/tests/verify-spawn.sh
 //! already uses: a script named `tmux`, first on PATH, that unsets `TMUX` and
 //! `TMUX_PANE` and hands the real tmux an explicit `-S <socket>`. That is the
 //! whole safety story, and TMUX_TMPDIR does not do it: inside a tmux pane —

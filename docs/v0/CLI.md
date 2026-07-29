@@ -839,6 +839,9 @@ hm-9a1-attempt-1  recorded starting
 hm-6e3-attempt-2  recorded active, observation unknown
   no destructive action suggested
 
+hm-4c8-attempt-1  an open attempt has never been bound to a handle; no worker was launched
+  suggested: alderd spawn hm-4c8
+
 nimbus:box-22  present, no associated attempt
   attention: unclaimed environment handle
 ```
@@ -846,7 +849,9 @@ nimbus:box-22  present, no associated attempt
 Reconcile does not treat `unknown` as absent. It is durably read-only: it
 refreshes local observations and prints findings and suggested ordinary
 commands, but never appends an event or acts on a provider. A caller performs
-any accepted repair separately.
+any accepted repair separately. A suggestion is a string for a human or an
+agent to run: `alderd spawn` appears in one of them, and Alder still never
+calls `alderd`.
 
 Use `alder reconcile --no-refresh` to compare against the current local
 inventory.
