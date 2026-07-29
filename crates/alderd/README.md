@@ -237,6 +237,36 @@ and repeated in the injection. They never narrow the pass. A pass woken by
 `observations` still runs its complete sync, because the driver cannot know
 what else changed and is not allowed to guess.
 
+## The canary
+
+Everything above is tested against stubs and sandboxes. One thing is not, and
+cannot be: a real model, on a real item, all the way through. That is the
+canary, and it is run once by the leader after this lands — dispatch one
+narrow, well-specified item with `alderd spawn <id> luna` and watch for five
+things, in this order:
+
+1. the worker **commits** on its branch from inside the sandbox;
+2. it **appends** to the log from inside the sandbox (`alder attempt edit`);
+3. it asks something (`alder work ask`), the answer is relayed back with
+   `.alder/resume <codex-session> "<the ruling>"`, and the same session
+   continues rather than a new one starting;
+4. it leaves a `ready for review` note;
+5. the leader reviews the branch, runs the gates on it, and merges.
+
+The mechanisms underneath 1–3 were each probed before the canary was spent,
+because each had a way to fail silently:
+
+- a `workspace-write` worker in a linked worktree **cannot commit** without
+  the project's `.git` as a writable root — it dies on `index.lock`. Fixed
+  above, and verified both ways.
+- an append needs `network_access=true`: `alder` pushes to the store remote
+  over ssh, which works from inside the sandbox, and fails to resolve DNS
+  without it.
+- `codex exec resume` inherits no model, effort or sandbox, which is why the
+  relay is `.alder/resume` and not a hand-typed line.
+- a fresh worktree codex has never seen needs no trust prompt: `codex exec`
+  with `approval_policy=never` runs and commits straight away.
+
 ## Testing
 
 Decision logic lives in `src/decide.rs` as pure functions over a snapshot and
