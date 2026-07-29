@@ -249,10 +249,6 @@ impl Effects for Host {
 /// The dispatch path. Same host, same shell-outs, plus the two things only a
 /// spawn needs: a git worktree and a pane started in it.
 impl SpawnHost for Host {
-    fn now(&self) -> DateTime<Utc> {
-        Utc::now()
-    }
-
     fn root(&self) -> &Path {
         &self.root
     }

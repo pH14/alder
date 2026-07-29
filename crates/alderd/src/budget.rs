@@ -218,8 +218,11 @@ fn codex_spend(home: &Path, since: DateTime<Utc>, until: DateTime<Utc>) -> (Spen
             let Some(usage) = payload.pointer("/info/last_token_usage") else {
                 continue;
             };
+            // `input_tokens` is the whole prompt for that turn, cached part
+            // included — the sibling `cached_input_tokens` is a breakdown of
+            // it, not an addition to it.
             spend.add(
-                number(usage, "input_tokens") + number(usage, "cache_write_input_tokens"),
+                number(usage, "input_tokens"),
                 number(usage, "output_tokens"),
             );
             counted = true;

@@ -48,7 +48,6 @@ pub const WORKER_CMD_ENV: &str = "ALDER_WORKER_CMD";
 /// is one: the ordering rules above are the interesting part, and they are
 /// worth testing without a tmux server, a git checkout, or a model.
 pub trait SpawnHost {
-    fn now(&self) -> DateTime<Utc>;
     /// The project the leader dispatches from.
     fn root(&self) -> &Path;
     /// The `alder` binary, as a path that can be copied into a worktree.
@@ -642,10 +641,6 @@ mod tests {
     }
 
     impl SpawnHost for Fake {
-        fn now(&self) -> DateTime<Utc> {
-            now()
-        }
-
         fn root(&self) -> &Path {
             &self.root
         }
