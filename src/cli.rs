@@ -18,7 +18,7 @@ pub enum Command {
     /// Create or verify `.alder/config.json`.
     Init(InitArgs),
     /// The default context pack.
-    Status(OverlayArgs),
+    Status(StatusArgs),
     /// Actionable work in priority order.
     Next(OverlayArgs),
     /// Current state and history for any Alder object.
@@ -57,6 +57,47 @@ pub struct InitArgs {
 pub struct OverlayArgs {
     #[arg(long = "with", value_name = "CHANGES")]
     pub changes: Option<String>,
+}
+
+/// `status` is the index by default: the loop line plus a per-section count.
+/// `--full` expands every section back in, `--section` expands exactly one.
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    #[arg(long = "with", value_name = "CHANGES")]
+    pub changes: Option<String>,
+    /// Show every section in full, as well as recent events.
+    #[arg(long, conflicts_with = "section")]
+    pub full: bool,
+    /// Show one section in full alongside the counts.
+    #[arg(long, value_enum)]
+    pub section: Option<StatusSection>,
+}
+
+/// The six sections `status` counts by default. Names match the JSON keys
+/// they expand, not the CLI's usual kebab-case, so a caller can round-trip
+/// `--section <name>` straight from a `counts` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum StatusSection {
+    Attention,
+    Handoffs,
+    InFlight,
+    Ready,
+    WaitingOnHuman,
+    Blocked,
+}
+
+impl StatusSection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StatusSection::Attention => "attention",
+            StatusSection::Handoffs => "handoffs",
+            StatusSection::InFlight => "in_flight",
+            StatusSection::Ready => "ready",
+            StatusSection::WaitingOnHuman => "waiting_on_human",
+            StatusSection::Blocked => "blocked",
+        }
+    }
 }
 
 #[derive(Debug, Args)]

@@ -133,50 +133,92 @@ present the local projection as current.
 
 ## Orientation
 
-### `alder status [--with <changes>]`
+### `alder status [--with <changes>] [--full | --section <name>]`
 
-The default context pack:
+The default output is an index, not a report: the loop line plus a count for
+each of six sections. A drained log — nothing anywhere — costs a few dozen
+tokens instead of the full pack's few thousand:
 
 ```text
 $ alder status
 head 4211 · observations refreshed 38s ago
 
-attention
-  hm-2b7  attempt hm-2b7-attempt-1 absent; last progress 3h ago
-  hm-8c3  question hm-8c3-question-1 answered; still blocked
+loop
+  engine claude
+  open hm-pass-19  claude  tmux:alder-leader  started 2026-07-27T09:41:02Z
+
+counts
+  attention  2
+  handoffs   1
+  in flight  1
+  ready      2
+  waiting on human  1
+  blocked    0
+```
+
+The six counted sections are `attention`, `handoffs`, `in_flight`, `ready`,
+`waiting_on_human`, and `blocked`. In `--json` they sit under a `counts`
+object at the top level, present on every call regardless of `--full` or
+`--section`:
+
+```json
+{"counts": {"attention": 2, "handoffs": 1, "in_flight": 1, "ready": 2, "waiting_on_human": 1, "blocked": 0}, ...}
+```
+
+Counts are full current state, just summarized — level-triggered like the
+rest of Alder, never a delta. A nonzero count is not itself the detail; a
+caller that needs to act on one still fetches the section before treating the
+pass as done.
+
+`--section <name>` expands exactly one of the six sections back to its full
+list, alongside the counts:
+
+```text
+$ alder status --section attention
+head 4211 · observations refreshed 38s ago
 
 loop
   engine claude
   open hm-pass-19  claude  tmux:alder-leader  started 2026-07-27T09:41:02Z
 
-handoffs
-  hm-handoff-f27  Frame index v2  specs/frame-index-v2.md
+counts
+  attention  2
+  handoffs   1
+  in flight  1
+  ready      2
+  waiting on human  1
+  blocked    0
 
-in flight
-  hm-4f2  hm-4f2-attempt-1  tmux:box-17/alder-hm-4f2-attempt-1  present  checks 2/3
-
-ready
-  hm-9a1  priority 80
-  hm-2b7  priority 60
-
-waiting on human
-  hm-3bwm-question-1  ARM lane: ship masked digest or wait for AA-6?
+attention
+  hm-2b7  attempt hm-2b7-attempt-1 absent; last progress 3h ago
+  hm-8c3  question hm-8c3-question-1 answered; still blocked
 ```
+
+In `--json`, that adds a matching top-level key — here, `attention` — holding
+the array. The other five section keys stay absent; a caller that wants more
+than one issues more than one `--section` call, or reaches for `--full`.
+
+`--full` expands every section, matching today's full pack, and is the only
+way to see `recent_events` — the last ten log entries, dropped from the
+default pack entirely because the six sections already fold events into
+state. `--full` and `--section` are mutually exclusive.
 
 `status` shows observation times and command failures. Alder does not derive a
 stale-attempt classification; the caller judges elapsed time. A failed refresh
 produces `unknown` rather than presenting an older observation as current.
 
-`waiting on human` lists the unanswered questions someone can still act on.
-A question whose work has since been dropped or finished is stranded and is
-omitted from that list in both human and `--json` output; nobody is waiting on
-a decision about a requirement that no longer stands. Stranded questions are
-not hidden — `show` renders them, and reopening the work returns them to the
-list. The `--json` `questions` array carries every question with a derived
+`waiting_on_human` lists the unanswered questions someone can still act on. A
+question whose work has since been dropped or finished is stranded and is
+omitted from that list — and its count — in both human and `--json` output;
+nobody is waiting on a decision about a requirement that no longer stands.
+Stranded questions are not hidden — `show` renders them, and reopening the
+work returns them to the list. The `--json` `questions` array, always present
+regardless of `--full` or `--section`, carries every question with a derived
 `stranded` field.
 
-The `loop` section reports the loop's desired state and its two interesting
-passes: whether it is paused and why, the desired engine, whether a rotation is
+The `loop` section is not one of the six counted sections and is never
+gated: it reports the loop's desired state and its two interesting passes —
+whether it is paused and why, the desired engine, whether a rotation is
 pending, the open pass, and the last ended pass with its outcome, the first
 line of its report, any wake time it requested, and the head it ended at.
 Comparing that `ended_seq` with the document's own `head` tells a reader
@@ -193,10 +235,12 @@ hypothetical · based on head 4211 · replan.json · not written
 ...
 ```
 
-The hypothetical durable state is combined with the current external
-observations. Nothing is appended, and the hypothetical change is not written
-to the local projection. Ordinary head synchronization may first rebuild an
-out-of-date projection.
+`--with` composes with the rest of `status` exactly as it always has: the
+hypothetical durable state is combined with the current external
+observations, and the resulting counts (or expanded sections, under `--full`
+or `--section`) reflect it. Nothing is appended, and the hypothetical change
+is not written to the local projection. Ordinary head synchronization may
+first rebuild an out-of-date projection.
 
 ### `alder next [--with <changes>]`
 

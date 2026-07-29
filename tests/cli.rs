@@ -210,7 +210,8 @@ fn drive_work_and_preserve_the_completion_contract() {
     let started = project.success(&["work", "start", &first_id, "--meta", "engine=opus-5"]);
     let attempt = string(&started, "attempt_id");
     assert!(attempt.ends_with("-attempt-1"));
-    let in_flight = project.success(&["status"]);
+    assert_eq!(project.success(&["status"])["counts"]["in_flight"], 1);
+    let in_flight = project.success(&["status", "--full"]);
     assert_eq!(in_flight["in_flight"][0]["id"], attempt);
     assert!(in_flight["ready"].as_array().unwrap().is_empty());
     let duplicate = project.failure(&["work", "start", &first_id]);
@@ -257,16 +258,25 @@ fn drive_work_and_preserve_the_completion_contract() {
 
     let asked = project.success(&["work", "ask", &second_id, "Ship now?"]);
     let question = string(&asked, "question_id");
-    let waiting = project.success(&["status"]);
+    assert_eq!(
+        project.success(&["status"])["counts"]["waiting_on_human"],
+        1
+    );
+    let waiting = project.success(&["status", "--full"]);
     assert_eq!(waiting["waiting_on_human"][0]["id"], question);
     assert!(
         !project
-            .human(&["status"])
+            .human(&["status", "--full"])
             .contains("answered questions still blocked")
     );
     project.success(&["question", "answer", &question, "Wait"]);
     project.success(&["question", "answer", &question, "Ship"]);
-    let status = project.success(&["status"]);
+    assert_eq!(
+        project.success(&["status"])["counts"]["waiting_on_human"],
+        0
+    );
+    assert_eq!(project.success(&["status"])["counts"]["blocked"], 1);
+    let status = project.success(&["status", "--full"]);
     assert!(status["waiting_on_human"].as_array().unwrap().is_empty());
     assert_eq!(status["questions"][0]["answer"], "Ship");
     assert_eq!(
@@ -276,7 +286,7 @@ fn drive_work_and_preserve_the_completion_contract() {
     assert_eq!(status["blocked"][0]["id"], second_id);
     assert!(
         project
-            .human(&["status"])
+            .human(&["status", "--full"])
             .contains("answered questions still blocked")
     );
 
@@ -288,7 +298,8 @@ fn drive_work_and_preserve_the_completion_contract() {
         "--ref",
         "branch:side",
     ]);
-    let status = project.success(&["status"]);
+    assert_eq!(project.success(&["status"])["counts"]["handoffs"], 1);
+    let status = project.success(&["status", "--full"]);
     assert_eq!(status["handoffs"][0]["id"], handoff["handoff_id"]);
 }
 
@@ -359,7 +370,11 @@ fn observations_distinguish_presence_outage_and_missing_configuration() {
     project.config(json!([{"observer": "tmux", "list": command}]));
     let refreshed = project.success(&["refresh"]);
     assert_eq!(refreshed["result"]["present"], 1);
-    assert!(project.human(&["status"]).contains("tmux:worker  present"));
+    assert!(
+        project
+            .human(&["status", "--full"])
+            .contains("tmux:worker  present")
+    );
     let diagnostics = project.success(&["debug", "observations", "tmux"]);
     assert_eq!(diagnostics["kinds"][0]["configured"], true);
     assert_eq!(diagnostics["kinds"][0]["command"], command);
@@ -399,10 +414,150 @@ fn observations_distinguish_presence_outage_and_missing_configuration() {
     );
 
     project.config(json!([]));
-    let status = project.success(&["status"]);
+    assert_eq!(project.success(&["status"])["counts"]["attention"], 1);
+    let status = project.success(&["status", "--full"]);
     assert_eq!(status["attention"][0]["kind"], "unconfigured");
     assert!(status["attention"][0]["suggested_command"].is_null());
     assert_eq!(status["observations"]["handles"][0]["status"], "unknown");
+
+    let sectioned = project.success(&["status", "--section", "attention"]);
+    assert_eq!(sectioned["attention"][0]["kind"], "unconfigured");
+    assert!(sectioned.get("handoffs").is_none());
+    assert!(sectioned.get("blocked").is_none());
+    assert_eq!(sectioned["counts"]["attention"], 1);
+}
+
+const STATUS_SECTIONS: [&str; 6] = [
+    "attention",
+    "handoffs",
+    "in_flight",
+    "ready",
+    "waiting_on_human",
+    "blocked",
+];
+
+/// One item lands in each of the six counted sections, so `counts` and every
+/// `--full` / `--section` expansion can be checked against the same fixture.
+#[test]
+fn status_defaults_to_counts_and_expands_only_on_request() {
+    let project = TestProject::new();
+
+    // ready: nothing else has happened to it.
+    project.success(&["work", "add", "--title", "Ready work"]);
+
+    // in_flight + attention: an active attempt whose handle kind has no
+    // configured observer is both in flight and unconfigured attention.
+    let flight_work = string(
+        &project.success(&["work", "add", "--title", "In-flight work"]),
+        "work_id",
+    );
+    let attempt = string(
+        &project.success(&["work", "start", &flight_work]),
+        "attempt_id",
+    );
+    project.success(&["attempt", "edit", &attempt, "--handle", "tmux:worker"]);
+
+    // blocked + waiting_on_human: an unanswered question blocks its work.
+    let blocked_work = string(
+        &project.success(&["work", "add", "--title", "Blocked work"]),
+        "work_id",
+    );
+    project.success(&["work", "ask", &blocked_work, "Ship now?"]);
+
+    // handoffs: submitted, not yet admitted.
+    project.success(&[
+        "handoff",
+        "add",
+        "--title",
+        "Side work",
+        "--ref",
+        "branch:side",
+    ]);
+
+    let counts_only = project.success(&["status"]);
+    for section in STATUS_SECTIONS {
+        assert_eq!(counts_only["counts"][section], 1, "{section} count");
+        assert!(
+            counts_only.get(section).is_none(),
+            "{section} leaked into the default pack"
+        );
+    }
+    assert!(counts_only.get("recent_events").is_none());
+    assert!(counts_only.get("loop").is_some());
+    assert!(counts_only.get("observations").is_some());
+    assert!(counts_only.get("questions").is_some());
+
+    let human_default = project.human(&["status"]);
+    assert!(human_default.contains("\ncounts\n"), "{human_default}");
+    assert!(human_default.contains("attention  1"), "{human_default}");
+    assert!(human_default.contains("blocked  1"), "{human_default}");
+    assert!(
+        !human_default.contains(&flight_work),
+        "a work id should not appear in the counts-only view"
+    );
+
+    let full = project.success(&["status", "--full"]);
+    assert_eq!(full["counts"], counts_only["counts"]);
+    for section in STATUS_SECTIONS {
+        assert_eq!(
+            full[section].as_array().unwrap().len(),
+            usize::try_from(full["counts"][section].as_u64().unwrap()).unwrap(),
+            "{section} count must match its expanded section length"
+        );
+    }
+    assert!(full.get("recent_events").is_some());
+    let human_full = project.human(&["status", "--full"]);
+    assert!(human_full.contains(&flight_work), "{human_full}");
+
+    for section in STATUS_SECTIONS {
+        let sectioned = project.success(&["status", "--section", section]);
+        assert_eq!(sectioned["counts"], counts_only["counts"]);
+        assert_eq!(sectioned[section], full[section], "{section} round-trip");
+        for other in STATUS_SECTIONS {
+            if other != section {
+                assert!(
+                    sectioned.get(other).is_none(),
+                    "{other} leaked under --section {section}"
+                );
+            }
+        }
+        assert!(sectioned.get("recent_events").is_none());
+    }
+
+    // `--full` and `--section` name mutually exclusive levels of detail.
+    let conflict = project.failure(&["status", "--full", "--section", "ready"]);
+    assert_eq!(conflict["code"], "invalid_command");
+}
+
+#[test]
+fn status_with_composes_with_counts() {
+    let project = TestProject::new();
+    project.success(&["work", "add", "--title", "Existing"]);
+    let baseline = project.success(&["status"])["counts"]["ready"]
+        .as_u64()
+        .unwrap();
+
+    let document = project.work.join("overlay.json");
+    fs::write(
+        &document,
+        serde_json::to_vec(&json!({"add": [{"title": "Hypothetical"}]})).unwrap(),
+    )
+    .unwrap();
+
+    let overlaid = project.success(&["status", "--with", path(&document)]);
+    assert_eq!(overlaid["hypothetical"], true);
+    assert_eq!(overlaid["counts"]["ready"], baseline + 1);
+    assert!(overlaid.get("ready").is_none());
+
+    let overlaid_full = project.success(&["status", "--with", path(&document), "--full"]);
+    assert_eq!(overlaid_full["counts"]["ready"], baseline + 1);
+    assert_eq!(
+        overlaid_full["ready"].as_array().unwrap().len(),
+        usize::try_from(baseline + 1).unwrap()
+    );
+
+    // Nothing was written: the plain read still sees the original count.
+    assert_eq!(project.success(&["status"])["counts"]["ready"], baseline);
 }
 
 #[test]
@@ -767,7 +922,8 @@ fn handoff_withdraw_retires_a_submission_and_status_stops_listing_it() {
         "branch:side",
     ]);
     let handoff_id = string(&handoff, "handoff_id");
-    let status = project.success(&["status"]);
+    assert_eq!(project.success(&["status"])["counts"]["handoffs"], 1);
+    let status = project.success(&["status", "--full"]);
     assert_eq!(status["handoffs"][0]["id"], handoff_id);
 
     // An empty reason is rejected before anything is appended.
@@ -788,9 +944,10 @@ fn handoff_withdraw_retires_a_submission_and_status_stops_listing_it() {
     assert_eq!(withdrawn["state"], "withdrawn");
 
     // Status-filter: a withdrawn handoff is no longer an inbox entry.
-    let status = project.success(&["status"]);
+    assert_eq!(project.success(&["status"])["counts"]["handoffs"], 0);
+    let status = project.success(&["status", "--full"]);
     assert!(status["handoffs"].as_array().unwrap().is_empty());
-    assert!(!project.human(&["status"]).contains(&handoff_id));
+    assert!(!project.human(&["status", "--full"]).contains(&handoff_id));
 
     // `show` still renders it, now terminal.
     let shown = project.success(&["show", &handoff_id]);
@@ -850,10 +1007,14 @@ fn terminal_work_strands_its_questions_until_it_is_reopened() {
     );
 
     // While the work is live the question is a decision someone owes.
-    let status = project.success(&["status"]);
+    assert_eq!(
+        project.success(&["status"])["counts"]["waiting_on_human"],
+        1
+    );
+    let status = project.success(&["status", "--full"]);
     assert_eq!(status["waiting_on_human"][0]["id"], question);
     assert_eq!(status["questions"][0]["stranded"], Value::Null);
-    assert!(project.human(&["status"]).contains(&question));
+    assert!(project.human(&["status", "--full"]).contains(&question));
     assert_eq!(
         project.success(&["debug", "query", "SELECT count(*) AS n FROM questions_open"])["result"]
             ["rows"][0]["n"],
@@ -863,10 +1024,14 @@ fn terminal_work_strands_its_questions_until_it_is_reopened() {
     // Dropping the work strands it, and the drop says so at decision time.
     let dropped = project.success(&["work", "drop", &work, "--why", "requirement withdrawn"]);
     assert_eq!(dropped["stranded_questions"][0], question);
-    let status = project.success(&["status"]);
+    assert_eq!(
+        project.success(&["status"])["counts"]["waiting_on_human"],
+        0
+    );
+    let status = project.success(&["status", "--full"]);
     assert!(status["waiting_on_human"].as_array().unwrap().is_empty());
     assert_eq!(status["questions"][0]["stranded"], "work dropped");
-    assert!(!project.human(&["status"]).contains(&question));
+    assert!(!project.human(&["status", "--full"]).contains(&question));
     assert_eq!(
         project.success(&["debug", "query", "SELECT count(*) AS n FROM questions_open"])["result"]
             ["rows"][0]["n"],
@@ -887,8 +1052,13 @@ fn terminal_work_strands_its_questions_until_it_is_reopened() {
         project.success(&["show", &work])["current"]["state"],
         "blocked"
     );
-    let status = project.success(&["status"]);
+    assert_eq!(
+        project.success(&["status"])["counts"]["waiting_on_human"],
+        1
+    );
+    let status = project.success(&["status", "--section", "waiting_on_human"]);
     assert_eq!(status["waiting_on_human"][0]["id"], question);
+    assert!(status.get("blocked").is_none());
     assert_eq!(
         project.success(&["show", &question])["current"]["stranded"],
         Value::Null
@@ -983,11 +1153,9 @@ fn terminal_transitions_report_the_questions_they_strand() {
         project.success(&["show", &finished_question])["current"]["stranded"],
         "work done"
     );
-    assert!(
-        project.success(&["status"])["waiting_on_human"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        project.success(&["status"])["counts"]["waiting_on_human"],
+        0
     );
 
     // Work with nothing outstanding strands nothing and says nothing.

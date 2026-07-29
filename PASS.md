@@ -13,9 +13,12 @@ Use `./target/debug/alder` for every alder command.
 
 ## The pass
 
-1. **Sync.** `alder status --json`. Read every section: attention, handoffs,
-   in flight, ready, waiting on human. `alder refresh` runs the tmux
-   observer, so status reflects live worker sessions.
+1. **Sync.** `alder status --json` reads as an index: the loop line plus a
+   count for `attention`, `handoffs`, `in_flight`, `ready`,
+   `waiting_on_human`, and `blocked`. Any nonzero count obligates fetching
+   that section — `alder status --section <name>`, or `--full` for more than
+   one — before this pass may end. `alder refresh` runs the tmux observer,
+   so status reflects live worker sessions.
 2. **Reconcile.** `alder reconcile`. Apply repairs through the commands it
    names: a `missing` finding means the worker session died — end the
    attempt as it suggests; a `bindable` finding means a session lost its
@@ -36,8 +39,11 @@ Use `./target/debug/alder` for every alder command.
    "ready for review" and every check is satisfied. At most ONE full
    review-and-merge per pass:
    - Read the branch diff: `git diff main...work/<id>`.
-   - Run the gates yourself on their branch (`cargo fmt --check`, `cargo
-     clippy --workspace --all-targets`, `cargo test --workspace`).
+   - Run the gates yourself on their branch (`cargo fmt --check` — already
+     silent on a pass and shows the diff on a failure, so it takes no flag —
+     `cargo clippy --workspace --all-targets --quiet`, `cargo test
+     --workspace --quiet`). `--quiet` drops cargo's own build chatter; a
+     failure's warnings, diff, or test output still print in full.
    - Good: merge locally (`git merge --no-ff work/<id>`), then
      `alder work finish <id> --attempt <attempt>`, kill the session
      (`tmux kill-session -t alder-work-<id>`), remove the worktree

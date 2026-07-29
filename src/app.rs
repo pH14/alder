@@ -11,7 +11,7 @@ use crate::{
     cli::{
         AttemptCommand, AttemptEditArgs, Command, DebugCommand, DebugDbCommand, DebugLogCommand,
         HandoffCommand, LoopCommand, NonSuccessOutcome, PassCommand, PassOutcomeArg,
-        QuestionCommand, TriggerKind, WorkAddArgs, WorkCommand, WorkEditArgs,
+        QuestionCommand, StatusSection, TriggerKind, WorkAddArgs, WorkCommand, WorkEditArgs,
     },
     config::{Project, initialize},
     domain::{
@@ -57,7 +57,12 @@ impl App {
         let mut context = load_context()?;
         match command {
             Command::Init(_) => unreachable!(),
-            Command::Status(args) => status(&mut context, args.changes.as_deref()),
+            Command::Status(args) => status(
+                &mut context,
+                args.changes.as_deref(),
+                args.full,
+                args.section,
+            ),
             Command::Next(args) => next(&mut context, args.changes.as_deref()),
             Command::Show(args) => show(&context, &args.id),
             Command::Refresh => refresh(&context),
@@ -630,7 +635,12 @@ fn attempt_edit(context: &Context, args: &AttemptEditArgs) -> Result<Output> {
     ))
 }
 
-fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
+fn status(
+    context: &mut Context,
+    changes: Option<&str>,
+    full: bool,
+    section: Option<StatusSection>,
+) -> Result<Output> {
     let (state, hypothetical, source) = overlay_state(context, changes)?;
     let mut observations = context.projection.observations()?;
     let runs = context.projection.observation_runs()?;
@@ -704,17 +714,16 @@ fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
         .cloned()
         .collect();
     blocked.sort_by_key(|work| work.opened_seq);
-    let recent_events: Vec<_> = context
-        .snapshot
-        .events
-        .iter()
-        .rev()
-        .take(10)
-        .rev()
-        .map(event_summary)
-        .collect();
     let loop_section = loop_section(&state);
-    let json = json!({
+    let counts = json!({
+        "attention": findings.len(),
+        "handoffs": handoffs.len(),
+        "in_flight": in_flight.len(),
+        "ready": ready.len(),
+        "waiting_on_human": questions.len(),
+        "blocked": blocked.len(),
+    });
+    let mut json = json!({
         "schema": "alder.status.v0",
         "head": context.snapshot.head.sequence(),
         "revision": context.snapshot.head.revision(),
@@ -725,15 +734,38 @@ fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
             "runs": runs,
             "handles": observations,
         },
-        "attention": findings,
-        "handoffs": handoffs,
-        "in_flight": in_flight,
-        "ready": ready,
-        "waiting_on_human": questions,
         "questions": rendered_questions,
-        "blocked": blocked,
-        "recent_events": recent_events,
+        "counts": counts,
     });
+    let object = json.as_object_mut().expect("status json is an object");
+    if full {
+        object.insert("attention".to_owned(), json!(findings));
+        object.insert("handoffs".to_owned(), json!(handoffs));
+        object.insert("in_flight".to_owned(), json!(in_flight));
+        object.insert("ready".to_owned(), json!(ready));
+        object.insert("waiting_on_human".to_owned(), json!(questions));
+        object.insert("blocked".to_owned(), json!(blocked));
+        let recent_events: Vec<_> = context
+            .snapshot
+            .events
+            .iter()
+            .rev()
+            .take(10)
+            .rev()
+            .map(event_summary)
+            .collect();
+        object.insert("recent_events".to_owned(), json!(recent_events));
+    } else if let Some(section) = section {
+        let value = match section {
+            StatusSection::Attention => json!(findings),
+            StatusSection::Handoffs => json!(handoffs),
+            StatusSection::InFlight => json!(in_flight),
+            StatusSection::Ready => json!(ready),
+            StatusSection::WaitingOnHuman => json!(questions),
+            StatusSection::Blocked => json!(blocked),
+        };
+        object.insert(section.as_str().to_owned(), value);
+    }
     let mut lines = Vec::new();
     if hypothetical {
         lines.push(format!(
@@ -757,9 +789,8 @@ fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
     if !failures.is_empty() {
         lines.push(format!("observation failures: {}", failures.join(", ")));
     }
-    human_section(
-        &mut lines,
-        "attention",
+    human_section(&mut lines, "loop", loop_lines(&state));
+    let attention_lines = || {
         findings.iter().map(|finding| {
             format!(
                 "{}  {}",
@@ -770,22 +801,17 @@ fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
                     .unwrap_or("-"),
                 finding.detail
             )
-        }),
-    );
-    human_section(&mut lines, "loop", loop_lines(&state));
-    human_section(
-        &mut lines,
-        "handoffs",
+        })
+    };
+    let handoffs_lines = || {
         handoffs.iter().map(|handoff| {
             format!(
                 "{}  {}  {}",
                 handoff.id, handoff.title, handoff.artifact_ref
             )
-        }),
-    );
-    human_section(
-        &mut lines,
-        "in flight",
+        })
+    };
+    let in_flight_lines = || {
         in_flight.iter().map(|attempt| {
             let status = attempt
                 .handle
@@ -800,45 +826,71 @@ fn status(context: &mut Context, changes: Option<&str>) -> Result<Output> {
                 attempt.handle.as_deref().unwrap_or("unbound"),
                 status
             )
-        }),
-    );
-    human_section(
-        &mut lines,
-        "ready",
+        })
+    };
+    let ready_lines = || {
         ready
             .iter()
-            .map(|work| format!("{}  {}  priority {}", work.id, work.title, work.priority)),
-    );
-    human_section(
-        &mut lines,
-        "waiting on human",
+            .map(|work| format!("{}  {}  priority {}", work.id, work.title, work.priority))
+    };
+    let waiting_on_human_lines = || {
         questions
             .iter()
-            .map(|question| format!("{}  {}", question.id, question.text)),
-    );
-    human_section(
-        &mut lines,
-        "answered questions still blocked",
-        answered_blocked.iter().map(|question| {
-            format!(
-                "{}  {}  answer: {}",
-                question.id,
-                question.work_id,
-                question.answer.as_deref().unwrap_or_default()
-            )
-        }),
-    );
-    human_section(
-        &mut lines,
-        "blocked",
+            .map(|question| format!("{}  {}", question.id, question.text))
+    };
+    let blocked_lines = || {
         blocked.iter().map(|work| {
             format!(
                 "{}  {}",
                 work.id,
                 work.block_reason.as_deref().unwrap_or("blocked")
             )
-        }),
-    );
+        })
+    };
+    if full {
+        human_section(&mut lines, "attention", attention_lines());
+        human_section(&mut lines, "handoffs", handoffs_lines());
+        human_section(&mut lines, "in flight", in_flight_lines());
+        human_section(&mut lines, "ready", ready_lines());
+        human_section(&mut lines, "waiting on human", waiting_on_human_lines());
+        human_section(
+            &mut lines,
+            "answered questions still blocked",
+            answered_blocked.iter().map(|question| {
+                format!(
+                    "{}  {}  answer: {}",
+                    question.id,
+                    question.work_id,
+                    question.answer.as_deref().unwrap_or_default()
+                )
+            }),
+        );
+        human_section(&mut lines, "blocked", blocked_lines());
+    } else if let Some(section) = section {
+        match section {
+            StatusSection::Attention => human_section(&mut lines, "attention", attention_lines()),
+            StatusSection::Handoffs => human_section(&mut lines, "handoffs", handoffs_lines()),
+            StatusSection::InFlight => human_section(&mut lines, "in flight", in_flight_lines()),
+            StatusSection::Ready => human_section(&mut lines, "ready", ready_lines()),
+            StatusSection::WaitingOnHuman => {
+                human_section(&mut lines, "waiting on human", waiting_on_human_lines())
+            }
+            StatusSection::Blocked => human_section(&mut lines, "blocked", blocked_lines()),
+        }
+    } else {
+        human_section(
+            &mut lines,
+            "counts",
+            [
+                format!("attention  {}", findings.len()),
+                format!("handoffs  {}", handoffs.len()),
+                format!("in flight  {}", in_flight.len()),
+                format!("ready  {}", ready.len()),
+                format!("waiting on human  {}", questions.len()),
+                format!("blocked  {}", blocked.len()),
+            ],
+        );
+    }
     Ok(Output::new(json, lines.join("\n")))
 }
 
