@@ -47,12 +47,26 @@ Use `./target/debug/alder` for every alder command.
      codex session in that directory, which is the worker's own unless it
      has been running consults.
 
+   **Then confirm it landed.** `send-keys -l` fills the pane's input buffer and
+   the `Enter` that follows does not reliably commit it: a full feedback
+   message has sat unsent in a worker's buffer for an entire pass — twice —
+   while the log recorded the ruling as relayed. So capture the pane
+   (`tmux capture-pane -pt alder-work-<id> | tail`) and read it: the text must
+   be gone from the input line and the engine must be working. If the message
+   is still sitting there, send a bare `Enter` again and capture again. Do this
+   before `work unblock`, so the log's "relayed" and the worker's reality agree.
+   A tmux pane is not a durable channel — the same lesson as recording a review
+   before relaying it.
+
    A worker with no live session gets a fresh spawn instead — and a fresh
    spawn is launched on the *item*, not on the Q&A, which is why an answer
    that amounts to a ruling has to be folded into the item to survive.
    When an answer amounts to a spec ruling, fold it into the item with
-   `alder work edit --spec/--add-check --why "<the ruling>"` so it outlives
-   the Q&A and survives a respawn.
+   `alder work edit --spec --why "<the ruling>"` so it outlives the Q&A and
+   survives a respawn. A ruling that needs a whole new *check* cannot be folded
+   into a running item — checks cannot change while an attempt is active — so
+   it waits for the attempt to end and lands with the respawn, or it stays in
+   the spec.
 5. **Review finished workers.** A worker is finished when its attempt says
    "ready for review" and every check it owns is satisfied. At most ONE full
    review-and-merge per pass:
@@ -64,7 +78,9 @@ Use `./target/debug/alder` for every alder command.
      failure's warnings, diff, or test output still print in full.
    - Cross-review it before it goes anywhere — see **The cross-review rule**.
      Your own reading is not that review; you dispatched the work.
-   - Good: merge locally (`git merge --no-ff work/<id>`), then
+   - Good: check that the branch head still equals the `reviewed-sha` you
+     recorded (`git rev-parse work/<id>`), merge locally
+     (`git merge --no-ff work/<id>`), then
      `alder work finish <id> --attempt <attempt>`, kill the session
      (`tmux kill-session -t alder-work-<id>`), remove the worktree
      (`git worktree remove ../alder-work-<id>`) and delete the branch.
@@ -101,14 +117,22 @@ Use `./target/debug/alder` for every alder command.
 Before a branch is merged — or, when it is being staged for Paul rather than
 merged, before it is presented to him, and again before any re-presentation —
 it is reviewed by an engine on the **other vendor's ladder**. The author's
-engine is the attempt's `engine` metadata; the reviewer is the
-equivalent-or-higher rung across from it. Never the author's own vendor, never
-the author's own session: a reviewer that shares the author's blind spots
-returns a rubber stamp with a receipt on it.
+engine is the attempt's `engine` metadata; the reviewer is the rung across from
+it or higher. Never the author's own vendor, never the author's own session: a
+reviewer that shares the author's blind spots returns a rubber stamp with a
+receipt on it.
 
-- **claude-authored work is reviewed on codex, at `sol`.**
-- **codex-authored work is reviewed on claude:** `sol` → `opus` or `fable`,
-  `terra` → `opus`, `luna` → `sonnet` or above.
+| authored at | reviewed by |
+| --- | --- |
+| `sonnet`, `opus`, `fable` | codex `sol` |
+| `luna` | claude `sonnet` or higher |
+| `terra` | claude `opus` or `fable` |
+| `sol` | claude `fable` |
+
+The ladders pair by standing — `luna`↔`sonnet`, `terra`↔`opus`, `sol`↔`fable`,
+the counterpart column in `crates/alderd/README.md` — so `sol` is reviewed at
+`fable` and not at `opus`. Reviewing the hardest codex work a rung down is the
+one thing "across from it or higher" rules out.
 
 The two mechanics are **not symmetric**, and treating them as one shape is how
 the weaker of them ends up run wrong:
@@ -124,8 +148,8 @@ the weaker of them ends up run wrong:
   worth trusting. The model and the effort say what reviewed the branch; a run
   that omits either is a review by whatever `~/.codex/config.toml` said that
   week, which the log would then record as `sol`. The other two say it runs
-  unattended: nobody is sitting at that pane, and a review stopped on an
-  approval request is indistinguishable from a slow one.
+  unattended: nothing answers an approval request inside a review, and a review
+  stopped waiting on one is indistinguishable from a slow one.
 
   The model is pinned with `-c model=` and not with `-m` because `codex
   review` has no `-m` — that flag is `codex exec`'s, and review rejects it
@@ -135,45 +159,121 @@ the weaker of them ends up run wrong:
   The repository's own `AGENTS.md` is the standing review lens and `codex
   review` reads it unprompted. The prompt argument carries what that file
   cannot know — what *this* item was asked to do, and what it must satisfy.
-- **codex-authored** — a fresh leader subagent at the matching claude rung,
-  handed the diff (`git diff main...work/<id>`), the item's spec, and its
-  checks. Fresh because the point is a second reading: a subagent carrying this
-  pass's context has already agreed with everything in it.
+- **codex-authored** — a fresh `claude` one-shot at the matching rung, run in
+  the branch's own worktree:
 
-The verdict is durable, on the **authoring** attempt, in one call:
+      claude -p --model claude-fable-5 --effort xhigh --permission-mode auto \
+        "Review work/<id> against main: git diff main...work/<id>. \
+         The item's spec: <spec>. Its checks: <checks>. \
+         AGENTS.md is the review lens. Report findings, or say the branch is clean."
 
+  The full model ID and the effort are written out for the same reason the
+  codex side writes them out, and `claude-fable-5` rather than `fable` because
+  an alias moves under you. This is a `claude` invocation and not a subagent
+  precisely because of the effort: a subagent inherits the leader's session
+  effort, which is nowhere in the log, so `reviewed-by` would name a rung the
+  review may not have run at. `--permission-mode auto` is the counterpart of
+  the codex side's `approval_policy=never`: nobody is watching for a prompt.
+
+  Fresh matters as much as the rung. The point is a second reading, and any
+  session carrying this pass's context has already agreed with everything in
+  it.
+
+### Record the verdict before you relay it
+
+Every verdict is durable, on the **authoring** attempt, and it is written
+*before* a word of it reaches anyone. Both outcomes are one call:
+
+    # clean
     alder attempt edit <attempt> --satisfied cross-review \
-      --evidence "gpt-5.6-sol via codex review: no blocking findings, 2 minor" \
-      --meta reviewed-by=gpt-5.6-sol
+      --evidence "gpt-5.6-sol via codex review at c7c8923: clean, 0 findings" \
+      --meta reviewed-by=gpt-5.6-sol --meta reviewed-sha=c7c8923
 
-Evidence names the reviewer engine, the verdict, and the finding count.
+    # changes requested
+    alder attempt edit <attempt> --failed cross-review \
+      --evidence "gpt-5.6-sol via codex review at c7c8923: changes requested, 6 findings (4 P1)" \
+      --meta reviewed-by=gpt-5.6-sol --meta reviewed-sha=c7c8923
+
+Evidence names four things: the reviewer engine, the commit it read, the
+verdict, and the finding count.
+
+**Findings first, feedback second.** A review that ends in a `send-keys` and
+nothing else appended is a review that did not happen: after a rotation or a
+crash, a branch with findings reads exactly like a branch nobody has looked at,
+so the next leader pays for the same review again and the author waits another
+pass for feedback it was already sent. `--failed cross-review` is what makes
+that state readable — it is the level-triggered rule in `AGENTS.md` turned on
+the leader's own work.
+
 `reviewed-by` lands beside the `engine` the dispatch stamped, so author ≠
 reviewer is auditable from the log alone, by a reader who was not there.
+`reviewed-sha` is what makes the verdict a fact about a **revision** rather
+than about a branch: a satisfied check does not follow new commits, so an
+author who commits one more fix leaves a green check over unreviewed code. **At
+merge, the branch head must equal `reviewed-sha`.** If it has moved — a fix, a
+rebase, one more commit — the review is stale: run it again and record the new
+SHA.
 
-`cross-review` is declared at admission, with the item's other checks, because
-checks cannot change while an attempt is active (docs/v0/MODEL.md) and by the
-time a branch is worth reviewing it is far too late to add one:
+### The check is declared at admission
 
-    --add-check cross-review:"reviewed by the other vendor's ladder; the leader records this one, not the worker"
+`cross-review` is declared when the item is admitted, alongside its other
+checks, with `work add`:
 
-That description is part of the mechanism: a worker reading its goal sees a
-check that is not its to satisfy and stops at "ready for review" as its brief
-already tells it to. An item admitted before this rule carries no such check —
-review it anyway, record the verdict as an attempt note plus `reviewed-by`, and
-finish it on the checks it does carry.
+    alder work add --handoff <handoff> --priority <n> \
+      --check <the item's own checks> \
+      --check cross-review:"reviewed by the other vendor's ladder; the leader records this one, not the worker"
 
-Findings go one of three ways:
+`work add` takes `--check`. `--add-check` is `work edit`'s flag and does not
+exist on `add` (`src/cli.rs`), so reaching for it here fails the admission
+outright. And admission is the only moment it can be declared, because a check
+cannot be bolted onto work that is already running:
+
+    $ alder work edit al-zptgbz --add-check cross-review:"…"
+    error [active_attempt]: dependencies and checks cannot change while
+      `al-zptgbz-attempt-1` is active
+
+That is the ordinary rule from `docs/v0/MODEL.md`, and it is not worth routing
+around — ending a live attempt to widen its contract would be worse than the
+gap it closes. An item is admitted long before a branch exists, so there is no
+pass in which declaring it late is the only option.
+
+**Every item admitted before this rule has no such check**, including the one
+that introduced it. Do not end an attempt to add one. Review the branch anyway
+and record the same four facts where they still fit — `--meta
+reviewed-by=<engine> --meta reviewed-sha=<sha>` plus an attempt note carrying
+the verdict and the finding count — then finish the item on the checks it does
+carry. The audit trail comes out identical; what is missing is only the gate,
+so on those items the merge is held by your reading of the log rather than by
+`work finish` refusing. That set shrinks with every admission and never grows.
+
+The check is the leader's, and both worker-facing briefs say so: the dispatched
+goal names it apart from the checks the worker owns (`LEADER_CHECKS` and
+`Brief::goal` in `crates/alderd/src/spawn.rs`), and `WORKER.md` tells a worker
+to emit "ready for review" when the checks that are *its own* are satisfied.
+Neither is a courtesy. A worker stops when every check is satisfied; an
+unmarked check that only the leader can satisfy would strand every worker one
+step short of the marker step 5 waits on, and the protocol would deadlock on a
+check nobody could reach.
+
+Findings then go one of three ways, all of them after the check already reads
+`failed`:
 
 - **A real defect** goes back to the author exactly as any review finding does
-  today: precise feedback into the worker's session, or a respawn on the same
-  item and branch if the session is gone. The branch stays in flight.
+  today: precise feedback into the worker's session — confirmed landed, per step
+  4 — or a respawn on the same item and branch if the session is gone. The
+  branch stays in flight, and the author is told a finding is evidence, not an
+  order: it may be argued down with reasoning.
 - **A disagreement that needs authority** — the reviewer calls it a defect, the
   author defends it, and settling it is a ruling rather than a fix — becomes a
   `work ask` on the item: options plus a recommendation, and it waits.
-- **Anything unresolved blocks the merge**, because `cross-review` stays
-  unsatisfied and an unsatisfied check is what `work finish` refuses. There is
-  no override, deliberately: a finding is fixed, ruled on, or argued down on
-  the record.
+- **Anything unresolved blocks the merge**, because `cross-review` reads
+  `failed` until a re-review clears it, and `work finish` refuses a check that
+  is not satisfied. There is no override, deliberately: a finding is fixed,
+  ruled on, or argued down on the record.
+
+A re-review is a fresh review of a new revision: same command, new
+`reviewed-sha`, and `--satisfied` only once an engine that is not the author has
+read the code that is actually being merged.
 
 A cross-review is a heavy op. Running one is the pass's heavy op, whether or
 not the merge follows it in the same pass.
