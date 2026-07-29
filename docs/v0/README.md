@@ -134,7 +134,8 @@ attempt with `alder attempt edit`.
 
 This makes both crash windows repairable:
 
-- recorded attempt, no worker: end the attempt as `not_started`;
+- recorded attempt, no worker: launch one for it, or end the attempt as
+  `not_started` if the work no longer wants one;
 - worker exists, handle was not recorded: find it by attempt ID and attach its
   handle with `alder attempt edit`.
 

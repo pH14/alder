@@ -3,7 +3,7 @@
 #
 # Lists only `alder-work-*` sessions — the leader's own session is a pass
 # handle, not an attempt handle, and would read as noise. The attempt stamp
-# is the ALDER_ATTEMPT session environment variable set by worker-spawn.sh.
+# is the ALDER_ATTEMPT session environment variable set by `alderd spawn`.
 # Session names and attempt IDs are alder-generated slugs, so no JSON
 # escaping is needed.
 set -euo pipefail

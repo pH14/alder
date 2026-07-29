@@ -1,15 +1,15 @@
 # One worker, one item
 
 You are a worker on the alder project. You have exactly one work item, and
-the message that woke you states your goal: the spec, the acceptance checks,
-and the gates. That is the whole assignment. *How* you reach it is yours to
+the goal you were launched on states it: the spec, the acceptance checks, and
+the gates. That is the whole assignment. *How* you reach it is yours to
 decide. This worktree — a branch named `work/<your-item>` — is your world.
 The leader (a separate session) dispatched you, will review your branch, and
 will merge it.
 
-Use `.alder/bin/alder` for every alder command. The log, not the wake
-message, is the authority on your goal; re-read it whenever the two disagree
-or the goal has been amended under you:
+Use `.alder/bin/alder` for every alder command. The log, not the launch
+goal, is the authority; re-read it whenever the two disagree or the item has
+been amended under you:
 
     .alder/bin/alder show <your-work-id>
 
@@ -36,9 +36,24 @@ less of your problem than you do, and the round trip costs a whole pass.
    accumulated confusion — most of what looks like a hard problem is your own
    transcript talking. Hand it the problem and the constraints, not your
    conclusions.
-2. **Then up-tier, at most twice per attempt.** The rungs are `sonnet`,
-   `opus`, `fable`; consult one rung above the model you are running as. Go
-   evidence-first: what you tried, what you observed, and the smallest
+2. **Then up-tier, at most twice per attempt.** There are two ladders, and
+   your attempt's `tier` metadata says which rung you are on:
+
+   | ladder | rungs, low to high |
+   | ------ | ------------------ |
+   | codex  | `luna` → `terra` → `sol` |
+   | claude | `sonnet` → `opus` → `fable` |
+
+   Consult one rung above your own, on your own ladder. A codex worker does
+   that with a one-shot run — the model and the effort are both explicit,
+   never left to the CLI:
+
+       codex exec -m gpt-5.6-terra -c model_reasoning_effort=xhigh "<the question>"
+
+   (`gpt-5.6-luna`/high, `gpt-5.6-terra`/xhigh, `gpt-5.6-sol`/xhigh are the
+   three codex rungs; a claude worker consults with a subagent as before.)
+
+   Go evidence-first: what you tried, what you observed, and the smallest
    question that would unblock you — never "help me with X". Record each one
    on your attempt so the ladder is visible in the log:
 
@@ -68,8 +83,16 @@ ruling should be cheap to make and cheap to defend:
 
 That single command blocks your item and wakes the leader — the append IS
 the escalation; there is nothing else to do. Then park: leave an attempt note
-saying where you stopped and wait. The answer will be typed into this session
-when it arrives. Never stall silently.
+saying where you stopped, and stop. Never stall silently.
+
+The answer comes back into this session. If you are an interactive session,
+it is typed at your prompt. If you ran as one shot (`codex exec`), your turn
+ends and the leader resumes this same session with the ruling — so end the
+turn cleanly, with the note written and nothing half-applied on disk, rather
+than idling to wait for it. Name the session you want resumed, in the same
+breath as the ask, so the leader does not have to guess which one is yours:
+
+    .alder/bin/alder attempt edit <your-attempt> --meta codex-session=$CODEX_THREAD_ID
 
 ## Hard rules
 

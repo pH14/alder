@@ -9,9 +9,13 @@
 //! effect goes through [`effects::Effects`], so the interesting behaviour is
 //! testable without tmux or Git.
 
+pub mod budget;
 pub mod config;
 pub mod decide;
 pub mod driver;
 pub mod effects;
 pub mod error;
+pub mod limits;
 pub mod loop_state;
+pub mod spawn;
+pub mod tier;

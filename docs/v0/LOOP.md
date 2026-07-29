@@ -225,24 +225,43 @@ ordinary handle. This is entirely process layer: Alder stores attempts,
 handles, questions, and observations exactly as before, the tmux observer
 lists worker sessions like any other observed object, and `reconcile`
 catches dead ones with the same rules. No Alder mechanism knows the word
-"worker". See `PASS.md`, `WORKER.md`, and `scripts/worker-spawn.sh` in the
-repository for the process itself.
+"worker". See `PASS.md` and `WORKER.md` in the repository for the process
+itself, and `alderd spawn` for the dispatch.
 
-The spawn is checked end to end by `scripts/tests/verify-goal-mode.sh`, which
-runs the real script against a throwaway repository, log and tmux server and
-asserts that the goal a live session receives carries the item's title, spec,
-checks and gates. Its sandbox must never reach the machine's own tmux server,
-so the teardown that enforces that — one session, by exact name, only after
-proving the sandbox server holds nothing else — lives in
-`scripts/tests/tmux-sandbox.sh` and is itself tested by
-`scripts/tests/test-teardown-guard.sh`.
+`alderd spawn <work-id> [tier]` is the whole dispatch: it reads the item,
+records the attempt, cuts the worktree and branch, launches the pane with the
+item's goal **as argv**, and binds the handle. Nothing is typed at the
+session and nothing waits for an engine to boot, so there is no sleep on the
+path; the pane command ends `; exec bash`, so a one-shot engine leaves a live
+session behind and the handle stays true. The daemon still reaches the log
+only by running `alder`, and it hands the worktree a copy of `alder` alone —
+a worker cannot dispatch.
+
+The six rungs — `luna`, `terra`, `sol` on codex and `sonnet`, `opus`, `fable`
+on claude — are a table in the daemon, each pinning a model *and* a reasoning
+effort. An unknown rung is an error rather than a fall-through, because
+falling through to a CLI default would launch a worker at an unknown model
+and record nothing about it. A rung whose provider is rate-limited is served
+by the rung of equal standing on the other ladder; `alderd budget` reads
+trailing spend per provider off local transcripts, and `alderd limit` is how
+a limit gets recorded.
+
+The spawn is checked end to end by `crates/alderd/tests/spawn_host.rs` under
+`cargo test`, and by `scripts/tests/verify-spawn.sh` against a real `alder`
+and a throwaway log. Both run a throwaway repository and their own tmux
+server and assert what a live session actually received. That sandbox must
+never reach the machine's own tmux server, so the teardown that enforces it —
+one session, by exact name, only after proving the sandbox server holds
+nothing else — lives in `scripts/tests/tmux-sandbox.sh` and is itself tested
+by `scripts/tests/test-teardown-guard.sh`.
 
 Two conventions in that process are worth naming here because they show up
 in the log rather than in the repository. A worker records an up-tier
 consult as `consulted` metadata on its own attempt, and a dispatch records
-the tier it launched at as `engine` metadata; between them, an item resent
-up the ladder carries the whole climb. Both are ordinary open-ended
-metadata: Alder stores and displays them and reads nothing into them.
+the rung it launched at as `tier`, `engine` and `effort` metadata; between
+them, an item resent up the ladder carries the whole climb. All are ordinary
+open-ended metadata: Alder stores and displays them and reads nothing into
+them.
 
 ## The trigger-message contract
 
