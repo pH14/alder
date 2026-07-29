@@ -1,11 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Sample launchd agent for alderd.
-
-  Copy to ~/Library/LaunchAgents/com.alder.alderd.plist, replace every
-  /Users/you path, then:
-
-      launchctl load ~/Library/LaunchAgents/com.alder.alderd.plist
+  Template for scripts/alderd-install.sh. The @...@ values are replaced with
+  absolute paths for this checkout before launchd sees the file.
 
   alderd runs one project. Use one copy per project, with a distinct Label,
   and give each project a distinct tmuxSession in its .alder/driver.json.
@@ -19,19 +15,19 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/you/.cargo/bin/alderd</string>
+        <string>@ALDERD_BIN@</string>
         <string>--root</string>
-        <string>/Users/you/workspace/harmony</string>
+        <string>@REPO_ROOT@</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/you/workspace/harmony</string>
+    <string>@REPO_ROOT@</string>
 
     <!-- alderd shells out to alder, git, and tmux, so they must be on PATH. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/you/.cargo/bin</string>
+        <string>@PATH@</string>
         <key>ALDER_ACTOR</key>
         <string>alderd</string>
     </dict>
@@ -47,9 +43,9 @@
     <integer>60</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/you/Library/Logs/alderd.log</string>
+    <string>@REPO_ROOT@/.alder/alderd.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/you/Library/Logs/alderd.log</string>
+    <string>@REPO_ROOT@/.alder/alderd.log</string>
 
     <!-- alderd wakes an interactive agent; it has no business running when
          nobody is logged in. LimitLoadToSessionType keeps it in the GUI
