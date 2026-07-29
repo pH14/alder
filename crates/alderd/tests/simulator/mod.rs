@@ -52,11 +52,16 @@
 //! naming it is, so the convergence property below stays honest rather than
 //! quietly excluding the subsets that expose it.
 //!
-//! The other torn state this surfaced — a session created but not yet stamped
-//! with `ALDER_ATTEMPT` — needs no handoff twice over: `reconcile` already
-//! names it `unclaimed` and repair kills it, and the unmerged adoptive-spawn
-//! branch `work/al-730568` closes the window entirely by stamping the attempt
-//! as the session is created.
+//! Two other torn states this surfaced need no handoff. A session created but
+//! not yet stamped with `ALDER_ATTEMPT` is already named `unclaimed` by
+//! `reconcile` and killed by repair, and the unmerged adoptive-spawn branch
+//! `work/al-730568` closes the window entirely by stamping the attempt as the
+//! session is created. And a pane left holding text nobody submitted — the
+//! injection typed, the Enter not — is real residue that nothing clears
+//! eagerly, but it cannot outlive the silence: see
+//! [`Simulator::assert_pending_input_is_transient`] for the rule that makes it
+//! self-healing and for why demanding an empty pane at the fixpoint would have
+//! been demanding something the daemon never promised.
 
 use std::{
     any::Any,
@@ -81,7 +86,7 @@ use alder::{
 use alder_log::{Head, Log, LogError, MemoryLog, RecordDraft};
 use alderd::{
     config::Engine,
-    decide::{Decision, Poll, decide},
+    decide::{Decision, Poll, SessionAction, decide, session_action},
     driver::Driver,
     effects::Effects,
     error::{DriverError, Result},
@@ -98,12 +103,28 @@ const LEADER_SESSION: &str = "alder-leader";
 const MAX_RECOVERY_ROUNDS: usize = 96;
 
 /// The envelope `src/app.rs::mutation_output` wraps around every mutating
-/// `alder --json` answer. See [`DISPATCHED_SCHEMAS`] for why this is spelled
-/// out here.
+/// `alder --json` answer. See [`MIRRORED`] for why this is spelled out here.
 pub const MUTATION_ENVELOPE: [&str; 4] = ["schema", "head", "revision", "event_id"];
 
-/// Every `alder` command this simulator answers, and the CLI schema its answer
-/// claims to be.
+/// Where in `src/app.rs` the real answer to one dispatched command is built.
+///
+/// The region matters as much as the schema. A whole-file search for a schema
+/// identifier proves almost nothing: `alder.attempt.edit.v0` is claimed by two
+/// call sites — binding a handle and updating metadata — and this simulator
+/// models only the binding, so a rename confined to the binding arm would slip
+/// straight past a search that the *other* arm keeps satisfying.
+#[derive(Debug, Clone, Copy)]
+pub enum Site {
+    /// The body of `fn <name>` in `src/app.rs`, for a read.
+    Function(&'static str),
+    /// The one `mutation_output(...)` call whose source text contains this
+    /// needle. Asserted to match exactly one call, so an ambiguous needle is a
+    /// test failure rather than a silently weakened check.
+    MutationCall(&'static str),
+}
+
+/// One document this simulator hands back, and the CLI region that produces
+/// the real one.
 ///
 /// **DRIFT RISK, NAMED OUT LOUD.** This module hand-mirrors the real CLI's
 /// output shapes. Nothing in the build makes the two move together: `alder`'s
@@ -114,19 +135,79 @@ pub const MUTATION_ENVELOPE: [&str; 4] = ["schema", "head", "revision", "event_i
 /// CLI that no longer exists.
 ///
 /// The tripwire is `the_simulated_dispatcher_still_mirrors_the_cli_pack` in
-/// `sim_crash.rs`: it reads `src/app.rs` and fails if the mutation envelope or
-/// any of these schema identifiers move. It cannot catch a renamed *payload*
-/// field, so a change to one of those shapes still has to be mirrored here by
-/// hand.
-pub const DISPATCHED_SCHEMAS: [(&str, &str); 8] = [
-    ("show", "alder.show.v0"),
-    ("status", "alder.status.v0"),
-    ("refresh", "alder.refresh.v0"),
-    ("work start", "alder.work.start.v0"),
-    ("attempt edit", "alder.attempt.edit.v0"),
-    ("attempt end", "alder.attempt.end.v0"),
-    ("loop wake", "alder.loop.wake.v0"),
-    ("pass end", "alder.pass.end.v0"),
+/// `sim_crash.rs`. It reads `src/app.rs`, narrows to each [`Site`], and fails
+/// if the schema or any mirrored field is not emitted *from that region*. What
+/// it still cannot see is a field the CLI renames in a region this simulator
+/// does not model at all, so a new `alder` sub-command answered here has to
+/// arrive with a row in this table.
+#[derive(Debug, Clone, Copy)]
+pub struct Mirrored {
+    /// `alder <command>`, as this simulator dispatches it.
+    pub command: &'static str,
+    pub site: Site,
+    pub schema: &'static str,
+    /// Every key the simulator's answer carries beyond the envelope.
+    /// Production must still emit all of them from the same region.
+    pub fields: &'static [&'static str],
+}
+
+pub const MIRRORED: [Mirrored; 9] = [
+    Mirrored {
+        command: "show",
+        site: Site::Function("show"),
+        schema: "alder.show.v0",
+        fields: &["head", "id", "kind", "current", "history"],
+    },
+    Mirrored {
+        command: "status",
+        site: Site::Function("status"),
+        schema: "alder.status.v0",
+        fields: &["head", "revision", "loop"],
+    },
+    Mirrored {
+        command: "status --section in_flight",
+        site: Site::Function("status"),
+        schema: "alder.status.v0",
+        fields: &["head", "revision", "in_flight"],
+    },
+    Mirrored {
+        command: "refresh",
+        site: Site::Function("refresh"),
+        schema: "alder.refresh.v0",
+        fields: &["head", "changed", "result"],
+    },
+    Mirrored {
+        command: "work start",
+        site: Site::MutationCall("alder.work.start.v0"),
+        schema: "alder.work.start.v0",
+        fields: &["work_id", "attempt_id"],
+    },
+    Mirrored {
+        // Narrowed to the binding arm: the updating arm claims the same schema
+        // and this simulator does not model it.
+        command: "attempt edit --handle",
+        site: Site::MutationCall(r#""change": "bound""#),
+        schema: "alder.attempt.edit.v0",
+        fields: &["attempt_id", "change", "handle"],
+    },
+    Mirrored {
+        command: "attempt end",
+        site: Site::MutationCall("alder.attempt.end.v0"),
+        schema: "alder.attempt.end.v0",
+        fields: &["attempt_id", "outcome"],
+    },
+    Mirrored {
+        command: "loop wake",
+        site: Site::MutationCall("alder.loop.wake.v0"),
+        schema: "alder.loop.wake.v0",
+        fields: &["pass_id", "engine", "handle", "triggers"],
+    },
+    Mirrored {
+        command: "pass end",
+        site: Site::MutationCall("alder.pass.end.v0"),
+        schema: "alder.pass.end.v0",
+        fields: &["pass_id", "outcome", "rotate"],
+    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +227,13 @@ struct Session {
     kind: SessionKind,
     cwd: PathBuf,
     attempt_id: Option<String>,
+    /// Literal text typed into the pane and not yet submitted. Production's
+    /// `tmux_send_keys` is two tmux invocations — `send-keys -l -- <text>`
+    /// then `send-keys Enter` — so a pane holding unsubmitted text is a state
+    /// a killed daemon really can leave, and the next injection would be typed
+    /// on top of it.
+    pending_input: Option<String>,
+    /// The pass the leader was actually handed, once the text was submitted.
     injected_pass: Option<String>,
     script: AgentScript,
 }
@@ -182,10 +270,14 @@ enum Mutation {
         name: String,
         attempt_id: String,
     },
-    SessionInject {
+    /// `tmux send-keys -l -- <text>`: literal text lands in the pane's input,
+    /// submitted by nothing.
+    SessionType {
         name: String,
-        pass_id: String,
+        text: String,
     },
+    /// `tmux send-keys Enter`: whatever the pane is holding is submitted.
+    SessionSubmit(String),
     SessionClearInjection(String),
     SessionRemove(String),
     WorktreeEntryRemoved(PathBuf),
@@ -210,7 +302,8 @@ impl Mutation {
             Self::File(_) => "file",
             Self::SessionCreate { .. } => "session",
             Self::SessionStamp { .. } => "stamp",
-            Self::SessionInject { .. } => "injection",
+            Self::SessionType { .. } => "typed",
+            Self::SessionSubmit(_) => "submitted",
             Self::SessionClearInjection(_) => "injection-cleared",
             Self::SessionRemove(_) => "session-removed",
             Self::WorktreeEntryRemoved(_) => "worktree-entry-removed",
@@ -443,7 +536,7 @@ enum Answer {
     /// A read: no footprint, and the document as it stands.
     Read(Result<Value>),
     /// A mutation: one append to stage, plus the fields the CLI packs around
-    /// it. See [`DISPATCHED_SCHEMAS`] for the drift risk this shape carries.
+    /// it. See [`MIRRORED`] for the drift risk this shape carries.
     Mutation {
         payload: EventPayload,
         schema: &'static str,
@@ -590,9 +683,14 @@ impl Simulator {
                 .iter()
                 .map(|(name, session)| {
                     format!(
-                        "{name}:{:?}:{}",
+                        "{name}:{:?}:{}{}",
                         session.kind,
-                        session.attempt_id.as_deref().unwrap_or("-")
+                        session.attempt_id.as_deref().unwrap_or("-"),
+                        if session.pending_input.is_some() {
+                            ":typed"
+                        } else {
+                            ""
+                        }
                     )
                 })
                 .collect(),
@@ -769,6 +867,7 @@ impl Simulator {
                         kind,
                         cwd: cwd.clone(),
                         attempt_id: None,
+                        pending_input: None,
                         injected_pass: None,
                         script,
                     },
@@ -779,9 +878,28 @@ impl Simulator {
                     session.attempt_id = Some(attempt_id.clone());
                 }
             }
-            Mutation::SessionInject { name, pass_id } => {
+            Mutation::SessionType { name, text } => {
                 if let Some(session) = self.shared.world.borrow_mut().sessions.get_mut(name) {
-                    session.injected_pass = Some(pass_id.clone());
+                    // tmux appends to whatever the pane is already holding, so
+                    // typing onto unsubmitted text really does concatenate.
+                    session
+                        .pending_input
+                        .get_or_insert_with(String::new)
+                        .push_str(text);
+                }
+            }
+            Mutation::SessionSubmit(name) => {
+                if let Some(session) = self.shared.world.borrow_mut().sessions.get_mut(name) {
+                    // Enter submits the line as it stands. A pass ID is read
+                    // out of it here rather than at send time, so text that was
+                    // corrupted by an earlier torn injection is submitted as
+                    // the garbage it is.
+                    session.injected_pass = session
+                        .pending_input
+                        .take()
+                        .as_deref()
+                        .and_then(injected_pass_id)
+                        .map(str::to_owned);
                 }
             }
             Mutation::SessionClearInjection(name) => {
@@ -831,23 +949,27 @@ impl Simulator {
         }
     }
 
-    /// The head every packed answer reports, read after the append landed —
-    /// exactly where the real CLI reads it.
+    /// A mutation answer, packed the way `src/app.rs::mutation_output` packs
+    /// one: the fields, plus the envelope, with the head read *after* the
+    /// append landed — exactly where the real CLI reads it.
     fn pack(&self, schema: &str, event_id: &str, fields: Value) -> Value {
+        let mut object = self.headed(schema, fields);
         let head = self.shared.log.head().expect("the memory log has a head");
-        let mut object = match fields {
-            Value::Object(object) => object,
-            _ => serde_json::Map::new(),
-        };
-        object.insert("schema".to_owned(), json!(schema));
-        object.insert("head".to_owned(), json!(head.sequence()));
         object.insert("revision".to_owned(), json!(head.revision()));
         object.insert("event_id".to_owned(), json!(event_id));
         Value::Object(object)
     }
 
-    /// A read document, headed the way `alder --json` heads every answer.
-    fn read_pack(&self, schema: &str, fields: Value) -> Value {
+    /// The two keys every `alder --json` document carries, whatever it is.
+    ///
+    /// Read envelopes are deliberately **not** shared beyond this. `status`
+    /// carries a `revision` and `show` and `refresh` do not, and a common
+    /// packer that added one to all three would be drift in the dangerous
+    /// direction: daemon code could come to depend on a field production has
+    /// never emitted, and this harness would keep passing while the real CLI
+    /// handed back nothing. Omitting a field production does have is the safe
+    /// direction — the simulator fails first — so each read says for itself.
+    fn headed(&self, schema: &str, fields: Value) -> serde_json::Map<String, Value> {
         let head = self.shared.log.head().expect("the memory log has a head");
         let mut object = match fields {
             Value::Object(object) => object,
@@ -855,6 +977,24 @@ impl Simulator {
         };
         object.insert("schema".to_owned(), json!(schema));
         object.insert("head".to_owned(), json!(head.sequence()));
+        object
+    }
+
+    /// `alder show --json`: schema, head, and the item. No revision.
+    fn show_pack(&self, fields: Value) -> Value {
+        Value::Object(self.headed("alder.show.v0", fields))
+    }
+
+    /// `alder refresh --json`: schema, head, and what the sweep saw. No
+    /// revision.
+    fn refresh_pack(&self, fields: Value) -> Value {
+        Value::Object(self.headed("alder.refresh.v0", fields))
+    }
+
+    /// `alder status --json`, the one read that does carry a revision.
+    fn status_pack(&self, fields: Value) -> Value {
+        let head = self.shared.log.head().expect("the memory log has a head");
+        let mut object = self.headed("alder.status.v0", fields);
         object.insert("revision".to_owned(), json!(head.revision()));
         Value::Object(object)
     }
@@ -863,31 +1003,28 @@ impl Simulator {
         let snapshot = self.snapshot();
         let state = &snapshot.state;
         let control = &state.loop_control;
-        self.read_pack(
-            "alder.status.v0",
-            json!({
-                "loop": {
-                    "paused": control.paused,
-                    "pause_reason": control.pause_reason,
-                    "engine": control.engine,
-                    "rotate_pending": control.rotate_pending(),
-                    "nudge_pending": control.nudge_pending(),
-                    "open_pass": state.open_pass().map(|pass| json!({
-                        "id": pass.id,
-                        "engine": pass.engine,
-                        "handle": pass.handle,
-                        "started_at": pass.started_at,
-                    })),
-                    "last_pass": state.last_ended_pass().map(|pass| json!({
-                        "id": pass.id,
-                        "outcome": pass.outcome.map(PassOutcome::as_str),
-                        "wake_at": pass.wake_at,
-                        "ended_at": pass.ended_at,
-                        "ended_seq": pass.ended_seq,
-                    })),
-                }
-            }),
-        )
+        self.status_pack(json!({
+            "loop": {
+                "paused": control.paused,
+                "pause_reason": control.pause_reason,
+                "engine": control.engine,
+                "rotate_pending": control.rotate_pending(),
+                "nudge_pending": control.nudge_pending(),
+                "open_pass": state.open_pass().map(|pass| json!({
+                    "id": pass.id,
+                    "engine": pass.engine,
+                    "handle": pass.handle,
+                    "started_at": pass.started_at,
+                })),
+                "last_pass": state.last_ended_pass().map(|pass| json!({
+                    "id": pass.id,
+                    "outcome": pass.outcome.map(PassOutcome::as_str),
+                    "wake_at": pass.wake_at,
+                    "ended_at": pass.ended_at,
+                    "ended_seq": pass.ended_seq,
+                })),
+            }
+        }))
     }
 
     fn observations(&self) -> Vec<ObservedHandle> {
@@ -1258,6 +1395,46 @@ impl Simulator {
             "the recovery fixpoint still wants to fire: {:?}",
             self.decision()
         );
+        self.assert_pending_input_is_transient();
+    }
+
+    /// What a pane holding unsubmitted text has to satisfy at the fixpoint.
+    ///
+    /// A torn `tmux_send_keys` — the literal text sent, the Enter not — really
+    /// does leave text nobody submitted, and *nothing clears it eagerly*:
+    /// `await_pass` times the abandoned pass out and the loop goes idle with
+    /// the line still sitting in the pane. Requiring the fixpoint to be free of
+    /// it would be requiring something the daemon never promised, and would
+    /// only be satisfiable by inventing a sweep production does not perform.
+    ///
+    /// What production does promise is that the residue cannot outlive the
+    /// silence: the daemon that comes back has forgotten a session it never
+    /// created, so its next fire reconciles the session before it types
+    /// anything, and `session_action` restarts a pane it does not know. That is
+    /// asserted here through production's own rule rather than assumed, and the
+    /// stronger half of the property — that no injection is ever typed on top
+    /// of pending text — is asserted at the seam in `tmux_send_keys`.
+    fn assert_pending_input_is_transient(&self) {
+        let dirty: Vec<String> = self
+            .shared
+            .world
+            .borrow()
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.pending_input.is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        if dirty.is_empty() {
+            return;
+        }
+        let status = self.status_document();
+        let state = LoopState::from_status(&status).expect("status is production-readable");
+        let action = session_action(&config(), &state, "stub", 0, true, None);
+        assert!(
+            matches!(action, SessionAction::Restart(_)),
+            "panes {dirty:?} hold unsubmitted text, and the next fire would \
+             {action:?} rather than restart them — the text would be typed on"
+        );
     }
 
     /// The scripted leader agent, run when the driver reads the pass it was
@@ -1315,7 +1492,7 @@ impl Simulator {
     /// The simulated `alder <args> --json`.
     ///
     /// Every shape here is hand-mirrored from `src/app.rs`; see
-    /// [`DISPATCHED_SCHEMAS`] for the drift risk that carries.
+    /// [`MIRRORED`] for the drift risk that carries.
     fn alder_command(&self, args: &[&str]) -> Result<Value> {
         let label = dispatch_label(args);
         match self.answer(args) {
@@ -1347,21 +1524,18 @@ impl Simulator {
                 let Some(work) = snapshot.state.work.get(*id) else {
                     return Answer::Read(Err(DriverError::coded("not_found", "work not found")));
                 };
-                Answer::Read(Ok(self.read_pack(
-                    "alder.show.v0",
-                    json!({
+                Answer::Read(Ok(self.show_pack(json!({
+                    "id": work.id,
+                    "kind": "work",
+                    "current": {
                         "id": work.id,
-                        "kind": "work",
-                        "current": {
-                            "id": work.id,
-                            "title": work.title,
-                            "spec": work.spec,
-                            "checks": work.checks,
-                            "state": work.state.as_str(),
-                        },
-                        "history": [],
-                    }),
-                )))
+                        "title": work.title,
+                        "spec": work.spec,
+                        "checks": work.checks,
+                        "state": work.state.as_str(),
+                    },
+                    "history": [],
+                }))))
             }
             ["show", id] if id.contains("-pass-") => {
                 self.run_agent_if_ready(id);
@@ -1369,22 +1543,19 @@ impl Simulator {
                 let Some(pass) = snapshot.state.passes.get(*id) else {
                     return Answer::Read(Err(DriverError::coded("not_found", "pass not found")));
                 };
-                Answer::Read(Ok(self.read_pack(
-                    "alder.show.v0",
-                    json!({
+                Answer::Read(Ok(self.show_pack(json!({
+                    "id": pass.id,
+                    "kind": "pass",
+                    "current": {
                         "id": pass.id,
-                        "kind": "pass",
-                        "current": {
-                            "id": pass.id,
-                            "state": match pass.state {
-                                PassState::Open => "open",
-                                PassState::Ended => "ended",
-                            },
-                            "outcome": pass.outcome.map(PassOutcome::as_str),
+                        "state": match pass.state {
+                            PassState::Open => "open",
+                            PassState::Ended => "ended",
                         },
-                        "history": [],
-                    }),
-                )))
+                        "outcome": pass.outcome.map(PassOutcome::as_str),
+                    },
+                    "history": [],
+                }))))
             }
             ["status"] => Answer::Read(Ok(self.status_document())),
             ["status", "--section", "in_flight"] => {
@@ -1404,14 +1575,11 @@ impl Simulator {
                         })
                     })
                     .collect();
-                Answer::Read(Ok(
-                    self.read_pack("alder.status.v0", json!({"in_flight": in_flight}))
-                ))
+                Answer::Read(Ok(self.status_pack(json!({"in_flight": in_flight}))))
             }
-            ["refresh"] => Answer::Read(Ok(self.read_pack(
-                "alder.refresh.v0",
-                json!({"changed": false, "result": {"changed": false}}),
-            ))),
+            ["refresh"] => Answer::Read(Ok(
+                self.refresh_pack(json!({"changed": false, "result": {"changed": false}}))
+            )),
             ["work", "start", work_id] => {
                 let snapshot = self.snapshot();
                 let ordinal = snapshot
@@ -1768,20 +1936,37 @@ impl Effects for Simulator {
     }
 
     fn tmux_send_keys(&self, session: &str, text: &str) -> Result<()> {
-        let pass_id = text
-            .split("pass-id: ")
-            .nth(1)
-            .and_then(|tail| tail.split([';', ')']).next())
-            .ok_or_else(|| DriverError::new("injection has no pass ID"))?;
-        if !self.shared.world.borrow().sessions.contains_key(session) {
-            return Err(DriverError::new("leader session missing"));
-        }
+        injected_pass_id(text).ok_or_else(|| DriverError::new("injection has no pass ID"))?;
+        let pending = {
+            let world = self.shared.world.borrow();
+            match world.sessions.get(session) {
+                None => return Err(DriverError::new("leader session missing")),
+                Some(session) => session.pending_input.clone(),
+            }
+        };
+        // The invariant unsubmitted text is really held to: nothing is ever
+        // typed on top of it. tmux appends, so an injection typed onto a dirty
+        // pane produces one line naming two passes, and the leader would run
+        // neither. This fires the moment that happens rather than leaving it to
+        // be inferred from a stuck fixpoint.
+        assert!(
+            pending.is_none(),
+            "injecting `{text}` into `{session}`, which still holds unsubmitted \
+             text {pending:?} from a torn injection"
+        );
+        // Production types the literal text and presses Enter as two separate
+        // tmux invocations, so this is genuinely two mutations: a daemon killed
+        // between them leaves the pane holding text nobody submitted, and the
+        // leader is never handed the pass the log already says was woken.
         self.effect(
             "pass.inject",
-            Footprint::tearable(vec![Mutation::SessionInject {
-                name: session.to_owned(),
-                pass_id: pass_id.to_owned(),
-            }]),
+            Footprint::tearable(vec![
+                Mutation::SessionType {
+                    name: session.to_owned(),
+                    text: text.to_owned(),
+                },
+                Mutation::SessionSubmit(session.to_owned()),
+            ]),
         );
         Ok(())
     }
@@ -1898,6 +2083,13 @@ fn dispatch_label(args: &[&str]) -> &'static str {
         ["refresh"] => "daemon.refresh",
         _ => "alder.other",
     }
+}
+
+/// The pass an injection line hands the leader, read out of the line itself.
+fn injected_pass_id(text: &str) -> Option<&str> {
+    text.split("pass-id: ")
+        .nth(1)
+        .and_then(|tail| tail.split([';', ')']).next())
 }
 
 fn value_after<'a>(args: &'a [&str], flag: &str) -> Option<&'a str> {

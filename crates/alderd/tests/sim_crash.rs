@@ -16,8 +16,8 @@ mod simulator;
 use alderd::{driver::Driver, spawn, tier};
 use proptest::prelude::*;
 use simulator::{
-    AgentScript, Boundary, Case, DISPATCHED_SCHEMAS, Fault, MUTATION_ENVELOPE, Operation,
-    Simulator, catch_sim_crash, config, execute_case,
+    AgentScript, Boundary, Case, Fault, MIRRORED, MUTATION_ENVELOPE, Operation, Simulator, Site,
+    catch_sim_crash, config, execute_case,
 };
 
 /// The real CLI, as source, for the drift tripwires below.
@@ -189,22 +189,73 @@ fn the_harness_contains_no_wall_clock_or_real_sleep() {
     }
 }
 
-/// The tripwire for the drift risk named in `simulator::DISPATCHED_SCHEMAS`.
+/// The body of `fn <name>` in the CLI source.
+fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+    source
+        .split_once(&format!("\nfn {name}("))
+        .unwrap_or_else(|| panic!("`fn {name}` is gone from src/app.rs"))
+        .1
+        .split_once("\n}\n")
+        .unwrap_or_else(|| panic!("`fn {name}` has no body"))
+        .0
+}
+
+/// Every `mutation_output(...)` call in the CLI source, as source text.
+///
+/// Parens are balanced with string literals skipped, so a `format!` argument
+/// carrying a bracket cannot end a call early.
+fn mutation_calls(source: &str) -> Vec<&str> {
+    let mut calls = Vec::new();
+    for (index, needle) in source.match_indices("mutation_output(") {
+        if source[..index].ends_with("fn ") {
+            continue; // the definition, not a call
+        }
+        let open = index + needle.len() - 1;
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut end = None;
+        for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+            if in_string {
+                match byte {
+                    _ if escaped => escaped = false,
+                    b'\\' => escaped = true,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        calls.push(&source[open..=end.expect("a `mutation_output` call is balanced")]);
+    }
+    calls
+}
+
+/// The tripwire for the drift risk named in `simulator::MIRRORED`.
 ///
 /// The simulated dispatcher hand-mirrors the CLI's `--json` shapes, and
 /// nothing in the type system ties the two together. This reads the CLI's own
-/// source and fails when the mutation envelope or any dispatched schema moves,
-/// which is the class of drift that would otherwise leave this whole harness
-/// happily simulating a CLI that no longer exists.
+/// source and fails when the mutation envelope moves, or when a mirrored
+/// schema or field stops being emitted *by the region that answers that
+/// command* — which is the point of narrowing rather than searching the whole
+/// file. `alder.attempt.edit.v0` is claimed by two call sites, binding and
+/// updating, and only the binding is modelled here; a whole-file search would
+/// keep passing on the strength of the arm nobody simulates.
 #[test]
 fn the_simulated_dispatcher_still_mirrors_the_cli_pack() {
-    let body = CLI_SOURCE
-        .split_once("fn mutation_output(")
-        .expect("the CLI still packs mutation answers through `mutation_output`")
-        .1
-        .split_once("\n}\n")
-        .expect("`mutation_output` has a body")
-        .0;
+    let body = function_body(CLI_SOURCE, "mutation_output");
     let envelope: Vec<&str> = body
         .match_indices("object.insert(\"")
         .map(|(index, needle)| {
@@ -219,12 +270,46 @@ fn the_simulated_dispatcher_still_mirrors_the_cli_pack() {
         "the CLI's mutation envelope moved; mirror it in simulator/mod.rs"
     );
 
-    for (command, schema) in DISPATCHED_SCHEMAS {
+    let calls = mutation_calls(CLI_SOURCE);
+    assert!(
+        calls.len() >= 10,
+        "only {} mutation_output calls parsed out of src/app.rs; the scanner \
+         is broken, not the CLI",
+        calls.len()
+    );
+
+    for mirrored in MIRRORED {
+        let region = match mirrored.site {
+            Site::Function(name) => function_body(CLI_SOURCE, name),
+            Site::MutationCall(needle) => {
+                let matched: Vec<_> = calls.iter().filter(|call| call.contains(needle)).collect();
+                assert_eq!(
+                    matched.len(),
+                    1,
+                    "`alder {}` is pinned to `{needle}`, which now matches {} \
+                     mutation_output calls; the needle no longer names one \
+                     answer",
+                    mirrored.command,
+                    matched.len()
+                );
+                matched[0]
+            }
+        };
         assert!(
-            CLI_SOURCE.contains(&format!("\"{schema}\"")),
-            "`alder {command}` no longer answers as `{schema}`; \
-             the simulated dispatcher is mirroring a CLI that moved"
+            region.contains(&format!("\"{}\"", mirrored.schema)),
+            "`alder {}` no longer answers as `{}` from the region that builds \
+             it; the simulated dispatcher is mirroring a CLI that moved",
+            mirrored.command,
+            mirrored.schema
         );
+        for field in mirrored.fields {
+            assert!(
+                region.contains(&format!("\"{field}\"")),
+                "`alder {}` no longer emits `{field}`, which the simulator's \
+                 answer still carries; mirror the change in simulator/mod.rs",
+                mirrored.command
+            );
+        }
     }
 }
 
@@ -316,6 +401,50 @@ fn a_worktree_torn_before_its_admin_entry_still_converges() {
             "subset {mask:04b} converged without ever sweeping the stray path"
         );
     }
+}
+
+/// Production types the injection and presses Enter as two separate tmux
+/// invocations, so a daemon killed between them leaves the pane holding a line
+/// nobody submitted while the log already says the pass was woken. Pinned so
+/// the subset does not depend on proptest finding it.
+#[test]
+fn an_injection_torn_before_its_enter_leaves_text_nobody_submitted() {
+    let probe = Simulator::new(13);
+    Driver::new(probe.clone(), config()).poll_once().unwrap();
+    let trace = probe.trace();
+    let inject = trace[position_of(&trace, "pass.inject") - 1].clone();
+    assert_eq!(
+        inject.footprint,
+        vec!["typed", "submitted"],
+        "the injection footprint changed; re-derive the torn subset below"
+    );
+
+    // The text sent, the Enter not.
+    let host = Simulator::new(13);
+    host.schedule_faults(vec![Fault::torn(inject.ordinal, 0b01)]);
+    let mut driver = Driver::new(host.clone(), config());
+    assert!(
+        catch_sim_crash(|| driver.poll_once()).is_none(),
+        "the torn injection did not kill the poll"
+    );
+    let digest = host.digest();
+    assert!(
+        digest
+            .sessions
+            .iter()
+            .any(|session| session.ends_with(":typed")),
+        "the torn injection left no unsubmitted text: {digest:#?}"
+    );
+    assert!(
+        digest.state.contains("Open"),
+        "the pass should be open and unhanded-over: {digest:#?}"
+    );
+
+    // Convergence, and with it the pane invariant: recovery times the
+    // abandoned pass out, and `assert_invariant` holds the leftover text to
+    // the rule that makes it transient rather than pretending it is gone.
+    host.recover(false);
+    host.assert_invariant(false);
 }
 
 fn generated_case(seed: u64, noise: Vec<u8>, fault_slots: Vec<(u8, u8)>) -> Case {
