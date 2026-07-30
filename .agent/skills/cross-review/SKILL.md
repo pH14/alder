@@ -30,15 +30,16 @@ not share the authoring vendor or session. The paired rungs are:
 | `sol` | Claude `fable` |
 
 The standing equivalences are `luna` ↔ `sonnet`, `terra` ↔ `opus`, and
-`sol` ↔ `fable`. Thus the hardest Codex work is reviewed by `fable`, not
-`opus`. Every engine invocation names its full model identifier and its
-reasoning effort explicitly; no alias, config default, or inherited effort is
-evidence of a review.
+`sol` ↔ `fable`, as the counterpart column in
+`crates/alderd/README.md` records. Thus the hardest Codex work is reviewed by
+`fable`, not `opus`. Every engine invocation names its full model identifier
+and its reasoning effort explicitly; no alias, config default, or inherited
+effort is evidence of a review.
 
 If both vendors have written on one branch, it needs one whole-diff review from
 each ladder. Record both reviewers comma-joined in `reviewed-by`; the check is
 satisfied only after every authoring vendor has been read by the other. That
-requires two heavy operations and normally two passes. The model has no durable
+requires two heavy operations and therefore two passes. The model has no durable
 partial-verdict state between pending and satisfied, so avoid this case by
 keeping a respawn on one vendor's fresh branch until product work
 `al-q8qwhy` supplies that fact. When authorship cannot be attributed to a
@@ -113,10 +114,9 @@ Each explicit setting is deliberate:
   `-m`; that flag belongs to `codex exec`.
 - `-c model_reasoning_effort=xhigh` records the actual review effort rather
   than a moving config default.
-- `approval_policy=never` lets an unattended review proceed without an approval
-  prompt.
-- `sandbox_mode=workspace-write` prevents an unexpectedly read-only review
-  workspace.
+- `approval_policy=never` and `sandbox_mode=workspace-write` say the review
+  runs unattended: nothing answers an approval request inside a review, and a
+  review stopped waiting on one is indistinguishable from a slow one.
 
 `--base`, `--uncommitted`, `--commit`, and a positional prompt are alternative
 scope selectors in codex-cli 0.146.0-alpha.3.1; they do not compose. A scoped
@@ -132,12 +132,17 @@ lens on this route, which is why it must be complete.
 | `--base main --title "<text>"` | runs |
 
 The branch must therefore argue for itself through its diff, tests, and commit
-messages. Do not try to smuggle the item brief through `--title` or config.
+messages. A prompt buys item context and gives up harness-computed scope, and
+scope is the one thing a merge gate cannot trade: a review of the last commit
+on a five-commit branch is worse than no review, because it reports clean. Do
+not try to smuggle the item brief through `--title` or config.
 
 ### Codex-authored branch: fresh Claude review
 
 Run a fresh, one-shot Claude review at the matching rung in the branch
-worktree. It must not inherit the author or leader session's context or effort:
+worktree. This is a `claude` invocation, not a subagent, precisely because
+a subagent inherits the leader's session effort, which is nowhere in the log;
+otherwise `reviewed-by` could name a rung the review did not run at.
 
 ```sh
 claude -p --model claude-fable-5 --effort xhigh --permission-mode auto \
@@ -286,11 +291,11 @@ delivery is repairable: the next leader reads and relays the durable evidence.
 A relay with no preceding record is a review that disappears at rotation.
 
 The default fix path is a **fresh worker**: start a new attempt on the same
-item and branch, carrying the durable findings in its brief and having the new
-worker read that attempt evidence and notes before changing code. Choose the
-tier by the size of the findings, not the original item; narrow enumerated
-findings are down-tier work, so `luna` or `sonnet` can fix what `sol` found in
-`terra`'s change.
+item and branch. Before changing code, the new worker reads the prior attempts'
+durable review evidence and notes with `alder show <item>`; a launch goal alone
+contains title, spec, checks, and gates. Choose the tier by the size of the
+findings, not the original item; narrow enumerated findings are down-tier work,
+so `luna` or `sonnet` can fix what `sol` found in `terra`'s change.
 
 Do not compact or preserve the original author session for a feedback round.
 Compaction pays a full-context read at author tier and preserves laundered
