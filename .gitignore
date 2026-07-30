@@ -1,3 +1,4 @@
 /target/
 /mutants.out/
 .alder/
+.claude/settings.local.json
