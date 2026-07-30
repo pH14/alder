@@ -513,6 +513,16 @@ fn the_simulated_status_serves_the_loop_section_production_builds() {
         "no pass has ended to compare"
     );
 
+    // `status_document` is production's packer only for as long as `status`
+    // is what calls it, and that is a question about one unique identifier —
+    // the kind a source scan settles outright, unlike "which of the two
+    // `"loop"` literals is the key the driver reads".
+    assert!(
+        function_body(CLI_SOURCE, "status").contains("status_document("),
+        "`fn status` no longer builds its answer with `status_document`, so \
+         driving that packer proves nothing about what the CLI hands back"
+    );
+
     // Production's own packer, over the state the simulator just answered
     // from. `head` and the `loop` key are written by `src/app.rs`; nothing
     // here reproduces them.
