@@ -919,7 +919,13 @@ fn selected_status_sections(
 
 /// The loop's desired state and its two interesting passes. The driver reads
 /// this section and ignores the rest of `status`.
-fn loop_section(state: &ProjectState) -> Value {
+///
+/// Public so a test can compare a document this built against one built
+/// elsewhere, rather than grepping this file for key names. A source scan sees
+/// only literals and cannot tell one `"id"` from another — `open_pass` and
+/// `last_pass` each have one — so it stays green through a rename that breaks
+/// every reader.
+pub fn loop_section(state: &ProjectState) -> Value {
     let control = &state.loop_control;
     json!({
         "paused": control.paused,
