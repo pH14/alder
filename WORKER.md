@@ -89,10 +89,10 @@ The answer comes back into this session. If you are an interactive session,
 it is typed at your prompt. If you ran as one shot (`codex exec`), your turn
 ends and the leader resumes this same session with the ruling — so end the
 turn cleanly, with the note written and nothing half-applied on disk, rather
-than idling to wait for it. Name the session you want resumed, in the same
-breath as the ask, so the leader does not have to guess which one is yours:
-
-    .alder/bin/alder attempt edit <your-attempt> --meta codex-session=$CODEX_THREAD_ID
+than idling to wait for it. Spawn starts an independent watcher before Codex
+that records `codex-session` on the attempt, so this does not rely on you
+reaching the ask. If a reconcile finding says the stamp is missing, repair it
+with the UUID it names; never ask the leader to fall back to `--last`.
 
 ## Hard rules
 

@@ -43,9 +43,11 @@ Use `./target/debug/alder` for every alder command.
      model, effort and sandbox the worker was launched with, because
      `codex exec resume` inherits none of them; do not hand-write the
      `codex exec resume` line. The UUID is the attempt's `codex-session`
-     metadata; without it, `.alder/resume "<the ruling>"` resumes the newest
-     codex session in that directory, which is the worker's own unless it
-     has been running consults.
+     metadata. It is required: `.alder/resume` refuses a ruling without the
+     UUID, because guessing with the newest session in the directory can
+     resume a consult instead of the worker. Reconcile reports
+     `codex_session_unstamped` with the exact repair if the launcher-side
+     stamp could not reach the ledger.
 
    A worker with no live session gets a fresh spawn instead — and a fresh
    spawn is launched on the *item*, not on the Q&A, which is why an answer

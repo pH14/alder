@@ -207,11 +207,11 @@ impl Tier {
             r#"#!/bin/sh
 # Resume this worker's codex session with a ruling from the leader.
 #
-#     .alder/resume [<codex-session-id>] "<the ruling>"
+#     .alder/resume <codex-session-id> "<the ruling>"
 #
-# With no session ID it resumes the most recent codex session started in this
-# directory, which is this worker's own unless it has run consults of its own
-# since. The attempt's `codex-session` metadata is the exact answer.
+# A session ID is mandatory. `--last` is unsafe here: a worker may have run a
+# consult in this directory, and that would resume the consult instead of this
+# worker. The attempt's `codex-session` metadata is the exact answer.
 #
 # `codex exec resume` inherits nothing from the session it resumes, so the
 # model, the effort and the sandbox are repeated here exactly as this worker
@@ -219,12 +219,12 @@ impl Tier {
 # them runs at another model's default, cannot commit, and cannot reach the
 # log.
 set -eu
-if [ $# -ge 2 ]; then
-  session=$1
-  shift
-else
-  session=--last
+if [ $# -ne 2 ]; then
+  echo "usage: .alder/resume <codex-session-id> <ruling>" >&2
+  exit 64
 fi
+session=$1
+shift
 exec codex exec resume "$session" {flags} "$1"
 "#,
             tier = self.name,
@@ -233,7 +233,87 @@ exec codex exec resume "$session" {flags} "$1"
             flags = flags.join(" "),
         ))
     }
+
+    /// A launcher-owned watcher for a Codex worker's session ID.
+    ///
+    /// `CODEX_THREAD_ID` is only available *inside* the Codex turn, after the
+    /// pane has already been created. Putting the stamp in the brief therefore
+    /// loses exactly the workers that die before their first tool call. This
+    /// watcher starts before `codex exec`, snapshots the existing rollouts,
+    /// and claims the first new rollout whose session metadata names this
+    /// worktree. It is outside the sandbox and independent of the model's
+    /// progress. The marker lets reconciliation surface a repair if its log
+    /// append loses a race or the ledger is temporarily unavailable.
+    pub fn codex_session_stamp_script(&self) -> Option<&'static str> {
+        (self.provider == Provider::Codex).then_some(CODEX_SESSION_STAMP_SCRIPT)
+    }
 }
+
+/// Starts a detached watcher rather than waiting for Codex to boot. The
+/// session files are the local source of truth that `codex exec resume` uses,
+/// and session_meta gives both the stable UUID and the worker's cwd. `jq` is
+/// already part of the operator environment that runs the tmux observer.
+const CODEX_SESSION_STAMP_SCRIPT: &str = r#"#!/usr/bin/env bash
+# Stamp a Codex worker attempt without relying on the worker reaching a tool
+# call. Invoked by the pane immediately before `codex exec`.
+set -uo pipefail
+
+attempt=${ALDER_ATTEMPT:?ALDER_ATTEMPT is required}
+worktree=$(pwd -P)
+codex_home=${CODEX_HOME:-"$HOME/.codex"}
+sessions="$codex_home/sessions"
+stamp_dir=.alder
+marker="$stamp_dir/codex-session"
+log="$stamp_dir/codex-session-stamp.log"
+
+mkdir -p "$stamp_dir"
+snapshot=$(mktemp "${TMPDIR:-/tmp}/alder-codex-sessions.XXXXXX")
+if [ -d "$sessions" ]; then
+  find "$sessions" -type f -name '*.jsonl' -print 2>/dev/null >"$snapshot" || true
+else
+  : >"$snapshot"
+fi
+
+find_new_session() {
+  local file session_id
+  [ -d "$sessions" ] || return 1
+  while IFS= read -r file; do
+    grep -Fqx -- "$file" "$snapshot" && continue
+    session_id=$(jq -er --arg cwd "$worktree" '
+      select(.type == "session_meta" and .payload.cwd == $cwd)
+      | (.payload.session_id // .payload.id)
+      | select(type == "string")
+    ' "$file" 2>/dev/null | head -n 1) || continue
+    if [[ "$session_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+      printf '%s\n' "$session_id"
+      return 0
+    fi
+  done < <(find "$sessions" -type f -name '*.jsonl' -print 2>/dev/null)
+  return 1
+}
+
+(
+  trap 'rm -f "$snapshot"' EXIT
+  for _ in {1..60}; do
+    if session_id=$(find_new_session); then
+      temporary="$marker.$$.tmp"
+      printf '%s\n' "$session_id" >"$temporary"
+      mv -f "$temporary" "$marker"
+      for _ in {1..60}; do
+        if .alder/bin/alder attempt edit "$attempt" --meta "codex-session=$session_id"; then
+          exit 0
+        fi
+        sleep 1
+      done
+      printf 'could not stamp %s on %s after 60 attempts\n' "$session_id" "$attempt" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+  printf 'no new Codex session for %s appeared within 60 seconds\n' "$worktree" >&2
+) </dev/null >>"$log" 2>&1 &
+disown || true
+"#;
 
 /// The second writable root a codex worker cannot commit without.
 ///
@@ -259,6 +339,10 @@ fn writable_roots(git_common_dir: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+
+    use tempfile::TempDir;
+
     use super::*;
 
     #[test]
@@ -417,10 +501,102 @@ mod tests {
         // The goal placeholder never reaches it; the ruling does.
         assert!(script.trim_end().ends_with("\"$1\""), "{script}");
         assert!(!script.contains("''"), "an empty goal leaked in: {script}");
+        assert!(
+            script.contains("if [ $# -ne 2 ]; then"),
+            "a bare resume must fail: {script}"
+        );
+        assert!(
+            !script.contains("session=--last"),
+            "a resume must never guess from the newest session: {script}"
+        );
 
         // A claude worker sits at a prompt and is typed at, so there is
         // nothing to write.
         assert!(tier("opus").unwrap().resume_script(None).is_none());
+    }
+
+    #[test]
+    fn a_codex_launch_gets_a_sidecar_that_stamps_before_the_worker_can_act() {
+        let watcher = tier("terra")
+            .unwrap()
+            .codex_session_stamp_script()
+            .expect("codex launches need a session watcher");
+        assert!(watcher.contains("find_new_session"), "{watcher}");
+        assert!(watcher.contains(".payload.cwd == $cwd"), "{watcher}");
+        assert!(
+            watcher.contains("marker=\"$stamp_dir/codex-session\""),
+            "{watcher}"
+        );
+        assert!(
+            watcher.contains("attempt edit \"$attempt\" --meta \"codex-session=$session_id\""),
+            "the watcher never appends its stamp: {watcher}"
+        );
+        assert!(
+            watcher.find("snapshot=$(mktemp").unwrap()
+                < watcher.find(") </dev/null >>\"$log\" 2>&1 &").unwrap(),
+            "the snapshot must happen before the detached watcher can see Codex: {watcher}"
+        );
+        assert!(tier("opus").unwrap().codex_session_stamp_script().is_none());
+    }
+
+    #[test]
+    fn a_bare_resume_refuses_without_starting_codex() {
+        let temporary = TempDir::new().unwrap();
+        let resume = temporary.path().join("resume");
+        fs::write(
+            &resume,
+            tier("luna")
+                .unwrap()
+                .resume_script(Some("/projects/alder/.git"))
+                .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&resume, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bin = temporary.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let called = temporary.path().join("called");
+        let codex = bin.join("codex");
+        fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n",
+                called.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bare = Command::new(&resume)
+            .arg("the ruling")
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+        assert!(!bare.status.success());
+        assert!(
+            String::from_utf8_lossy(&bare.stderr).contains("usage:"),
+            "{}",
+            String::from_utf8_lossy(&bare.stderr)
+        );
+        assert!(
+            !called.exists(),
+            "a bare resume must not invoke the codex command"
+        );
+
+        let resumed = Command::new(&resume)
+            .args(["019fb2ef-d507-7201-bc36-79d6d5b82336", "the ruling"])
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+        assert!(
+            resumed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(called).unwrap(),
+            "exec resume 019fb2ef-d507-7201-bc36-79d6d5b82336 -m gpt-5.6-luna -c model_reasoning_effort=high -c approval_policy=never -c sandbox_mode=workspace-write -c sandbox_workspace_write.network_access=true -c sandbox_workspace_write.writable_roots=[\"/projects/alder/.git\"] the ruling\n"
+        );
     }
 
     #[test]

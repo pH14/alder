@@ -65,12 +65,18 @@ Three rules make that ordering worth having:
   one-shot `codex exec` leaves a live session behind: the handle stays
   observable, and a ruling can be relayed into the shell afterwards. For a
   codex rung the spawn also writes `<worktree>/.alder/resume`, which is how
-  that relay is typed — `.alder/resume [<session-id>] "<the ruling>"`. It
+  that relay is typed — `.alder/resume <session-id> "<the ruling>"`. It
   exists because `codex exec resume` inherits *nothing* from the session it
   resumes: no model, no effort, no sandbox. Resumed by hand, a luna worker
   quietly continues at another model, with no network access and no writable
   git dir, and can neither commit nor reach the log. The script repeats the
-  launch exactly, because the same table writes both.
+  launch exactly, because the same table writes both. A session ID is
+  mandatory: `--last` can select a later consult in the same worktree. Before
+  starting Codex, spawn also starts a local sidecar that snapshots the Codex
+  rollouts and stamps the first new one for this worktree onto the attempt.
+  If that append is unavailable, the sidecar leaves its UUID for the tmux
+  observer and `alder reconcile` names the repair as
+  `codex_session_unstamped`.
 - **Crash residue is adoptive.** Re-running spawn after any completed effect
   converges on the same attempt. An existing worktree is accepted only after
   Git proves it is on `work/<id>`. `tmux new-session` stamps

@@ -255,8 +255,16 @@ fn text(value: &Value, key: &str) -> Option<String> {
 /// `caffeinate -i` keeps the Mac from idle-sleeping under a worker. Every word
 /// is quoted, so the goal reaches the engine as one argument however it is
 /// spelled, and `exec bash` replaces the engine when it exits so the session —
-/// and therefore the handle — survives a one-shot run.
-pub fn pane_command(engine: &[String], goal: &str, session: &str) -> String {
+/// and therefore the handle — survives a one-shot run. A Codex launch starts
+/// its session-ID watcher before the engine; that watcher is independent of
+/// the worker's first tool call and returns immediately rather than waiting
+/// for Codex to boot.
+pub fn pane_command(
+    engine: &[String],
+    goal: &str,
+    session: &str,
+    stamp_codex_session: bool,
+) -> String {
     let mut words = vec!["caffeinate".to_owned(), "-i".to_owned()];
     words.extend(engine.iter().cloned());
     words.push(goal.to_owned());
@@ -265,8 +273,13 @@ pub fn pane_command(engine: &[String], goal: &str, session: &str) -> String {
         .map(|word| crate::effects::quote(word))
         .collect();
     let target = crate::effects::quote(&format!("={session}"));
+    let stamp = if stamp_codex_session {
+        ".alder/stamp-codex-session; "
+    } else {
+        ""
+    };
     format!(
-        "{}; tmux set-environment -t {target} {ENGINE_ENV} {ENGINE_EXITED}; exec bash",
+        "{stamp}{}; tmux set-environment -t {target} {ENGINE_ENV} {ENGINE_EXITED}; exec bash",
         quoted.join(" ")
     )
 }
@@ -718,10 +731,18 @@ fn launch(
     if let Some(script) = launch.tier.resume_script(Some(&git_common_dir)) {
         host.write_executable(&worktree.join(".alder/resume"), &script)?;
     }
+    if let Some(script) = launch.tier.codex_session_stamp_script() {
+        host.write_executable(&worktree.join(".alder/stamp-codex-session"), script)?;
+    }
     host.tmux_new_session(
         launch.session,
         worktree,
-        &pane_command(&engine, &goal, launch.session),
+        &pane_command(
+            &engine,
+            &goal,
+            launch.session,
+            launch.tier.codex_session_stamp_script().is_some(),
+        ),
         launch.attempt_id,
     )?;
     made.session = true;
@@ -1146,7 +1167,9 @@ mod tests {
         assert!(ordinal("alder show al-1") < ordinal("alder work start al-1"));
         assert!(ordinal("alder work start al-1") < ordinal("git worktree add"));
         assert!(ordinal("git worktree add") < ordinal("tmux new-session"));
-        assert!(ordinal("tmux new-session") < ordinal("alder attempt edit"));
+        assert!(
+            ordinal("tmux new-session") < ordinal("alder attempt edit al-1-attempt-1 --handle")
+        );
         // Identity is part of new-session itself. There is no crash window
         // where the pane exists but its attempt cannot be observed.
         assert!(host.called(
@@ -1217,6 +1240,11 @@ mod tests {
         // will be sitting, carrying the same rung.
         assert!(host.called("write /projects/alder-work-al-1/.alder/resume"));
         assert!(host.called("codex exec resume"));
+        assert!(host.called("write /projects/alder-work-al-1/.alder/stamp-codex-session"));
+        assert!(
+            pane.contains(".alder/stamp-codex-session;"),
+            "the Codex watcher must start before the worker: {pane}"
+        );
 
         // A claude worker is not sandboxed this way and is given no such root,
         // and nothing to resume: it sits at a prompt and is typed at.
@@ -1224,6 +1252,7 @@ mod tests {
         spawn(&host, "al-1", tier("opus").unwrap(), None).unwrap();
         assert!(!host.called("writable_roots"));
         assert!(!host.called(".alder/resume"));
+        assert!(!host.called("stamp-codex-session"));
     }
 
     #[test]
@@ -1584,7 +1613,10 @@ mod tests {
             .find(|call| call.starts_with("tmux new-session"))
             .expect("a session is created");
         assert!(pane.contains("'/tmp/stub.sh' '--once'"), "{pane}");
-        assert!(!pane.contains("codex"), "{pane}");
+        assert!(
+            !pane.contains("'codex' 'exec'"),
+            "the tier engine leaked through the stub override: {pane}"
+        );
         assert!(pane.contains("You are the worker for al-1"), "{pane}");
         // The tier is still what the attempt records, stub or no stub.
         assert!(host.called("--meta engine=gpt-5.6-sol --meta effort=xhigh --meta tier=sol"));
