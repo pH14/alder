@@ -142,7 +142,12 @@ Escalate to the operator only when one of these is true:
 
 Escalation is not a command. It is **leaving the question unanswered and
 naming it prominently in the pass report** — which is why nothing else may
-sit unanswered at the end of a pass. A question the worker raised and a
+sit unanswered at the end of a pass. An escalated question carries its
+review kit: the artifact and revision it is about (branch@sha, file, or
+event seq), the one command that shows it (`git diff main...work/<id>`,
+`alder show <id>`), and where the evidence lives. A question the operator
+cannot review from its own text plus one command is not finished being
+asked. A question the worker raised and a
 question you raise yourself escalate identically: `alder work ask <id>
 "<question>"`. Do not improvise around a blocked item, and never let a
 worker's question sit unrelayed.
