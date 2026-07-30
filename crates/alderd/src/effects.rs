@@ -367,6 +367,44 @@ impl SpawnHost for Host {
         path.symlink_metadata().is_ok()
     }
 
+    fn canonical_path(&self, path: &Path) -> Result<PathBuf> {
+        std::fs::canonicalize(path).map_err(|error| {
+            DriverError::new(format!(
+                "cannot resolve `{}` before checking Git's worktree registry: {error}",
+                path.display()
+            ))
+        })
+    }
+
+    fn remove_path(&self, path: &Path) -> Result<()> {
+        let metadata = match path.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(DriverError::new(format!(
+                    "cannot inspect `{}` before removing it: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let removed = if metadata.file_type().is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            // `symlink_metadata` above deliberately does not follow a
+            // symlink, so this removes the residue link rather than its
+            // target outside the worktree parent.
+            std::fs::remove_file(path)
+        };
+        match removed {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(DriverError::new(format!(
+                "cannot remove unregistered worktree residue `{}`: {error}",
+                path.display()
+            ))),
+        }
+    }
+
     fn create_dir_all(&self, path: &Path) -> Result<()> {
         std::fs::create_dir_all(path).map_err(|error| {
             DriverError::new(format!("cannot create `{}`: {error}", path.display()))
@@ -403,12 +441,31 @@ pub(crate) fn quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
+
     use super::*;
+    use crate::spawn::SpawnHost;
 
     #[test]
     fn shell_words_survive_quotes_intact() {
         assert_eq!(quote("claude"), "'claude'");
         assert_eq!(quote("a b"), "'a b'");
         assert_eq!(quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn removing_residue_does_not_follow_a_symlink_outside_its_path() {
+        let root = tempfile::TempDir::new().expect("a project root");
+        let outside = tempfile::TempDir::new().expect("an outside directory");
+        let protected = outside.path().join("protected");
+        std::fs::write(&protected, "keep").expect("the outside file is written");
+        let residue = root.path().join("alder-work-orphan");
+        symlink(outside.path(), &residue).expect("the residue link is created");
+        let host = Host::for_command(root.path().to_path_buf(), "alder".to_owned());
+
+        SpawnHost::remove_path(&host, &residue).expect("the residue link is removed");
+
+        assert!(residue.symlink_metadata().is_err());
+        assert_eq!(std::fs::read_to_string(protected).unwrap(), "keep");
     }
 }
