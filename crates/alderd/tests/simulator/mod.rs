@@ -138,18 +138,21 @@ pub enum Site {
 /// `sim_crash.rs`. It reads `src/app.rs`, narrows to each [`Site`], and fails
 /// if the schema or any mirrored field is not emitted *from that region*.
 ///
-/// **A source scan only reaches the keys the CLI writes as literals**, and
-/// production does not write all of them that way. `loop` is a literal, but it
-/// lives in `fn loop_section` rather than `fn status`, so its nested keys are
-/// pinned to the function that actually writes them. `current` and each
-/// `in_flight` item are not literals at all: the CLI serialises a domain value
-/// and the field names live on the type, where no scan of `src/app.rs` will
-/// ever find them. Those are checked by
-/// `the_simulated_dispatcher_serves_no_nested_shape_production_lacks`, which
-/// compares this simulator's answers against the real serialisation rather
-/// than against source text.
+/// **A source scan is the weak guard, and it is used only where nothing
+/// stronger is available.** It sees a key the CLI writes as a literal, but it
+/// cannot tell one occurrence of that key from another, so it is trusted here
+/// only for the flat top level of each document — where a name appears once
+/// and means one thing.
 ///
-/// What neither check can see is a field the CLI renames in a region this
+/// Every nested shape is checked instead by comparing a *produced document*
+/// against what production actually builds, which is a guard no rename slips
+/// past. `current` and each `in_flight` item are serialised from domain types
+/// whose field names appear nowhere in `src/app.rs`; the `loop` section is a
+/// literal, but its `id` and `engine` each occur at two different depths, so a
+/// scan for either proves nothing. Different reasons, same answer — both are
+/// covered by the two `the_simulated_dispatcher_serves_…` tests.
+///
+/// What none of it can see is a field the CLI renames in a region this
 /// simulator does not model at all, so a new `alder` sub-command answered here
 /// has to arrive with a row in this table.
 #[derive(Debug, Clone, Copy)]
@@ -166,7 +169,7 @@ pub struct Mirrored {
     pub fields: &'static [&'static str],
 }
 
-pub const MIRRORED: [Mirrored; 10] = [
+pub const MIRRORED: [Mirrored; 9] = [
     Mirrored {
         command: "show",
         site: Site::Function("show"),
@@ -223,33 +226,6 @@ pub const MIRRORED: [Mirrored; 10] = [
         schema: Some("alder.pass.end.v0"),
         fields: &["pass_id", "outcome", "rotate"],
     },
-    Mirrored {
-        // The loop section is a literal of its own, written in its own
-        // function; `fn status` only splices it in under `loop`. Scanning
-        // `fn status` for these would find nothing, and scanning it for
-        // `loop` alone would pass while every key inside had been renamed.
-        // These are what `LoopState` deserialises, so they are checked where
-        // production actually writes them.
-        command: "status (the loop section LoopState reads)",
-        site: Site::Function("loop_section"),
-        schema: None,
-        fields: &[
-            "paused",
-            "pause_reason",
-            "engine",
-            "rotate_pending",
-            "nudge_pending",
-            "open_pass",
-            "last_pass",
-            "id",
-            "handle",
-            "started_at",
-            "outcome",
-            "wake_at",
-            "ended_at",
-            "ended_seq",
-        ],
-    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,7 +253,6 @@ struct Session {
     pending_input: Option<String>,
     /// The pass the leader was actually handed, once the text was submitted.
     injected_pass: Option<String>,
-    script: AgentScript,
 }
 
 #[derive(Debug, Clone)]
@@ -511,7 +486,10 @@ struct World {
     branches: BTreeSet<String>,
     directories: BTreeSet<PathBuf>,
     files: BTreeSet<PathBuf>,
-    next_agent: AgentScript,
+    /// What the next leader agent to be handed a pass will do. A one-shot:
+    /// running it consumes it, so one `script_leader` means one scripted pass,
+    /// whichever session ends up handling it.
+    pending_script: AgentScript,
     notices: Vec<String>,
     messages: Vec<String>,
 }
@@ -529,7 +507,7 @@ impl World {
             branches: BTreeSet::from(["main".to_owned()]),
             directories: BTreeSet::new(),
             files: BTreeSet::new(),
-            next_agent: AgentScript::Complete,
+            pending_script: AgentScript::Complete,
             notices: Vec::new(),
             messages: Vec::new(),
         }
@@ -643,21 +621,18 @@ impl Simulator {
         self.shared.world.borrow().faults.iter().copied().collect()
     }
 
-    /// Script what the leader agent does on its next pass.
+    /// Script what the leader agent does on the next pass it is handed.
     ///
-    /// Both halves matter, and only one of them is obvious. `next_agent`
-    /// covers a leader session that does not exist yet. Retargeting the live
-    /// session covers the far commoner case: once a daemon has created its
-    /// session it reuses it, so a script set only for the *next* creation
-    /// would never reach the leader that is actually running — the pass would
-    /// end normally and an operation named for a leader death would quietly
-    /// produce none.
+    /// The script belongs to the *pass*, not to a session, and that is what
+    /// makes one call mean exactly one scripted pass. Scripting a session
+    /// instead has a failure on each side and the harness has now had both: a
+    /// script left on the next *creation* never reaches a leader the daemon
+    /// reuses, and a script written to both places fires on the live session
+    /// and then stays armed for the replacement, so one call meant two deaths.
+    /// Whichever session ends up running the pass consumes it — see
+    /// [`Simulator::run_agent_if_ready`] — so reuse and restart behave alike.
     pub fn script_leader(&self, script: AgentScript) {
-        let mut world = self.shared.world.borrow_mut();
-        world.next_agent = script;
-        if let Some(session) = world.sessions.get_mut(LEADER_SESSION) {
-            session.script = script;
-        }
+        self.shared.world.borrow_mut().pending_script = script;
     }
 
     pub fn advance(&self, ticks: u64) {
@@ -917,12 +892,6 @@ impl Simulator {
                 } else {
                     SessionKind::Worker
                 };
-                // Only the leader runs a script; a worker pane is inert here.
-                let script = if kind == SessionKind::Leader {
-                    std::mem::replace(&mut world.next_agent, AgentScript::Complete)
-                } else {
-                    AgentScript::Complete
-                };
                 world.sessions.insert(
                     name.clone(),
                     Session {
@@ -931,7 +900,6 @@ impl Simulator {
                         attempt_id: None,
                         pending_input: None,
                         injected_pass: None,
-                        script,
                     },
                 );
             }
@@ -1508,10 +1476,14 @@ impl Simulator {
     /// and only clears the injection.
     fn run_agent_if_ready(&self, pass_id: &str) {
         let script = {
-            let world = self.shared.world.borrow();
-            world.sessions.get(LEADER_SESSION).and_then(|session| {
-                (session.injected_pass.as_deref() == Some(pass_id)).then_some(session.script)
-            })
+            let mut world = self.shared.world.borrow_mut();
+            let handed = world
+                .sessions
+                .get(LEADER_SESSION)
+                .is_some_and(|session| session.injected_pass.as_deref() == Some(pass_id));
+            // Consumed by whichever session runs the pass, so the replacement
+            // created after a scripted death is an ordinary leader again.
+            handed.then(|| std::mem::replace(&mut world.pending_script, AgentScript::Complete))
         };
         match script {
             Some(AgentScript::Complete) => {

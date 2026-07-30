@@ -405,6 +405,113 @@ fn the_simulated_dispatcher_serves_no_nested_shape_production_lacks() {
     assert_still_emitted("in_flight[]", &attempt, &["id", "work_id", "handle"]);
 }
 
+/// The loop section, checked by building both documents rather than by
+/// grepping for key names.
+///
+/// A scan cannot do this one. `id` appears in `open_pass` and again in
+/// `last_pass`; `engine` appears at the top level and again inside
+/// `open_pass`. Searching `fn loop_section` for either finds a match whichever
+/// one was renamed, so the guard stays green while `LoopState::from_status`
+/// breaks against a simulator still serving the old shape. Comparing produced
+/// documents closes that: production's own builder is called on the same state
+/// the simulator answered from, and the result is then fed through
+/// production's own reader.
+#[test]
+fn the_simulated_status_serves_the_loop_section_production_builds() {
+    // Both sub-objects have to be populated or half the comparison is vacuous,
+    // so this wants one pass ended and another still open. Crashing right
+    // after the second wake leaves exactly that.
+    let probe = Simulator::new(19);
+    Driver::new(probe.clone(), config()).poll_once().unwrap();
+    probe.nudge();
+    probe.schedule_faults(Vec::new());
+    Driver::new(probe.clone(), config()).poll_once().unwrap();
+    let wake = position_of(&probe.trace(), "pass.wake");
+
+    let host = Simulator::new(19);
+    Driver::new(host.clone(), config()).poll_once().unwrap();
+    host.nudge();
+    host.schedule_faults(vec![Fault::whole(wake)]);
+    let mut driver = Driver::new(host.clone(), config());
+    assert!(
+        catch_sim_crash(|| driver.poll_once()).is_none(),
+        "the wake fault did not fire; trace={:#?}",
+        host.trace()
+    );
+
+    let state = host.snapshot().state;
+    assert!(state.open_pass().is_some(), "no pass is open to compare");
+    assert!(
+        state.last_ended_pass().is_some(),
+        "no pass has ended to compare"
+    );
+
+    // Production's own builder, on the state the simulator just answered from.
+    let real = alder::app::loop_section(&state);
+    let answer = alderd::effects::Effects::alder(&host, &["status"]).unwrap();
+    let simulated = &answer["loop"];
+
+    assert_no_invented_keys("status loop", simulated, &real);
+    assert_no_invented_keys(
+        "status loop.open_pass",
+        &simulated["open_pass"],
+        &real["open_pass"],
+    );
+    assert_no_invented_keys(
+        "status loop.last_pass",
+        &simulated["last_pass"],
+        &real["last_pass"],
+    );
+
+    // And production's own reader, on production's own document. Every field
+    // `LoopState` needs is non-optional, so a renamed `open_pass.id` fails
+    // here rather than deserialising to something plausible.
+    let head = answer["head"].clone();
+    let from_real = alderd::loop_state::LoopState::from_status(&serde_json::json!({
+        "head": head,
+        "loop": real,
+    }))
+    .expect("production's loop section still reads back into LoopState");
+    let from_simulated = alderd::loop_state::LoopState::from_status(&answer)
+        .expect("the simulated status is production-readable");
+
+    let (real_open, simulated_open) = (
+        from_real
+            .open_pass
+            .expect("production reports the open pass"),
+        from_simulated
+            .open_pass
+            .expect("the simulator reports the open pass"),
+    );
+    assert_eq!(real_open.id, simulated_open.id);
+    assert_eq!(real_open.engine, simulated_open.engine);
+    assert_eq!(real_open.handle, simulated_open.handle);
+    assert_eq!(real_open.started_at, simulated_open.started_at);
+
+    let (real_last, simulated_last) = (
+        from_real
+            .last_pass
+            .expect("production reports the last pass"),
+        from_simulated
+            .last_pass
+            .expect("the simulator reports the last pass"),
+    );
+    assert_eq!(real_last.id, simulated_last.id);
+    assert_eq!(real_last.outcome, simulated_last.outcome);
+    assert_eq!(real_last.ended_at, simulated_last.ended_at);
+    assert_eq!(real_last.ended_seq, simulated_last.ended_seq);
+    // Optional on the way in, so a rename would read as absent rather than
+    // fail; assert the values actually arrived.
+    assert!(
+        real_last.outcome.is_some(),
+        "loop.last_pass.outcome is gone"
+    );
+    assert!(
+        real_last.ended_seq.is_some(),
+        "loop.last_pass.ended_seq is gone, and it is the whole log trigger"
+    );
+}
+
 #[test]
 fn a_failing_seed_replays_byte_for_byte() {
     let case = Case {
@@ -604,6 +711,45 @@ fn a_daemon_that_died_mid_injection_does_not_reuse_the_pane_it_dirtied() {
             .any(|boundary| boundary.contains("torn")),
         "the injection was never torn: {digest:#?}"
     );
+}
+
+/// One armed script means one scripted pass, whoever runs it.
+///
+/// The script belongs to the pass, not to a session, and getting that wrong
+/// has failed in both directions here. Arming only the *next* session creation
+/// never reached a leader the daemon reuses, so an operation named for a death
+/// produced none. Arming both the live session and the next creation fired on
+/// the live one and then stayed armed for its replacement, so one operation
+/// modelled two deaths and quietly changed the interleaving under test. This
+/// pins both edges at once: a reused leader dies, and the leader created after
+/// it is an ordinary one.
+#[test]
+fn one_armed_leader_death_kills_exactly_one_leader() {
+    let host = Simulator::new(31);
+    let mut driver = Driver::new(host.clone(), config());
+    // A leader session exists and this daemon knows it, so the next fire
+    // reuses it rather than restarting it.
+    driver.poll_once().unwrap();
+    host.script_leader(AgentScript::DieMidPass);
+    host.nudge();
+    driver.poll_once().unwrap();
+    // The scripted leader is gone; firing again builds a replacement.
+    host.nudge();
+    let _ = driver.poll_once();
+
+    let deaths = host
+        .trace()
+        .iter()
+        .filter(|boundary| boundary.label == "agent.die")
+        .count();
+    assert_eq!(
+        deaths,
+        1,
+        "one armed script produced {deaths} deaths; trace={:#?}",
+        host.trace()
+    );
+    host.recover(false);
+    host.assert_invariant(false);
 }
 
 /// The operation named for a leader death has to actually kill a leader.
