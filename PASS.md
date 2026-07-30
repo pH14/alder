@@ -11,6 +11,29 @@ alder log before this pass ends.
 
 Use `./target/debug/alder` for every alder command.
 
+## Text you did not write never goes inside a command
+
+A question's answer, a ruling, a work title, a spec, a check description, a
+reviewer's findings, a worker's note, the titles a pass report has to name —
+every one of those is text somebody else wrote, and Alder validates none of it
+beyond non-empty. So it may contain backticks, `$(…)`, quotes, or newlines, and
+a shell that meets it inside an argument expands it: your shell runs what the
+text says, and the durable record ends up reading as something nobody wrote.
+
+**Write it to a file outside the worktree, and pass it as
+`"$(cat "$scratch/<name>.txt")"`.** A command substitution's content is not
+re-scanned, so nothing in the file can expand or execute. Outside the worktree,
+because a file inside one can be committed onto the branch under review. Write
+the file with a quoted heredoc (`<<'EOF'`) or by redirecting a command's output
+— an unquoted heredoc expands its body and is the same hole again.
+
+This is not a rule about `--evidence`. It is a rule about every command below,
+including the ones that reach a worker: `send-keys` takes a shell argument like
+anything else, and a relay that expands the findings it delivers has undone the
+care taken in recording them. Fixed strings *this document* authors are not
+somebody else's text and may appear inline. Every template below is written in
+that form; where one cannot be, it says why.
+
 ## The pass
 
 1. **Sync.** `alder status --json` reads as an index: the loop line plus a
@@ -29,36 +52,45 @@ Use `./target/debug/alder` for every alder command.
 3. **Triage questions.** For every *unanswered* question, decide which of
    four kinds it is before you decide anything else. See "Triage" below.
 4. **Relay answers.** For each answered question whose work has an active
-   attempt: read the answer (`alder show <question>`), send it into the
-   worker's session, then `alder work unblock <work> --why "<the ruling>"`.
+   attempt: read the answer (`alder show <question>`), write the ruling to
+   `$scratch/ruling-<id>.txt`, send it into the worker's session, then
+   `alder work unblock <work> --why "$(cat "$scratch/ruling-<id>.txt")"`.
    How the answer is sent depends on what is holding the pane, which the
    attempt's `engine` metadata names:
    - **A claude worker** is an interactive session waiting on a prompt:
-     `tmux send-keys -t alder-work-<id> -l -- "<the answer>"` then
-     `tmux send-keys -t alder-work-<id> Enter`.
+     `tmux send-keys -t alder-work-<id> -l -- "$(cat "$scratch/ruling-<id>.txt")"`
+     then `tmux send-keys -t alder-work-<id> Enter`.
    - **A codex worker** ran one shot and left a shell in its worktree, so
-     the answer is a *command* typed at that shell — the same two sends,
-     with `.alder/resume <codex-session-uuid> "<the ruling>"` as the literal
-     text. That script is written into the worktree at spawn and repeats the
+     the answer is a *command* typed at that shell — the same two sends, with
+     `.alder/resume <codex-session-uuid> "$(cat "<abs>/ruling-<id>.txt")"` as
+     the literal text. Single-quote that whole string in your own shell
+     (`send-keys -l -- '.alder/resume … "$(cat …)"'`): the text crosses **two**
+     shells, and the file must be read by the second one, not by the first.
+     The path has to be absolute, because that shell sits in the worktree.
+     That script is written into the worktree at spawn and repeats the
      model, effort and sandbox the worker was launched with, because
      `codex exec resume` inherits none of them; do not hand-write the
      `codex exec resume` line. The UUID is the attempt's `codex-session`
-     metadata; without it, `.alder/resume "<the ruling>"` resumes the newest
+     metadata; without it, `.alder/resume "$(cat …)"` resumes the newest
      codex session in that directory, which is the worker's own unless it
      has been running consults.
 
-   **Then confirm it landed**, because `send-keys -l` fills the pane's input
-   buffer and the `Enter` that follows does not reliably commit it: a full
-   feedback message has sat unsent in a worker's buffer for an entire pass —
-   twice — while the log recorded the ruling as relayed. Capture the pane
+   **Then confirm it landed**, because a pane is not a durable channel and the
+   log records the ruling as relayed either way. That is reason enough on its
+   own — and it is the only reason to trust here. A pass once reported that
+   `send-keys -l` had left a message unsent and that every send needs a verified
+   second `Enter` (al-pass-87). Treat that as **unverified**: it is equally
+   consistent with the ghost-text misreading described below, and "a second
+   `Enter` finally landed it" is exactly what submitting a ghost suggestion
+   looks like. Do not repeat it as established. Capture the pane
    (`tmux capture-pane -pt alder-work-<id> | tail`) and read it for the two
    signals that mean something:
 
    - **the engine is working** — a claude pane shows a running turn as a
      spinner line with an elapsed timer and a token count
      (`✢ Whisking… (1m 39s · ↓ 6.2k tokens)` — the word varies, the shape does
-     not); a codex worker's shell shows the
-     relayed `.alder/resume` command running above a busy prompt;
+     not); a codex worker's shell shows the relayed `.alder/resume` command
+     running above a busy prompt;
    - **the worker moves** — a fresh `attempt.updated` on that attempt is the
      only *durable* evidence of delivery, and it is what you actually want.
 
@@ -87,8 +119,8 @@ Use `./target/debug/alder` for every alder command.
    spawn is launched on the *item*, not on the Q&A, which is why an answer
    that amounts to a ruling has to be folded into the item to survive.
    When an answer amounts to a spec ruling, fold it into the item with
-   `alder work edit --spec --why "<the ruling>"` so it outlives the Q&A and
-   survives a respawn. A ruling that needs a whole new *check* cannot be folded
+   `alder work edit --spec --why "$(cat "$scratch/ruling-<id>.txt")"` so it
+   outlives the Q&A and survives a respawn. A ruling that needs a whole new *check* cannot be folded
    into a running item — checks cannot change while an attempt is active — so
    it waits for the attempt to end and lands with the respawn, or it stays in
    the spec.
@@ -104,13 +136,18 @@ Use `./target/debug/alder` for every alder command.
    - Cross-review it before it goes anywhere — see **The cross-review rule**.
      Your own reading is not that review; you dispatched the work.
    - Good: check both endpoints against what was reviewed —
-     `git rev-parse work/<id>` equals `reviewed-sha` and `git rev-parse main`
-     equals `reviewed-base` — then merge locally
-     (`git merge --no-ff work/<id>`), then
-     `alder work finish <id> --attempt <attempt>`, kill the session
+     `git rev-parse work/<id>` equals `reviewed-sha` and
+     `git merge-base main work/<id>` equals `reviewed-base` — then merge
+     locally (`git merge --no-ff work/<id>`) and **run the gates again on the
+     merge result**, which is the tree nobody has reviewed. If they fail there,
+     the merge does not stand: undo it — the merge commit is local and unpushed
+     — and send the incompatibility back to the author as a finding. If they
+     pass, `alder work finish <id> --attempt <attempt>`, kill the session
      (`tmux kill-session -t alder-work-<id>`), remove the worktree
      (`git worktree remove ../alder-work-<id>`) and delete the branch.
-   - Not good: send precise feedback into the session (same send-keys
+   - Not good: relay the findings from the file you recorded them in, never
+     inline — findings are the reviewer's text, so the quoting rule applies to
+     delivering them exactly as it did to recording them (same send-keys
      pattern) and leave it in flight.
 6. **Drain handoffs.** Admit each coherent submitted handoff
    (`alder work add --handoff <id>` with real priority/checks). Workers
@@ -134,7 +171,7 @@ Use `./target/debug/alder` for every alder command.
      gets recorded when a spawn or a worker dies on one.
 8. **Nudge stalls.** For each in-flight attempt with no milestone in a long
    while, look before poking: `tmux capture-pane -pt alder-work-<id> | tail`.
-   Genuinely stalled: nudge once through send-keys. Stalled again next pass:
+   Genuinely stalled: nudge once through send-keys, quoted the same way. Stalled again next pass:
    kill, respawn fresh (same item, same branch). Fails a second respawn:
    `alder work ask <id>` — Paul decides.
 
@@ -160,15 +197,23 @@ the item (`alder show <work>` lists them all), not just the newest.
 | `terra` | claude `opus` or `fable` |
 | `sol` | claude `fable` |
 
-**When both vendors appear, the branch takes two reviews** — one from each
+**When both vendors appear, the branch needs two reviews** — one from each
 ladder, each reading the whole diff, because no single review can be "not the
-author's vendor" for commits written by both. Both are recorded, comma-joined
-the way a second consult is (`--meta reviewed-by=gpt-5.6-sol,claude-fable-5`),
-and the check is satisfied only once every vendor on the branch has been read
-by the other. That is two heavy ops and therefore two passes. It is expensive
-on purpose: the cheap way out is to cut a fresh branch when a respawn switches
-provider, not to review half a diff. The log does not record which attempt
-wrote which commit, so when you cannot tell, count the vendor as an author.
+author's vendor" for commits written by both. Both go in `reviewed-by`,
+comma-joined the way a second consult is
+(`--meta reviewed-by=gpt-5.6-sol,claude-fable-5`), and the check is satisfied
+only once every vendor on the branch has been read by the other. That is two
+heavy ops and therefore two passes.
+
+Between them the first verdict has **nowhere durable to live**: satisfying the
+check after one review greens the gate over a half-read diff, and withholding it
+leaves a pending check, which carries no evidence at all. That gap needs a fact
+Alder does not have, so it is al-q8qwhy's and is not invented here — see *What
+this rule does not close*. Until it lands, the practical answer is to not get
+here: cut a fresh branch when a respawn switches provider, rather than review
+half a diff or hold a verdict in your head. The log does not record which
+attempt wrote which commit, so when you cannot tell, count the vendor as an
+author.
 
 The ladders pair by standing — `luna`↔`sonnet`, `terra`↔`opus`, `sol`↔`fable`,
 the counterpart column in `crates/alderd/README.md` — so `sol` is reviewed at
@@ -180,7 +225,7 @@ the weaker of them ends up run wrong:
 
 - **claude-authored** — `codex review`, run in the branch's own worktree:
 
-      codex review --base main --title "<work-id> — <the item's title>" \
+      codex review --base main --title "$(cat "$scratch/review-title-<id>.txt")" \
         -c model=gpt-5.6-sol -c model_reasoning_effort=xhigh \
         -c approval_policy=never -c sandbox_mode=workspace-write
 
@@ -262,11 +307,12 @@ the weaker of them ends up run wrong:
 Every verdict is durable, on the **authoring** attempt, and it is written
 *before* a word of it reaches anyone.
 
-**Reviewer text never travels on a command line.** Write the summary and the
-findings to a file outside the worktree, then pass the file:
+Write the summary and the findings to a file and pass the file, per the quoting
+rule at the top of this document: reviewer output is exactly the kind of
+branch-controlled text that rule exists for.
 
     cat > "$scratch/cross-review-<id>.txt" <<'EOF'
-    gpt-5.6-sol via codex review at 901445f (base main 6eab0cd), effort xhigh:
+    gpt-5.6-sol via codex review at 901445f (merge base 6eab0cd), effort xhigh:
     changes requested, 4 findings (3 P1).
       P1 PASS.md:138 the codex invocation does not run: --base and a prompt cannot compose.
       P1 PASS.md:165 the claude prompt omits the work title, the only always-present
@@ -278,26 +324,16 @@ findings to a file outside the worktree, then pass the file:
     alder attempt edit <attempt> --failed cross-review \
       --evidence "$(cat "$scratch/cross-review-<id>.txt")" \
       --meta reviewed-by=gpt-5.6-sol \
-      --meta reviewed-sha=901445f --meta reviewed-base=6eab0cd \
+      --meta reviewed-sha="$(git rev-parse work/<id>)" \
+      --meta reviewed-base="$(git merge-base main work/<id>)" \
       --meta reviewed-effort=xhigh
 
-A clean verdict is the same call with `--satisfied` and a one-line file. Both
-use `"$(cat …)"` and a quoted heredoc, because a finding is *branch-controlled
-text*: ordinary reviewer output contains backticks and `$(…)`, and pasted
-straight into a double-quoted argument the leader's own shell expands it —
-which silently rewrites the durable evidence, and runs whatever it expanded.
-The content of a command substitution is not re-scanned, so this is the whole
-fix; it is a template change, not a mechanism. Keep the file outside the
-worktree so it cannot be committed onto the branch under review.
-
-The same hole is in the claude prompt: a title, spec, or check description is
-arbitrary logged text. Build that prompt in a file too and pass
-`"$(cat "$scratch/review-prompt-<id>.txt")"`.
+A clean verdict is the same call with `--satisfied` and a one-line file.
 
 The verdict itself is the check's status and is not repeated in metadata: two
 places that can disagree about one fact is exactly what this repository refuses
-elsewhere. The three metadata keys are there because nothing else records them
-— **who** reviewed, at **what effort**, and **which two endpoints** they read.
+elsewhere. The four metadata keys are there because nothing else records them —
+**who** reviewed, at **what effort**, and **which two endpoints** they read.
 
 Evidence names the reviewer engine, the two revisions it read, the effort, the
 verdict, the finding count — and, when there are findings, **the findings**: one
@@ -324,23 +360,33 @@ it, a review that quietly ran at a default effort reads in the log exactly like
 one run at `xhigh`.
 
 `reviewed-sha` and `reviewed-base` make the verdict a fact about a **diff**
-rather than about a branch name. A review reads two endpoints, and either can
-move:
+rather than about a branch name. The two endpoints are the branch head and the
+**merge base** — `git merge-base main work/<id>` — because that is where the
+delta a reviewer reads begins: `git diff main...work/<id>` is three-dot, and
+`codex review --base main` reads from the fork point too. Record the merge base,
+never `git rev-parse main`: main's tip is a commit the reviewer did not read, so
+a gate comparing against it would attest to an integration context that never
+existed. Either endpoint can move:
 
-- the **branch head** moves when the author commits a fix or rebases, and a
-  satisfied check does not follow new commits — that is a green check over code
-  nobody read;
-- **main** moves whenever anything else merges, and then the review describes an
-  integration context that no longer exists. A cross-review can easily consume a
-  pass without merging, so this is not a corner case.
+- the **branch head** moves when the author commits a fix, and a satisfied
+  check does not follow new commits — that is a green check over code nobody
+  read;
+- the **merge base** moves when the branch is rebased, which replays the whole
+  delta onto a different parent.
 
 **At merge, `git rev-parse work/<id>` must equal `reviewed-sha` and
-`git rev-parse main` must equal `reviewed-base`.** If either has moved, the
-review is stale: run it again and record both SHAs. The consequence is worth
-saying out loud — merging anything stales every other pending review, so a
-second branch merged after the first needs its own fresh review, in its own
-pass. That is the honest price of a gate that means what it says, and it is
-what the one-heavy-op rule was already charging.
+`git merge-base main work/<id>` must equal `reviewed-base`.** If either has
+moved, the review is stale: run it again and record both.
+
+Main advancing on its own moves neither endpoint, so merging one branch does not
+stale the reviews of the others. What it changes is the merge *result*, and a
+review of a delta is not a test of the tree that comes out of merging it: two
+branches that each read clean can still be semantically incompatible. **This
+rule knowingly does not require a second review of the merge result** — that
+would double the cost of every merge, and an incompatibility of that kind is not
+an opinion a reviewer needs to supply. It requires the **gates** on the merge
+result instead, which is where such a conflict shows up as a failure. Step 5 runs
+them there.
 
 ### The check is declared at admission
 
@@ -348,8 +394,12 @@ what the one-heavy-op rule was already charging.
 checks, with `work add`:
 
     alder work add --handoff <handoff> --priority <n> \
-      --check <the item's own checks> \
+      --check "$(cat "$scratch/check-<key>.txt")" \
       --check cross-review:"reviewed by the other vendor's ladder; the leader records this one, not the worker"
+
+Repeat the first form once per check the handoff proposed — those descriptions
+are the submitter's text, so they arrive through files; the `cross-review`
+description is this document's own words and may be inline.
 
 `work add` takes `--check`. `--add-check` is `work edit`'s flag and does not
 exist on `add` (`src/cli.rs`), so reaching for it here fails the admission
@@ -378,7 +428,8 @@ durable fact in **metadata**:
 
     alder attempt edit <attempt> \
       --meta reviewed-by=gpt-5.6-sol \
-      --meta reviewed-sha=<sha> --meta reviewed-base=<main-sha> \
+      --meta reviewed-sha="$(git rev-parse work/<id>)" \
+      --meta reviewed-base="$(git merge-base main work/<id>)" \
       --meta reviewed-effort=xhigh \
       --meta cross-review=failed \
       --meta cross-review-findings="$(cat "$scratch/cross-review-<id>.txt")"
@@ -432,7 +483,7 @@ not the merge follows it in the same pass.
 
 ### What this rule does not close
 
-Three gaps are known, and none of them can be closed by prose, so this section
+Four gaps are known, and none of them can be closed by prose, so this section
 names them instead of pretending otherwise. Each needs a new durable fact or a
 change to what a worker's brief carries — product work, tracked as **al-q8qwhy**
 (which requires this item):
@@ -453,9 +504,16 @@ change to what a worker's brief carries — product work, tracked as **al-q8qwhy
   next pass simply pays again. This is the repository's own
   intent-before-effects rule, not yet applied to the leader.
 
+- **A partial verdict has nowhere to live.** When a branch carries commits from
+  both vendors it needs a review from each, and after the first one there is no
+  durable state between "satisfied" and "pending": one greens a gate over a
+  half-read diff, the other records nothing. A per-reviewer check result would
+  change the acceptance-check model, which is Paul's call, not a leader's.
+
 Until al-q8qwhy lands, these are costs a leader absorbs knowingly: relay
-carefully, respawn with the findings in hand, and expect a crashed review to be
-paid for twice.
+carefully, respawn with the findings in hand, expect a crashed review to be paid
+for twice, and keep a branch to one vendor so the partial-verdict case never
+arises.
 
 ## Triage
 
@@ -466,7 +524,8 @@ actually asking, not by how hard it looks.
 
 - **An authority question** — options plus a recommendation, which is how
   workers are told to ask. Ratify or overrule it, with
-  `alder question answer <question> "<the ruling>"`. Ratification is
+  `alder question answer <question> "$(cat "$scratch/ruling-<id>.txt")"`.
+  Ratification is
   administration, not adjudication: it does not require outranking the
   asker's model tier, and a recommendation from a stronger model is still
   only a recommendation. The rule is **if you cannot defend a veto from
@@ -501,15 +560,20 @@ Escalation is not a command. It is **leaving the question unanswered and
 naming it prominently in the pass report** — which is why nothing else may
 sit unanswered at the end of a pass. A question the worker raised and a
 question you raise yourself escalate identically: `alder work ask <id>
-"<question>"`. Do not improvise around a blocked item, and never let a
+"$(cat "$scratch/ask-<id>.txt")"` — a worker's own words are text you did not
+write. Do not improvise around a blocked item, and never let a
 worker's question sit unrelayed.
 
 ## Ending the pass
 
 Always end with:
 
-    alder pass end --outcome ok --report "<3-6 lines: what you saw, what you
-    did, what is blocked and why>" --wake <duration>
+    alder pass end --outcome ok \
+      --report "$(cat "$scratch/pass-report.txt")" --wake <duration>
+
+The report is 3-6 lines: what you saw, what you did, what is blocked and why.
+It goes through a file like everything else, because naming an item means
+quoting its title.
 
 Pick `--wake` honestly: ~10m with workers in flight, 30m–1h when only waiting
 on a human answer, longer when the frontier is empty and no one is working.
