@@ -11,6 +11,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
+alder = { path = "../.." }
+alder-log = { path = "../alder-log" }
+proptest = "1"
 tempfile = "3"
 
 [lints.rust]
