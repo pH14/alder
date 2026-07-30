@@ -8,7 +8,12 @@ use crate::error::{DriverError, Result};
 /// reported. This is the driver's complete view of the durable log: it never
 /// reads work, attempts, or questions, because deciding anything about them
 /// would be judgment.
-#[derive(Debug, Clone, Default, Deserialize)]
+///
+/// `PartialEq` so a test can compare two of these whole rather than field by
+/// field: the simulator's answer against production's, both read back through
+/// this type. A field added below then joins that comparison for free, which a
+/// hand-written list of assertions would not.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct LoopState {
     /// The current log head. Compared with the last pass's `ended_seq`, this
     /// is the whole log trigger, and it needs no memory of its own.
@@ -30,7 +35,7 @@ pub struct LoopState {
     pub last_pass: Option<LastPass>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct OpenPass {
     pub id: String,
     pub engine: String,
@@ -38,7 +43,7 @@ pub struct OpenPass {
     pub started_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct LastPass {
     pub id: String,
     pub outcome: Option<String>,

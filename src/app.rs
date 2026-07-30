@@ -16,8 +16,8 @@ use crate::{
     config::{Project, initialize},
     domain::{
         AppendResult, AttemptOutcome, ChangeMode, CheckDefinition, CheckStatus, CheckUpdate, Event,
-        EventPayload, GraphChangeDocument, NullableString, PassOutcome, PassTrigger, ProjectLog,
-        ProjectState, Question, Snapshot, WorkStateChange, prepare_change,
+        EventPayload, GraphChangeDocument, Head, NullableString, PassOutcome, PassTrigger,
+        ProjectLog, ProjectState, Question, Snapshot, WorkStateChange, prepare_change,
     },
     error::{AlderError, Result},
     observer,
@@ -645,6 +645,34 @@ fn attempt_edit(context: &Context, args: &AttemptEditArgs) -> Result<Output> {
     ))
 }
 
+/// The part of `alder status --json` every answer carries: the read envelope,
+/// and the loop section filed under the key the driver reads it from. `status`
+/// inserts the observation, question, and count sections — and whichever
+/// listings were asked for — on top of this.
+///
+/// Public, and split out of `status`, so a test can drive the real packer over
+/// a state it built rather than assembling the document itself. `alderd`'s
+/// `LoopState::from_status` looks `loop` and `head` up by name, and a test that
+/// writes those keys by hand cannot notice production renaming or dropping
+/// either. Neither can a scan of this file: `status` spells `"loop"` a second
+/// time for the human rendering, so a search finds a match whichever
+/// occurrence went.
+pub fn status_document(
+    head: &Head,
+    hypothetical: bool,
+    source: Option<&str>,
+    state: &ProjectState,
+) -> Value {
+    json!({
+        "schema": "alder.status.v0",
+        "head": head.sequence(),
+        "revision": head.revision(),
+        "hypothetical": hypothetical,
+        "source": source,
+        "loop": loop_section(state),
+    })
+}
+
 fn status(
     context: &mut Context,
     changes: Option<&str>,
@@ -724,7 +752,6 @@ fn status(
         .cloned()
         .collect();
     blocked.sort_by_key(|work| work.opened_seq);
-    let loop_section = loop_section(&state);
     let counts = json!({
         "attention": findings.len(),
         "handoffs": handoffs.len(),
@@ -733,21 +760,22 @@ fn status(
         "waiting_on_human": questions.len(),
         "blocked": blocked.len(),
     });
-    let mut json = json!({
-        "schema": "alder.status.v0",
-        "head": context.snapshot.head.sequence(),
-        "revision": context.snapshot.head.revision(),
-        "hypothetical": hypothetical,
-        "source": source,
-        "loop": loop_section,
-        "observations": {
+    let mut json = status_document(
+        &context.snapshot.head,
+        hypothetical,
+        source.as_deref(),
+        &state,
+    );
+    let object = json.as_object_mut().expect("status json is an object");
+    object.insert(
+        "observations".to_owned(),
+        json!({
             "runs": runs,
             "handles": observations,
-        },
-        "questions": rendered_questions,
-        "counts": counts,
-    });
-    let object = json.as_object_mut().expect("status json is an object");
+        }),
+    );
+    object.insert("questions".to_owned(), json!(rendered_questions));
+    object.insert("counts".to_owned(), counts);
     if full {
         object.insert("attention".to_owned(), json!(findings));
         object.insert("handoffs".to_owned(), json!(handoffs));
@@ -930,7 +958,9 @@ fn selected_status_sections(
 /// The loop's desired state and its two interesting passes. The driver reads
 /// this section and ignores the rest of `status`. It is public so the model
 /// checker and the simulator read the loop through the same projection the
-/// daemon does.
+/// daemon does. [`status_document`] files this value under the `loop` key,
+/// letting simulator tests compare the full production document instead of
+/// grepping source literals.
 pub fn loop_section(state: &ProjectState) -> Value {
     let control = &state.loop_control;
     json!({

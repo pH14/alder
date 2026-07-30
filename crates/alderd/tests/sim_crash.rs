@@ -13,7 +13,7 @@
 
 mod simulator;
 
-use alderd::{driver::Driver, spawn, tier};
+use alderd::{driver::Driver, loop_state::LoopState, spawn, tier};
 use proptest::prelude::*;
 use simulator::{
     AgentScript, Boundary, Case, Fault, MIRRORED, MUTATION_ENVELOPE, Operation, Simulator, Site,
@@ -351,6 +351,66 @@ fn assert_still_emitted(what: &str, real: &serde_json::Value, production_reads: 
     }
 }
 
+/// Every key production's loop section carries, split by whether [`LoopState`]
+/// — the driver's whole view of the durable log — reads it.
+///
+/// Both halves are asserted against the document production just built, so a
+/// field added to `loop_section` fails here until somebody classifies it.
+/// Everything in the read half is then *required* of the simulator, because
+/// `LoopState` defaults every field it can: an omission deserialises to a
+/// default rather than to an error, and the simulated loop would take a
+/// decision production never takes with this guard still green.
+const LOOP_READ: [&str; 7] = [
+    "paused",
+    "pause_reason",
+    "engine",
+    "rotate_pending",
+    "nudge_pending",
+    "open_pass",
+    "last_pass",
+];
+const LOOP_UNREAD: [&str; 0] = [];
+const OPEN_PASS_READ: [&str; 4] = ["id", "engine", "handle", "started_at"];
+const OPEN_PASS_UNREAD: [&str; 2] = ["triggers", "at_head"];
+const LAST_PASS_READ: [&str; 5] = ["id", "outcome", "wake_at", "ended_at", "ended_seq"];
+const LAST_PASS_UNREAD: [&str; 2] = ["engine", "report_line"];
+
+/// One object of the loop section, compared in both directions.
+///
+/// Production is held to its own inventory — exactly `read` plus `unread`, so a
+/// new field cannot arrive unclassified. The simulator is held to inventing
+/// nothing production lacks *and* to omitting nothing the driver reads.
+fn assert_compared_both_ways(
+    what: &str,
+    simulated: &serde_json::Value,
+    real: &serde_json::Value,
+    read: &[&str],
+    unread: &[&str],
+) {
+    let mut classified: Vec<&str> = read.iter().chain(unread).copied().collect();
+    classified.sort_unstable();
+    let emitted: Vec<&str> = real
+        .as_object()
+        .unwrap_or_else(|| panic!("{what}: production's value is not an object: {real}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        emitted, classified,
+        "{what}: production's fields moved. Each one is either read by \
+         `LoopState` or deliberately not, and this test has to say which."
+    );
+    assert_no_invented_keys(what, simulated, real);
+    for key in read {
+        assert!(
+            simulated.get(key).is_some(),
+            "{what}: the simulator omits `{key}`, which the driver reads; \
+             `LoopState` would default it and the simulated loop would decide \
+             on a value production never sent"
+        );
+    }
+}
+
 /// The half of the drift guard a source scan cannot reach.
 ///
 /// `current` and each `in_flight` item are not `json!` literals in the CLI:
@@ -405,17 +465,23 @@ fn the_simulated_dispatcher_serves_no_nested_shape_production_lacks() {
     assert_still_emitted("in_flight[]", &attempt, &["id", "work_id", "handle"]);
 }
 
-/// The loop section, checked by building both documents rather than by
-/// grepping for key names.
+/// The loop section, driven end to end: production's own status packer in, a
+/// parsed [`LoopState`] out, compared both ways.
 ///
-/// A scan cannot do this one. `id` appears in `open_pass` and again in
-/// `last_pass`; `engine` appears at the top level and again inside
-/// `open_pass`. Searching `fn loop_section` for either finds a match whichever
-/// one was renamed, so the guard stays green while `LoopState::from_status`
-/// breaks against a simulator still serving the old shape. Comparing produced
-/// documents closes that: production's own builder is called on the same state
-/// the simulator answered from, and the result is then fed through
-/// production's own reader.
+/// A scan settles none of it. `"loop"` occurs twice in `fn status` — once as
+/// the key the driver reads, once as a heading in the human rendering — so a
+/// search finds a match whichever one went. Inside the section, `id` appears in
+/// `open_pass` and again in `last_pass`, and `engine` at the top level and
+/// again inside `open_pass`.
+///
+/// Nor does building the document around production's section: a test that
+/// supplies the `loop` key itself is supplying the very thing
+/// `LoopState::from_status` looks up, and cannot notice production renaming or
+/// dropping it. So `app::status_document` — the real packer, envelope and key
+/// included — builds the whole document over the state the simulator answered
+/// from. The two documents are then compared field by field in both
+/// directions, and read back through production's own reader, whose parsed
+/// results must be equal.
 #[test]
 fn the_simulated_status_serves_the_loop_section_production_builds() {
     // Both sub-objects have to be populated or half the comparison is vacuous,
@@ -439,75 +505,87 @@ fn the_simulated_status_serves_the_loop_section_production_builds() {
         host.trace()
     );
 
-    let state = host.snapshot().state;
+    let snapshot = host.snapshot();
+    let state = &snapshot.state;
     assert!(state.open_pass().is_some(), "no pass is open to compare");
     assert!(
         state.last_ended_pass().is_some(),
         "no pass has ended to compare"
     );
 
-    // Production's own builder, on the state the simulator just answered from.
-    let real = alder::app::loop_section(&state);
-    let answer = alderd::effects::Effects::alder(&host, &["status"]).unwrap();
-    let simulated = &answer["loop"];
+    // Production's own packer, over the state the simulator just answered
+    // from. `head` and the `loop` key are written by `src/app.rs`; nothing
+    // here reproduces them.
+    let real = alder::app::status_document(&snapshot.head, false, None, state);
+    let simulated = alderd::effects::Effects::alder(&host, &["status"]).unwrap();
 
-    assert_no_invented_keys("status loop", simulated, &real);
-    assert_no_invented_keys(
+    // The envelope, which used to be a `MIRRORED` row scanned out of the
+    // source. Two produced documents settle it outright, so the row is gone.
+    assert_still_emitted("status", &real, &["schema", "head", "revision", "loop"]);
+    assert_no_invented_keys("status", &simulated, &real);
+    assert_eq!(
+        simulated["schema"], real["schema"],
+        "the simulator answers `status` as a schema production no longer claims"
+    );
+    assert!(
+        simulated.get("head").is_some(),
+        "the simulator's status carries no `head`, and the head is the whole \
+         log trigger"
+    );
+
+    assert_compared_both_ways(
+        "status loop",
+        &simulated["loop"],
+        &real["loop"],
+        &LOOP_READ,
+        &LOOP_UNREAD,
+    );
+    assert_compared_both_ways(
         "status loop.open_pass",
-        &simulated["open_pass"],
-        &real["open_pass"],
+        &simulated["loop"]["open_pass"],
+        &real["loop"]["open_pass"],
+        &OPEN_PASS_READ,
+        &OPEN_PASS_UNREAD,
     );
-    assert_no_invented_keys(
+    assert_compared_both_ways(
         "status loop.last_pass",
-        &simulated["last_pass"],
-        &real["last_pass"],
+        &simulated["loop"]["last_pass"],
+        &real["loop"]["last_pass"],
+        &LAST_PASS_READ,
+        &LAST_PASS_UNREAD,
     );
 
-    // And production's own reader, on production's own document. Every field
-    // `LoopState` needs is non-optional, so a renamed `open_pass.id` fails
-    // here rather than deserialising to something plausible.
-    let head = answer["head"].clone();
-    let from_real = alderd::loop_state::LoopState::from_status(&serde_json::json!({
-        "head": head,
-        "loop": real,
-    }))
-    .expect("production's loop section still reads back into LoopState");
-    let from_simulated = alderd::loop_state::LoopState::from_status(&answer)
-        .expect("the simulated status is production-readable");
-
-    let (real_open, simulated_open) = (
-        from_real
-            .open_pass
-            .expect("production reports the open pass"),
-        from_simulated
-            .open_pass
-            .expect("the simulator reports the open pass"),
+    // And production's own reader, over both documents. Parsed states rather
+    // than key sets: a field that arrives under the right name carrying the
+    // wrong thing is a difference here and nowhere above.
+    let from_real = LoopState::from_status(&real)
+        .expect("production's own status document reads back into LoopState");
+    let from_simulated =
+        LoopState::from_status(&simulated).expect("the simulated status is production-readable");
+    assert_eq!(
+        from_simulated, from_real,
+        "the loop the daemon sees under simulation is not the loop production \
+         reports for the same state"
     );
-    assert_eq!(real_open.id, simulated_open.id);
-    assert_eq!(real_open.engine, simulated_open.engine);
-    assert_eq!(real_open.handle, simulated_open.handle);
-    assert_eq!(real_open.started_at, simulated_open.started_at);
 
-    let (real_last, simulated_last) = (
-        from_real
-            .last_pass
-            .expect("production reports the last pass"),
-        from_simulated
-            .last_pass
-            .expect("the simulator reports the last pass"),
-    );
-    assert_eq!(real_last.id, simulated_last.id);
-    assert_eq!(real_last.outcome, simulated_last.outcome);
-    assert_eq!(real_last.ended_at, simulated_last.ended_at);
-    assert_eq!(real_last.ended_seq, simulated_last.ended_seq);
-    // Optional on the way in, so a rename would read as absent rather than
-    // fail; assert the values actually arrived.
+    // An equality between two empty states would prove nothing, so pin the
+    // fields the loop actually turns on. `wake_at` is null on both sides: no
+    // command the daemon sends sets one, so no scenario this harness reaches
+    // populates it. Requiring the simulator to emit the key is what catches it
+    // being renamed or dropped; the equality above carries its value whenever
+    // there is one.
+    assert!(from_real.head > 0, "the status document reports head 0");
+    let open = from_real
+        .open_pass
+        .expect("production reports the open pass");
+    assert!(!open.id.is_empty(), "loop.open_pass.id is empty");
+    assert!(!open.handle.is_empty(), "loop.open_pass.handle is empty");
+    let last = from_real
+        .last_pass
+        .expect("production reports the last pass");
+    assert!(last.outcome.is_some(), "loop.last_pass.outcome is gone");
     assert!(
-        real_last.outcome.is_some(),
-        "loop.last_pass.outcome is gone"
-    );
-    assert!(
-        real_last.ended_seq.is_some(),
+        last.ended_seq.is_some(),
         "loop.last_pass.ended_seq is gone, and it is the whole log trigger"
     );
 }

@@ -144,13 +144,15 @@ pub enum Site {
 /// only for the flat top level of each document — where a name appears once
 /// and means one thing.
 ///
-/// Every nested shape is checked instead by comparing a *produced document*
-/// against what production actually builds, which is a guard no rename slips
-/// past. `current` and each `in_flight` item are serialised from domain types
-/// whose field names appear nowhere in `src/app.rs`; the `loop` section is a
-/// literal, but its `id` and `engine` each occur at two different depths, so a
-/// scan for either proves nothing. Different reasons, same answer — both are
-/// covered by the two `the_simulated_dispatcher_serves_…` tests.
+/// Everything a scan cannot settle is checked instead by comparing a *produced
+/// document* against what production actually builds, which is a guard no
+/// rename slips past. `current` and each `in_flight` item are serialised from
+/// domain types whose field names appear nowhere in `src/app.rs`; the whole
+/// `status` document is a literal, but `loop` occurs twice in `fn status` and
+/// `id` and `engine` each occur at two different depths inside the section, so
+/// a scan for any of them proves nothing. Different reasons, same answer —
+/// both are covered by the `the_simulated_…serves_…` tests, and `alder status`
+/// has no row here at all because that comparison covers its whole document.
 ///
 /// What none of it can see is a field the CLI renames in a region this
 /// simulator does not model at all, so a new `alder` sub-command answered here
@@ -169,7 +171,7 @@ pub struct Mirrored {
     pub fields: &'static [&'static str],
 }
 
-pub const MIRRORED: [Mirrored; 9] = [
+pub const MIRRORED: [Mirrored; 8] = [
     Mirrored {
         command: "show",
         site: Site::Function("show"),
@@ -177,16 +179,21 @@ pub const MIRRORED: [Mirrored; 9] = [
         fields: &["head", "id", "kind", "current", "history"],
     },
     Mirrored {
-        command: "status",
-        site: Site::Function("status"),
-        schema: Some("alder.status.v0"),
-        fields: &["head", "revision", "loop"],
-    },
-    Mirrored {
+        // `alder status` has no row: it is guarded end to end instead, by
+        // `the_simulated_status_serves_the_loop_section_production_builds`,
+        // which drives `app::status_document` — the real packer, envelope and
+        // `loop` key included — and compares the answers as documents and as
+        // parsed `LoopState`s. That subsumes a scan for the schema, `head`,
+        // `revision` and `loop`, and catches the renames a scan cannot see.
+        //
+        // Both `status` answers arrive through the same two packers, this
+        // simulator's `status_pack` and production's `status_document`, so
+        // what is left to scan for here is the one key that distinguishes
+        // this answer and is a literal in `fn status`.
         command: "status --section in_flight",
         site: Site::Function("status"),
-        schema: Some("alder.status.v0"),
-        fields: &["head", "revision", "in_flight"],
+        schema: None,
+        fields: &["in_flight"],
     },
     Mirrored {
         command: "refresh",
