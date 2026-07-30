@@ -75,7 +75,12 @@ Use `./target/debug/alder` for every alder command.
    `alder next`, then: `alderd spawn <id> [tier]`. That one command records
    the attempt, cuts the worktree and branch, and launches the worker on its
    **goal** — spec, checks, and gates — so keep specs and check descriptions
-   worth reading; they are the brief. A dispatch round counts as the pass's
+   worth reading; they are the brief. Specs are yours to keep TRUE, not just
+   readable: when the world has moved since one was written — its branch
+   merged, its file gone, its premise already decided — re-scope it yourself
+   (`alder work edit --spec --why`, or `work drop` if nothing remains) before
+   dispatching anyone at it. Escalate a re-scope only when it needs a ruling
+   the repository cannot supply. A dispatch round counts as the pass's
    heavy op if it spawns anyone. Choosing the rung is yours:
    - **Default `terra`.** Ordinary work.
    - **`luna`** for narrow, well-specified items; **`sol`** only for the
