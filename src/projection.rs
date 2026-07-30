@@ -230,7 +230,7 @@ impl Projection {
 /// from the log, or for observations from the running world — so the honest
 /// response to a schema change is to drop it all and let the next sync and
 /// sweep refill it.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 fn reset_if_schema_changed(connection: &Connection) -> Result<()> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -312,7 +312,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
             work_id TEXT NOT NULL,
             state TEXT NOT NULL,
             outcome TEXT,
-            handle TEXT UNIQUE,
+            handle TEXT,
             metadata TEXT NOT NULL,
             note TEXT,
             started_seq INTEGER NOT NULL,
@@ -320,6 +320,10 @@ fn create_schema(connection: &Connection) -> Result<()> {
             updated_seq INTEGER NOT NULL,
             ended_seq INTEGER
         );
+        -- A handle is exclusive to one LIVE attempt; respawns reuse the
+        -- session name of an ended attempt.
+        CREATE UNIQUE INDEX IF NOT EXISTS attempts_live_handle
+            ON attempts(handle) WHERE handle IS NOT NULL AND ended_seq IS NULL;
         CREATE TABLE IF NOT EXISTS attempt_checks (
             attempt_id TEXT NOT NULL,
             key TEXT NOT NULL,
@@ -791,8 +795,8 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        CheckDefinition, CheckStatus, CheckUpdate, EventPayload, HandoffDefinition, Ledger,
-        WorkState,
+        AttemptOutcome, CheckDefinition, CheckStatus, CheckUpdate, EventPayload, HandoffDefinition,
+        Ledger, WorkState,
     };
     use alder_log::MemoryLog as MemoryStore;
 
@@ -837,6 +841,37 @@ mod tests {
         connection
             .query_row("SELECT count(*) FROM ready", [], |row| row.get::<_, u64>(0))
             .unwrap();
+    }
+
+    #[test]
+    fn a_respawn_may_reuse_the_handle_of_an_ended_attempt() {
+        let ledger = Ledger::new(MemoryStore::new(), "hm", "tester");
+        let (_, work_id) = ledger
+            .add_work("Build".to_owned(), None, 42, Vec::new(), Vec::new())
+            .unwrap();
+        let (_, first) = ledger.start(&work_id, BTreeMap::new()).unwrap();
+        ledger
+            .bind_attempt(&first, "tmux:leader".to_owned(), BTreeMap::new())
+            .unwrap();
+        ledger
+            .end_attempt(&first, AttemptOutcome::Lost, "handle absent".to_owned())
+            .unwrap();
+        let (_, second) = ledger.start(&work_id, BTreeMap::new()).unwrap();
+        ledger
+            .bind_attempt(&second, "tmux:leader".to_owned(), BTreeMap::new())
+            .unwrap();
+        let snapshot = ledger.snapshot().unwrap();
+
+        let temporary = TempDir::new().unwrap();
+        let projection = Projection::new(temporary.path().join("state.db"));
+        projection
+            .sync(&snapshot.head, &snapshot.events, &snapshot.state)
+            .unwrap();
+
+        let rows = projection
+            .raw_query("SELECT count(*) AS total FROM attempts WHERE handle = 'tmux:leader'")
+            .unwrap();
+        assert_eq!(rows["rows"][0]["total"], 2);
     }
 
     #[test]
