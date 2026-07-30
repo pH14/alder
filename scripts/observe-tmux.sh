@@ -15,6 +15,15 @@ valid_codex_session() {
 codex_sessions_for() {
   local session=$1 path marker session_id codex_home sessions
   path=$(tmux display-message -p -t "$session" '#{session_path}' 2>/dev/null || true)
+
+  # `alderd` writes .alder/resume from Tier::resume_script only for the
+  # Codex provider. This observer intentionally does not infer a provider
+  # from the attempt's engine or tier metadata: the daemon's rung table is
+  # the sole authority for that classification. A Claude worktree can contain
+  # Codex review rollouts, but it never gets this launch sidecar, so those
+  # rollouts must not become Codex-worker session candidates.
+  [ -x "$path/.alder/resume" ] || return 0
+
   marker="$path/.alder/codex-session"
   if [ -r "$marker" ]; then
     IFS= read -r session_id <"$marker" || true

@@ -694,7 +694,13 @@ pub fn reconcile(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        env, fs,
+        os::unix::fs::PermissionsExt,
+        path::Path,
+        process::Command,
+    };
 
     use tempfile::TempDir;
 
@@ -773,6 +779,13 @@ mod tests {
             .iter()
             .map(|finding| finding.kind.as_str())
             .collect()
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
     }
 
     #[test]
@@ -1288,6 +1301,90 @@ mod tests {
         );
         assert_eq!(finding_kinds(&ambiguous), vec!["codex_session_ambiguous"]);
         assert!(ambiguous[0].suggested_command.is_none());
+    }
+
+    #[test]
+    fn an_opus_attempt_with_codex_review_rollouts_has_no_codex_session_findings() {
+        let temporary = TempDir::new().unwrap();
+        let bin = temporary.path().join("bin");
+        let worktree = temporary.path().join("alder-work-opus");
+        let codex_home = temporary.path().join("codex");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(codex_home.join("sessions")).unwrap();
+
+        let attempt_id = "opus-attempt";
+        let session = "alder-work-opus";
+        let candidate = "019fb2ef-d507-7201-bc36-79d6d5b82336";
+        fs::write(
+            codex_home.join("sessions/review.jsonl"),
+            serde_json::to_string(&json!({
+                "type": "session_meta",
+                "payload": {"cwd": worktree, "session_id": candidate},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_executable(
+            &bin.join("tmux"),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n  list-sessions) printf '%s\\n' '{session}' ;;\n  show-environment) printf '%s\\n' 'ALDER_ATTEMPT={attempt_id}' ;;\n  display-message) printf '%s\\n' '{}' ;;\nesac\n",
+                worktree.display()
+            ),
+        );
+
+        let mut path_entries = vec![bin];
+        path_entries.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+        let output = Command::new("bash")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/observe-tmux.sh"))
+            .env("CODEX_HOME", &codex_home)
+            .env("PATH", env::join_paths(path_entries).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "observer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let objects: Vec<NormalizedObject> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(objects.len(), 1);
+        assert!(
+            objects[0].metadata.get("codex_session").is_none()
+                && objects[0].metadata.get("codex_sessions").is_none(),
+            "a Claude worktree's Codex review rollout became a worker candidate: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        // `opus` is a Claude rung. The launch sidecar is absent because
+        // alderd's existing Tier table only writes .alder/resume for Codex;
+        // alder deliberately does not interpret these metadata values.
+        let mut state = ProjectState::default();
+        let mut active = attempt(
+            attempt_id,
+            AttemptState::Active,
+            Some("tmux:alder-work-opus"),
+        );
+        active
+            .metadata
+            .insert("engine".to_owned(), json!("claude-opus-5"));
+        active.metadata.insert("tier".to_owned(), json!("opus"));
+        state.attempts.insert(attempt_id.to_owned(), active);
+        let observations: Vec<_> = objects
+            .into_iter()
+            .map(|object| ObservedHandle {
+                handle: format!("tmux:{}", object.value),
+                attempt_id: object.attempt_id,
+                status: ObservationStatus::Present,
+                metadata: object.metadata,
+                observed_at: "2026-01-01T00:00:00Z".to_owned(),
+                detail: None,
+            })
+            .collect();
+        let configured = BTreeSet::from(["tmux".to_owned()]);
+        assert!(
+            reconcile(&state, &observations, &configured, &configured).is_empty(),
+            "a healthy Claude attempt with a review rollout must not need repair"
+        );
     }
 
     #[test]
