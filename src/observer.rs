@@ -484,6 +484,53 @@ pub fn reconcile(
                                 suggested_command: None,
                                 metadata: observation.metadata.clone(),
                             });
+                        } else if let Some(codex_session) = observation
+                            .metadata
+                            .get("codex_session")
+                            .and_then(Value::as_str)
+                            && !attempt.metadata.contains_key("codex-session")
+                        {
+                            // The spawn-side watcher writes this marker as
+                            // soon as Codex creates its rollout, independently
+                            // of the worker reaching a tool call. If the
+                            // append itself failed, make the recovery explicit
+                            // instead of making a leader rediscover the UUID
+                            // by grepping ~/.codex/sessions.
+                            findings.push(ReconcileFinding {
+                                kind: "codex_session_unstamped".to_owned(),
+                                attempt_id: Some(attempt.id.clone()),
+                                handle: Some(handle.to_owned()),
+                                status: "present".to_owned(),
+                                detail: "a live Codex worker has a session UUID but its attempt is missing codex-session metadata"
+                                    .to_owned(),
+                                suggested_command: Some(format!(
+                                    "alder attempt edit {} --meta codex-session={codex_session}",
+                                    attempt.id
+                                )),
+                                metadata: observation.metadata.clone(),
+                            });
+                        } else if observation
+                            .metadata
+                            .get("codex_sessions")
+                            .and_then(Value::as_array)
+                            .is_some_and(|sessions| !sessions.is_empty())
+                            && !attempt.metadata.contains_key("codex-session")
+                        // The observer only supplies several candidates
+                        // after its direct launch marker was unavailable.
+                        // Choosing the newest would recreate `--last`'s
+                        // consult-resume bug, so surface the ambiguity
+                        // without suggesting an unsafe mutation.
+                        {
+                            findings.push(ReconcileFinding {
+                                kind: "codex_session_ambiguous".to_owned(),
+                                attempt_id: Some(attempt.id.clone()),
+                                handle: Some(handle.to_owned()),
+                                status: "present".to_owned(),
+                                detail: "a live Codex worker has several session UUID candidates; refusing to guess which one is the worker"
+                                    .to_owned(),
+                                suggested_command: None,
+                                metadata: observation.metadata.clone(),
+                            });
                         }
                     } else {
                         findings.push(ReconcileFinding {
@@ -687,6 +734,22 @@ mod tests {
             observed_at: "2026-01-01T00:00:00Z".to_owned(),
             detail: None,
         }
+    }
+
+    fn codex_observation(handle: &str, attempt_id: &str, session: &str) -> ObservedHandle {
+        let mut observed = observation(handle, Some(attempt_id), ObservationStatus::Present);
+        observed.metadata = json!({"codex_session": session});
+        observed
+    }
+
+    fn ambiguous_codex_observation(
+        handle: &str,
+        attempt_id: &str,
+        sessions: &[&str],
+    ) -> ObservedHandle {
+        let mut observed = observation(handle, Some(attempt_id), ObservationStatus::Present);
+        observed.metadata = json!({"codex_sessions": sessions});
+        observed
     }
 
     fn work(id: &str, state: WorkState) -> crate::domain::Work {
@@ -1135,6 +1198,96 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn reconciliation_names_an_unstamped_live_codex_worker() {
+        let configured = BTreeSet::from(["tmux".to_owned()]);
+        let known = configured.clone();
+        let session = "019fb2ef-d507-7201-bc36-79d6d5b82336";
+        let mut state = ProjectState::default();
+        let mut active = attempt(
+            "active",
+            AttemptState::Active,
+            Some("tmux:alder-work-active"),
+        );
+        active
+            .metadata
+            .insert("engine".to_owned(), json!("gpt-5.6-terra"));
+        state.attempts.insert("active".to_owned(), active);
+
+        let findings = reconcile(
+            &state,
+            &[codex_observation(
+                "tmux:alder-work-active",
+                "active",
+                session,
+            )],
+            &configured,
+            &known,
+        );
+        assert_eq!(finding_kinds(&findings), vec!["codex_session_unstamped"]);
+        let repair = format!("alder attempt edit active --meta codex-session={session}");
+        assert_eq!(
+            findings[0].suggested_command.as_deref(),
+            Some(repair.as_str())
+        );
+
+        // Once the watcher append reaches the ledger, the exact same live
+        // session is healthy and reconciliation stops asking a leader to
+        // repair it.
+        state
+            .attempts
+            .get_mut("active")
+            .unwrap()
+            .metadata
+            .insert("codex-session".to_owned(), json!(session));
+        assert!(
+            reconcile(
+                &state,
+                &[codex_observation(
+                    "tmux:alder-work-active",
+                    "active",
+                    session
+                )],
+                &configured,
+                &known,
+            )
+            .is_empty()
+        );
+        assert!(
+            reconcile(
+                &state,
+                &[ambiguous_codex_observation(
+                    "tmux:alder-work-active",
+                    "active",
+                    &[session, "019fb2ef-d507-7201-bc36-79d6d5b82337"],
+                )],
+                &configured,
+                &known,
+            )
+            .is_empty(),
+            "an already stamped attempt needs no candidate selection"
+        );
+
+        state
+            .attempts
+            .get_mut("active")
+            .unwrap()
+            .metadata
+            .remove("codex-session");
+        let ambiguous = reconcile(
+            &state,
+            &[ambiguous_codex_observation(
+                "tmux:alder-work-active",
+                "active",
+                &[session, "019fb2ef-d507-7201-bc36-79d6d5b82337"],
+            )],
+            &configured,
+            &known,
+        );
+        assert_eq!(finding_kinds(&ambiguous), vec!["codex_session_ambiguous"]);
+        assert!(ambiguous[0].suggested_command.is_none());
     }
 
     #[test]

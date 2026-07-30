@@ -262,6 +262,17 @@ session behind and the handle stays true. The daemon still reaches the log
 only by running `alder`, and it hands the worktree a copy of `alder` alone —
 a worker cannot dispatch.
 
+A Codex pane starts a launcher-owned sidecar before `codex exec`. It snapshots
+the existing local Codex rollouts, finds the first new `session_meta` whose
+`cwd` is the worktree, and stamps that UUID as `codex-session` on the attempt.
+This is deliberately outside the worker turn: a one-shot that dies before its
+first tool call still has a durable resume handle. The sidecar leaves a local
+marker first; when a ledger append is temporarily unavailable, the tmux
+observer recovers the fresh rollout UUID and supplies it to `reconcile`, which names a
+`codex_session_unstamped` finding and its exact `attempt edit` repair. A
+resume without that UUID is refused rather than guessing from `--last`, since
+a consult can be newer than the worker session.
+
 The six rungs — `luna`, `terra`, `sol` on codex and `sonnet`, `opus`, `fable`
 on claude — are a table in the daemon, each pinning a model *and* a reasoning
 effort. An unknown rung is an error rather than a fall-through, because
@@ -283,10 +294,11 @@ by `scripts/tests/test-teardown-guard.sh`.
 Two conventions in that process are worth naming here because they show up
 in the log rather than in the repository. A worker records an up-tier
 consult as `consulted` metadata on its own attempt, and a dispatch records
-the rung it launched at as `tier`, `engine` and `effort` metadata; between
-them, an item resent up the ladder carries the whole climb. All are ordinary
-open-ended metadata: Alder stores and displays them and reads nothing into
-them.
+the rung it launched at as `tier`, `engine` and `effort` metadata; the Codex
+sidecar also records `codex-session`. Between them, an item resent up the
+ladder carries the whole climb and a one-shot worker carries its resume
+handle. All are ordinary open-ended metadata: Alder stores and displays them
+and reads nothing into them.
 
 ## The trigger-message contract
 

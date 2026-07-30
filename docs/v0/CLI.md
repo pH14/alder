@@ -857,6 +857,9 @@ hm-6e3-attempt-2  recorded active, observation unknown
 hm-4c8-attempt-1  an open attempt has never been bound to a handle; no worker was launched
   suggested: alderd spawn hm-4c8
 
+hm-5d1-attempt-1  a live Codex worker has a session UUID but its attempt is missing codex-session metadata
+  suggested: alder attempt edit hm-5d1-attempt-1 --meta codex-session=019f...
+
 nimbus:box-22  present, no associated attempt
   attention: unclaimed environment handle
 ```
