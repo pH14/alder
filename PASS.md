@@ -39,20 +39,19 @@ sequence rather than pasting it into the event.
 For a tmux worker, record the ruling first, then call that worktree's
 `.alder/relay <session> <file>`. The helper owns literal tmux delivery and any
 Codex resume mechanics; leaders do not recreate a `send-keys`, command
-substitution, or quoted resume command. It confirms delivery only after both a
-working engine and a fresh `attempt.updated` in its post-delivery sample,
-never by inspecting a pane's input line. For a resumed Codex worker, the
-strongest engine signal is the process table showing the session UUID and the
-delivered file's contents in that process's argv.
+substitution, or quoted resume command. It confirms that tmux sent the ruling
+to a working engine, never by inspecting a pane's input line. For a resumed
+Codex worker, the strongest engine signal is the process table showing the
+session UUID and the delivered file's contents in that process's argv.
 
-A successful exit is that confirmation. Exit 75 means the helper sent the
-ruling once but has not yet seen both signals. A milestone is not expected on
-every poll, so the helper neither waits for an invented 60-second deadline nor
-replays the ruling. Do not run it again merely because it returned 75; later
-passes observe the worker's durable progress. A crash between send and
-confirmation still has no durable receipt, so it cannot be mechanically
-distinguished from a pre-send crash. That is the delivery-receipt gap recorded
-on `al-q8qwhy`, not a licence to type the same ruling twice.
+A successful exit is that confirmation. A fresh `attempt.updated` is the
+worker's next meaningful milestone, not an immediate receipt: the next pass's
+normal log read observes it after delivery. Exit 75 means the helper sent once
+but could not observe a working engine; do not replay it merely because the
+engine observation is late. A crash between send and confirmation still has no
+durable receipt, so it cannot be mechanically distinguished from a pre-send
+crash. That is the delivery-receipt gap recorded on `al-q8qwhy`, not a licence
+to type the same ruling twice.
 
 The helper is a tmux adapter, not the delivery concept. The ruling is durable
 in the log before transport, so a future cloud worker can pull it from there
@@ -62,13 +61,14 @@ The ratified surface is deliberately narrow. These text-bearing surfaces still
 lack a file-valued form: `--meta KEY=VALUE` (including reviewed endpoints and
 legacy findings), `question answer`, `work ask`, `work edit --spec/--why`,
 `pass end --report`, and `work add/edit --check` descriptions. External review
-clients' title/prompt arguments are likewise outside this adapter. The
-cross-review manual identifies the affected legacy paths instead of disguising
-them with command substitutions. Do not add `--meta-file` or another flag, or
-revive a shell recipe, without its own operator ruling. For now only
-leader-authored, fixed text belongs in those remaining argv surfaces; text
-someone else supplied needs a durable pointer, an existing ratified file flag,
-or an authority decision.
+clients' title/prompt arguments are likewise outside this adapter unless they
+accept stdin. **The quoting rule is not fully retired for those named argv
+surfaces:** write the value to a local file and pass it as `"$(cat "$file")"`.
+Inside double quotes the substitution becomes one argv value; its contents are
+not parsed again as shell syntax. This is the explicitly limited legacy
+protocol, not authority to add a flag or improvise a new transport. Prefer the
+ratified file flags whenever they exist. Do not add `--meta-file` or another
+flag without its own operator ruling.
 
 ## The pass
 
@@ -96,13 +96,14 @@ or an authority decision.
    launch-pinned model, effort, sandbox, and exact `codex-session` UUID. Do
    not hand-write a resume command or infer a session with `--last`.
 
-   A successful helper exit confirms a working engine plus a fresh
-   `attempt.updated`. It never reads ghost text or sends a speculative bare
-   `Enter`. Exit 75 says it sent once but has not yet confirmed those signals:
-   do not unblock this pass on that result and do not retry the adapter merely
-   because the milestone is late. The ruling remains recoverable from the log;
-   a later pass observes the milestone, while the pre-send/post-send crash
-   ambiguity remains the explicitly named `al-q8qwhy` receipt gap.
+   A successful helper exit confirms tmux delivery to a working engine. It
+   never reads ghost text or sends a speculative bare `Enter`; unblock on that
+   result. The next pass's normal `alder show <attempt>` observes the worker's
+   later `attempt.updated` as meaningful progress. Exit 75 says the helper
+   could not observe a working engine after sending once: do not unblock on
+   that result and do not retry merely because the engine observation is late.
+   The ruling remains recoverable from the log, while the pre-send/post-send
+   crash ambiguity remains the explicitly named `al-q8qwhy` receipt gap.
 
    Only after confirmation, unblock with a repository-authored reason such as
    `alder work unblock <work> --why "answered question relayed"`. A tmux pane
@@ -113,9 +114,10 @@ or an authority decision.
    spawn is launched on the *item*, not on the Q&A, which is why an answer
    that amounts to a ruling has to be folded into the item to survive. When an
    answer amounts to a spec ruling, the question remains the canonical raw
-   ruling; identify its question ID in a concise, leader-authored requirement
-   folded into the item with `alder work edit --spec --why`. Do not replace the
-   ruling with a paraphrase or copy raw answer text into an argv value. A
+   ruling; identify its question ID in a concise requirement folded into the
+   item with `alder work edit --spec "$(cat "$spec_file")" --why
+   "$(cat "$why_file")"`. Do not replace the ruling with a paraphrase. These
+   two inline-only arguments are a named remaining quoting surface. A
    ruling that needs a whole new *check* cannot be folded into a
    running item — checks cannot change while an attempt is active — so it waits
    for the attempt to end and lands with the respawn, or it stays in the spec.
@@ -149,8 +151,9 @@ or an authority decision.
    - If findings need a live worker, first record them with
      `--evidence-file`, then hand the same local file to that worker's
    `.alder/relay`. Do not inline them or reimplement delivery. Leave the item
-   in flight until the helper confirms the fresh `attempt.updated`; an
-   unconfirmed send is not an invitation to replay it.
+   in flight until the helper confirms a working engine; the next pass observes
+   the later `attempt.updated`. An unconfirmed send is not an invitation to
+   replay it.
 6. **Drain handoffs.** Admit each coherent submitted handoff
    (`alder work add --handoff <id>` with real priority/checks). Workers
    cannot admit work; you are the only gate.
@@ -179,7 +182,7 @@ or an authority decision.
 8. **Nudge stalls.** For each in-flight attempt with no milestone in a long
    while, use fresh observations and the attempt's durable progress rather
    than pane text. A genuine stall gets one short, leader-authored nudge
-   through `.alder/relay`; its normal delivery confirmation applies. Stalled
+   through `.alder/relay`; its working-engine confirmation applies. Stalled
    again next pass: kill, respawn fresh (same item, same branch). Fails a
    second respawn: `alder work ask <id>` — the operator decides.
 
@@ -244,8 +247,11 @@ blocked item, and never let a worker's authority question sit unrelayed.
 
 ## Ending the pass
 
-Always end with `alder pass end --outcome ok --report <your report> --wake
-<duration>`. The report is authored here, not copied from a worker or reviewer.
+Write the 3–6 line report to a local file, then end with `alder pass end
+--outcome ok --report "$(cat "$report_file")" --wake <duration>`. The report
+is authored here, not copied from a worker or reviewer. `--report` is one of
+the named inline-only surfaces above: the double-quoted substitution makes the
+file text one data argument rather than shell syntax.
 
 The report is 3-6 lines: what you saw, what you did, what is blocked and why.
 Name items in your own short human label rather than copying their titles into

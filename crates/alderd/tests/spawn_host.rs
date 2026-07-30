@@ -97,13 +97,8 @@ case "$1 $2" in
   "show {WORK}")
     printf '%s' '{{"current":{{"id":"{WORK}","title":"Sandbox item","spec":"docs/S.md","checks":[{{"key":"k","description":"the check reaches the worker"}}]}}}}' ;;
   "show {WORK}-attempt-1")
-    if [ ! -f '{relay_shown}' ]; then
-      : >'{relay_shown}'
-      printf '%s' '{{"current":{{"updated_seq":3,"metadata":{{}}}},"history":[]}}'
-    else
-      while [ ! -f '{relay_updated}' ]; do sleep 0.01; done
-      printf '%s' '{{"current":{{"updated_seq":4,"metadata":{{}}}},"history":[{{"seq":4,"type":"attempt.updated"}}]}}'
-    fi ;;
+    [ "$RELAY_DIRECT_NO_SHOW" != "1" ] || exit 64
+    printf '%s' '{{"current":{{"updated_seq":3,"metadata":{{"codex-session":"019fb2ef-d507-7201-bc36-79d6d5b82336"}}}},"history":[]}}' ;;
   "status --section")
     if [ -f '{bound}' ]; then
       printf '%s' '{{"in_flight":[{{"id":"{WORK}-attempt-1","work_id":"{WORK}","handle":"tmux:alder-work-{WORK}"}}]}}'
@@ -134,7 +129,6 @@ esac
             log = work.path().join("alder-calls.log").display(),
             started = work.path().join("attempt-started").display(),
             bound = work.path().join("attempt-bound").display(),
-            relay_shown = work.path().join("relay-shown-before").display(),
             relay_updated = work.path().join("relay-updated").display(),
         ),
     );
@@ -247,7 +241,7 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     let stub = write_executable(
         &work.join("engine.sh"),
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$#\" >'{argc}'\nprintf '%s\\n' \"$@\" >'{argv}.part' && mv '{argv}.part' '{argv}'\nstty -icanon -echo min 1 time 0\n: >'{ready}'\ndd bs=1 count={count} of='{received}.part' 2>/dev/null && mv '{received}.part' '{received}'\n.alder/bin/alder attempt edit \"$ALDER_ATTEMPT\" --note 'ruling received'\nwhile [ ! -f '{release}' ]; do sleep 0.05; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$#\" >'{argc}'\nprintf '%s\\n' \"$@\" >'{argv}.part' && mv '{argv}.part' '{argv}'\nstty -icanon -echo min 1 time 0\n: >'{ready}'\ndd bs=1 count={count} of='{received}.part' 2>/dev/null && mv '{received}.part' '{received}'\n.alder/bin/alder attempt edit \"$ALDER_ATTEMPT\" --note 'ruling received'\nstty sane\nwhile [ ! -f '{release}' ]; do sleep 0.05; done\n",
             argc = argc.display(),
             argv = argv.display(),
             ready = relay_ready.display(),
@@ -321,7 +315,9 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
 
     // Run the generated helper against this test's live pane. The stub reads
     // the terminal in raw mode, so this catches both a bad pane target and
-    // tmux's default LF-to-CR conversion without trusting a tmux mock.
+    // tmux's default LF-to-CR conversion without trusting a tmux mock. This
+    // direct invocation makes `show <attempt>` fail, so a running relay cannot
+    // borrow a fake read to invent an instant worker milestone.
     let tmux_before_relay = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
     assert!(
         !tmux_before_relay.contains("send-keys"),
@@ -337,6 +333,7 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     let delivered = Command::new(&relay)
         .args([&session, ruling_file.to_str().expect("the path is UTF-8")])
         .current_dir(&spawned.worktree)
+        .env("RELAY_DIRECT_NO_SHOW", "1")
         .output()
         .expect("the relay runs");
     assert!(
@@ -348,6 +345,10 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     await_true(
         || relay_received.is_file(),
         "the live pane receives the relayed ruling",
+    );
+    await_true(
+        || work.join("relay-updated").is_file(),
+        "the worker records a later meaningful relay milestone",
     );
     assert_eq!(
         fs::read(&relay_received).expect("the received ruling is readable"),
@@ -398,6 +399,49 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         relay.is_file(),
         "adopting an older worktree did not backfill its delivery helper"
     );
+    let generated_resume = fs::read_to_string(spawned.worktree.join(".alder/resume"))
+        .expect("the generated resume script is readable before the relay stub replaces it");
+
+    // Exercise the Codex holding-shell route against the same real tmux
+    // server. The resume stub holds a real non-shell pane process after
+    // capturing the decoded argument, which makes `display-message` prove
+    // the actual adapter target rather than a mock's invented answer.
+    let resumed_ruling = work.join("resumed-ruling");
+    write_executable(
+        &spawned.worktree.join(".alder/resume"),
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$2\" >'{}'\nexec tmux wait-for relay-resume-hold\n",
+            resumed_ruling.display()
+        ),
+    );
+    let resumed = Command::new(&relay)
+        .args([&session, ruling_file.to_str().expect("the path is UTF-8")])
+        .current_dir(&spawned.worktree)
+        .output()
+        .expect("the Codex relay runs");
+    assert_eq!(
+        resumed.status.code(),
+        Some(75),
+        "a just-resumed engine must not borrow test timing\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    await_true(
+        || resumed_ruling.is_file(),
+        "the holding shell executes the generated resume command",
+    );
+    assert_eq!(
+        fs::read_to_string(&resumed_ruling).expect("the resumed ruling is readable"),
+        ruling,
+        "the Codex route changed the local ruling bytes"
+    );
+    let resumed_tmux_calls = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
+    assert!(
+        resumed_tmux_calls.lines().any(
+            |call| call == format!("display-message -p -t {session} #{{pane_current_command}}")
+        ),
+        "the Codex engine probe did not target the real session pane: {resumed_tmux_calls}"
+    );
 
     // The worktree is real, on its own branch, carrying alder and nothing that
     // would let a worker dispatch.
@@ -433,7 +477,7 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
             != 0,
         "the resume script is not executable"
     );
-    let script = fs::read_to_string(&resume).expect("the resume script is readable");
+    let script = &generated_resume;
     for part in [
         "codex exec resume",
         "-m",
@@ -448,8 +492,8 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         );
     }
     let checked = Command::new("sh")
-        .args(["-n"])
-        .arg(&resume)
+        .args(["-n", "-c"])
+        .arg(&generated_resume)
         .status()
         .expect("sh runs");
     assert!(checked.success(), "the resume script is not valid sh");
@@ -471,7 +515,7 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         ".alder/relay <session> <file>",
         "load-buffer",
         "paste-buffer",
-        "attempt.updated",
+        "working engine observed",
         "pane_current_command",
     ] {
         assert!(

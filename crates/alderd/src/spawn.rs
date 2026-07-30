@@ -807,9 +807,10 @@ fn install_relay(host: &impl SpawnHost, worktree: &Path) -> Result<()> {
 /// loaded into a tmux buffer directly (an interactive worker), or encoded
 /// before a one-shot Codex shell reconstructs them as an argv value for the
 /// already-generated `.alder/resume` script. In neither route does the helper
-/// inspect the pane's input line.  It samples a working engine and a later
-/// `attempt.updated` immediately after delivery; a missing milestone is an
-/// explicit unconfirmed result, not a reason to wait or send the ruling again.
+/// inspect the pane's input line. It confirms that the transport sent once to
+/// a working engine. A later `attempt.updated` is a meaningful worker
+/// milestone, observed by the next pass rather than manufactured as an
+/// impossible immediate receipt.
 fn relay_script() -> &'static str {
     r##"#!/bin/sh
 # Deliver a durable ruling to this worktree's tmux worker.
@@ -841,10 +842,6 @@ fi
 here=$(CDPATH= cd "$(dirname "$0")" && pwd)
 alder="$here/bin/alder"
 resume="$here/resume"
-if [ ! -x "$alder" ]; then
-  echo "relay cannot find this worktree's alder binary" >&2
-  exit 69
-fi
 cd "$here/.."
 
 session_target="=$session"
@@ -854,18 +851,6 @@ case "$attempt_line" in
   ALDER_ATTEMPT=*) attempt=${attempt_line#ALDER_ATTEMPT=} ;;
   *)
     echo "relay cannot identify an Alder attempt for tmux session $session" >&2
-    exit 69
-    ;;
-esac
-
-snapshot=$("$alder" show "$attempt" --json)
-updated_seq() {
-  printf '%s\n' "$1" | sed -n 's/.*"updated_seq":\([0-9][0-9]*\).*/\1/p'
-}
-before=$(updated_seq "$snapshot")
-case "$before" in
-  ''|*[!0-9]*)
-    echo "relay could not read attempt update sequence for $attempt" >&2
     exit 69
     ;;
 esac
@@ -880,6 +865,11 @@ engine=$(tmux show-environment -t "$session_target" ALDER_ENGINE 2>/dev/null || 
 if [ "$engine" != "ALDER_ENGINE=running" ]; then
   # A one-shot Codex worker is sitting at a shell. Encode the source file so
   # the text somebody else wrote never becomes shell syntax in that shell.
+  if [ ! -x "$alder" ]; then
+    echo "relay cannot find this worktree's alder binary" >&2
+    exit 69
+  fi
+  snapshot=$("$alder" show "$attempt" --json)
   codex_session=$(printf '%s\n' "$snapshot" | sed -n 's/.*"codex-session":"\([^"]*\)".*/\1/p')
   case "$codex_session" in
     ''|*[!0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-]*)
@@ -920,20 +910,16 @@ working_engine() {
   [ -n "$command" ] && [ "$command" != "bash" ] && [ "$command" != "sh" ]
 }
 
-current=$("$alder" show "$attempt" --json)
-updated=$(updated_seq "$current")
-if [ -n "$updated" ] && [ "$updated" -gt "$before" ] \
-  && "$alder" debug log show "$updated" --json | grep -F '"type":"attempt.updated"' >/dev/null \
-  && working_engine; then
-  echo "relayed to $session; $attempt.updated at $updated"
+if working_engine; then
+  echo "relayed to $session; working engine observed"
   exit 0
 fi
 
-# A milestone is meaningful progress, not a receipt that must arrive within
-# an arbitrary timeout.  The ruling was sent once; report that it is not yet
-# confirmed and let a later pass observe the durable milestone without typing
-# the same ruling into the worker a second time.
-echo "relay sent once but is not yet confirmed: need a working engine and a fresh attempt.updated for $attempt; do not resend this ruling" >&2
+# A milestone belongs to the worker's next meaningful progress, not to an
+# arbitrary immediate poll. The ruling was sent once but the engine was not
+# observable afterwards; do not turn that ambiguous result into a duplicate
+# input line.
+echo "relay sent once but could not observe a working engine for $attempt; do not resend this ruling" >&2
 exit 75
 "##
 }
@@ -1030,7 +1016,6 @@ mod tests {
         env, fs,
         os::unix::fs::PermissionsExt,
         process::Command,
-        time::Instant,
     };
 
     use chrono::Duration;
@@ -1418,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_loads_literal_file_text_and_confirms_a_new_durable_update() {
+    fn relay_delivers_literal_file_text_to_a_working_engine_without_waiting_for_a_milestone() {
         let temporary = TempDir::new().unwrap();
         let worktree = temporary.path().join("worker");
         let alder_dir = worktree.join(".alder/bin");
@@ -1439,25 +1424,21 @@ mod tests {
         )
         .unwrap();
 
-        let show_count = temporary.path().join("show-count");
         write_executable(
             &alder_dir.join("alder"),
             r##"#!/bin/sh
 case "$1 $2" in
   "show hm-attempt-1")
+    if [ "$RELAY_ALDER_MUST_NOT_RUN" = "1" ]; then
+      exit 64
+    fi
     if [ "$RELAY_ENGINE" = "exited" ]; then
       metadata='{"codex-session":"019fb2ef-d507-7201-bc36-79d6d5b82336"}'
     else
       metadata='{}'
     fi
-    if [ -f "$RELAY_SHOW_COUNT" ] && [ "$RELAY_NO_UPDATE" != "1" ]; then
-      printf '{"current":{"updated_seq":4,"metadata":%s},"history":[{"seq":4,"type":"attempt.updated"}]}' "$metadata"
-    else
-      : > "$RELAY_SHOW_COUNT"
-      printf '{"current":{"updated_seq":3,"metadata":%s},"history":[]}' "$metadata"
-    fi
+    printf '{"current":{"updated_seq":3,"metadata":%s},"history":[]}' "$metadata"
     ;;
-  "debug log") printf '%s' '{"event":{"type":"attempt.updated"}}' ;;
   *) exit 64 ;;
 esac
 "##,
@@ -1484,9 +1465,9 @@ esac
         let output = Command::new(&relay)
             .args(["alder-work-hm", finding.to_str().unwrap()])
             .env("PATH", &relay_path)
-            .env("RELAY_SHOW_COUNT", &show_count)
             .env("RELAY_TMUX_CALLS", &tmux_calls)
             .env("RELAY_ENGINE", "running")
+            .env("RELAY_ALDER_MUST_NOT_RUN", "1")
             .output()
             .unwrap();
         assert!(
@@ -1494,7 +1475,7 @@ esac
             "relay failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("hm-attempt-1.updated at 4"),);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("working engine observed"),);
         assert!(
             !sentinel.exists(),
             "a reviewer's shell syntax was evaluated by the relay"
@@ -1528,14 +1509,12 @@ esac
 
         // A Codex worker has left its one-shot engine and is holding a shell.
         // The same helper must send only a safe encoded resume command, then
-        // use the changed pane process plus the fresh durable update to
-        // confirm it — it must not fall back to pasting the ruling at a shell.
+        // observe the changed pane process — it must not fall back to pasting
+        // the ruling at a shell.
         write_executable(&worktree.join(".alder/resume"), "#!/bin/sh\nexit 0\n");
-        fs::remove_file(&show_count).unwrap();
         let codex = Command::new(&relay)
             .args(["alder-work-hm", finding.to_str().unwrap()])
             .env("PATH", &relay_path)
-            .env("RELAY_SHOW_COUNT", &show_count)
             .env("RELAY_TMUX_CALLS", &tmux_calls)
             .env("RELAY_ENGINE", "exited")
             .output()
@@ -1566,41 +1545,6 @@ esac
         assert!(
             calls.contains("display-message -p -t alder-work-hm #{pane_current_command}"),
             "Codex engine inspection did not target the detached session pane: {calls}"
-        );
-
-        // A worker commonly records its next meaningful milestone later than
-        // relay returns. That is not a reason to spend a minute polling, or to
-        // paste the same ruling again: report an unconfirmed one-shot send.
-        fs::remove_file(&show_count).unwrap();
-        let before_unconfirmed = fs::read_to_string(&tmux_calls).unwrap();
-        let started = Instant::now();
-        let unconfirmed = Command::new(&relay)
-            .args(["alder-work-hm", finding.to_str().unwrap()])
-            .env("PATH", &relay_path)
-            .env("RELAY_SHOW_COUNT", &show_count)
-            .env("RELAY_TMUX_CALLS", &tmux_calls)
-            .env("RELAY_ENGINE", "running")
-            .env("RELAY_NO_UPDATE", "1")
-            .output()
-            .unwrap();
-        assert_eq!(unconfirmed.status.code(), Some(75));
-        assert!(
-            started.elapsed().as_secs() < 2,
-            "relay waited for a milestone instead of reporting one unconfirmed send"
-        );
-        assert!(String::from_utf8_lossy(&unconfirmed.stderr).contains("do not resend this ruling"));
-        let after_unconfirmed = fs::read_to_string(&tmux_calls).unwrap();
-        assert_eq!(
-            after_unconfirmed
-                .lines()
-                .filter(|call| call.starts_with("send-keys"))
-                .count(),
-            before_unconfirmed
-                .lines()
-                .filter(|call| call.starts_with("send-keys"))
-                .count()
-                + 1,
-            "an unconfirmed relay pasted the ruling more than once: {after_unconfirmed}"
         );
     }
 

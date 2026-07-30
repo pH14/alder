@@ -166,16 +166,20 @@ worktree. This is a `claude` invocation, not a subagent, precisely because
 a subagent inherits the leader's session effort, which is nowhere in the log;
 otherwise `reviewed-by` could name a rung the review did not run at.
 
-Claude's one-shot `-p` currently takes its prompt as argv; it has no ratified
-file-valued input. Do not turn a local review-prompt file into a command
-substitution here. This route is an explicitly remaining surface in PASS.md:
-it needs a ratified external-client adapter before it can carry item-controlled
-brief text. `$scratch` may still hold the proposed brief outside the worktree,
-but that fact does not make an argv interpolation safe. The title leads in that
-brief because it is the one requested-change description that is always present:
-a spec is optional in v0 (`docs/v0/MODEL.md`), and `Brief::goal` falls back to
-the title for exactly that reason. A reviewer given an empty spec and check
-keys can judge code, but not whether it is the requested change.
+```sh
+claude -p --model claude-fable-5 --effort xhigh --permission-mode auto \
+  < "$scratch/review-prompt-<id>.txt"
+```
+
+`claude -p` reads its prompt from stdin. The redirection carries the file's
+bytes without placing prompt text in argv or shell syntax; it is a safe
+external-client transport, not an unratified Alder flag. `$scratch` is outside
+the worktree, so nothing written there can be committed onto the branch under
+review. The title leads because it is the one requested-change description
+that is always present: a spec is optional in v0 (`docs/v0/MODEL.md`), and
+`Brief::goal` falls back to the title for exactly that reason. A reviewer given
+an empty spec and check keys can judge code, but not whether it is the
+requested change.
 
 ```text
 Review work/<id> against main: git diff main...work/<id>.
@@ -250,8 +254,8 @@ Record a non-clean review before relaying it:
 alder attempt edit <attempt> --failed cross-review \
   --evidence-file <local-findings-file> \
   --meta reviewed-by=gpt-5.6-sol \
-  --meta reviewed-sha=<reviewed-sha> \
-  --meta reviewed-base=<reviewed-base> \
+  --meta reviewed-sha="$(cat "$scratch/reviewed-sha-<id>.txt")" \
+  --meta reviewed-base="$(cat "$scratch/reviewed-base-<id>.txt")" \
   --meta reviewed-effort=xhigh
 ```
 
@@ -265,10 +269,10 @@ pretending an earlier green check covers new code.
 
 `--evidence-file` reads the local file now and carries its contents in the
 event; delete the file and the review record remains whole. `--meta` has no
-file-valued form. Obtain each endpoint with the commands below, then supply
-the resulting SHA as its literal placeholder value—not a command substitution.
-That remaining argv surface is named in PASS.md and needs separate
-ratification to change.
+file-valued form. It is one of PASS.md's explicit remaining quoting surfaces:
+write each endpoint to a local file, then use the double-quoted `cat` form
+above. The result is one argv value and is not parsed again as shell syntax;
+do not substitute an unquoted command result.
 
 Findings first, feedback second: a review that only sends keys and appends
 nothing disappears after a rotation or crash, leaving a reviewed branch
@@ -288,8 +292,8 @@ that is where the three-dot delta read by `git diff main...work/<id>` and
 comparing it would attest to an integration context that never existed.
 
 ```sh
-git rev-parse work/<id>
-git merge-base main work/<id>
+git rev-parse work/<id> > "$scratch/reviewed-sha-<id>.txt"
+git merge-base main work/<id> > "$scratch/reviewed-base-<id>.txt"
 ```
 
 Either endpoint can move: a new author commit moves the head, leaving a green
@@ -312,16 +316,15 @@ Declare `cross-review` at admission, with the other checks:
 
 ```sh
 alder work add --handoff <handoff> --priority <n> \
-  --check <leader-authored-key:description> \
+  --check "$(cat "$scratch/check-<key>.txt")" \
   --check cross-review:"reviewed by the other vendor's ladder; the leader records this one, not the worker"
 ```
 
-Repeat the first form once per leader-authored check. A handoff-proposed check
-description is submitter text and `--check` has no ratified file-valued form:
-do not recover the old command-substitution template. Leave that description
-behind a durable pointer or obtain a separate operator ruling before admission.
-`work add` takes `--check`; `--add-check` is `work edit`'s flag and does not
-exist on add (`src/cli.rs`), so using it here fails admission outright.
+Repeat the first form once per handoff-proposed check. Those descriptions are
+submitter text and `--check` has no ratified file-valued form, so it is a named
+remaining quoting surface: the double-quoted `cat` result is one argument, not
+shell code. `work add` takes `--check`; `--add-check` is `work edit`'s flag and
+does not exist on add (`src/cli.rs`), so using it here fails admission outright.
 Admission is the only time to declare it because a check or dependency cannot
 change while an attempt is active:
 
@@ -356,14 +359,14 @@ folded current note:
 
 ```sh
 alder attempt edit <attempt> --note-file <local-findings-file>
-# Read the returned `head` and use that literal event sequence below.
+# Write the returned numeric `head` to $scratch/findings-event-seq-<id>.txt.
 alder attempt edit <attempt> \
   --meta reviewed-by=gpt-5.6-sol \
-  --meta reviewed-sha=<reviewed-sha> \
-  --meta reviewed-base=<reviewed-base> \
+  --meta reviewed-sha="$(cat "$scratch/reviewed-sha-<id>.txt")" \
+  --meta reviewed-base="$(cat "$scratch/reviewed-base-<id>.txt")" \
   --meta reviewed-effort=xhigh \
   --meta cross-review=failed \
-  --meta cross-review-findings=<findings-event-seq>
+  --meta cross-review-findings="$(cat "$scratch/findings-event-seq-<id>.txt")"
 ```
 
 For a legacy item, `cross-review=<verdict>` earns its place: without a check
