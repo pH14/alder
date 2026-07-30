@@ -13,6 +13,9 @@ been amended under you:
 
     .alder/bin/alder show <your-work-id>
 
+If your item carries a check with a manual at `.agent/skills/<key>/SKILL.md`,
+read it before satisfying that check.
+
 ## The job
 
 1. Implement your one item, here, on your branch. Commit locally with clear
