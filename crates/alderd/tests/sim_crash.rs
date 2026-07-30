@@ -531,17 +531,23 @@ fn the_simulated_status_serves_the_loop_section_production_builds() {
 
     // The envelope, which used to be a `MIRRORED` row scanned out of the
     // source. Two produced documents settle it outright, so the row is gone.
-    assert_still_emitted("status", &real, &["schema", "head", "revision", "loop"]);
+    // `schema` and `revision` are not read by the driver — the simulator
+    // serves them for fidelity — so dropping either shows up as the simulator
+    // inventing a key rather than as production losing one.
     assert_no_invented_keys("status", &simulated, &real);
     assert_eq!(
         simulated["schema"], real["schema"],
         "the simulator answers `status` as a schema production no longer claims"
     );
-    assert!(
-        simulated.get("head").is_some(),
-        "the simulator's status carries no `head`, and the head is the whole \
-         log trigger"
-    );
+    // `head` and `loop` are the two the driver does read, and the head is the
+    // whole log trigger. Both directions, on both.
+    assert_still_emitted("status", &real, &["head", "loop"]);
+    for key in ["head", "loop"] {
+        assert!(
+            simulated.get(key).is_some(),
+            "the simulator's status carries no `{key}`, which the driver reads"
+        );
+    }
 
     assert_compared_both_ways(
         "status loop",
