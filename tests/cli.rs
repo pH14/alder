@@ -444,6 +444,62 @@ fn graph_changes_are_hypothetical_then_atomic() {
 }
 
 #[test]
+fn attempt_file_values_append_contents_not_local_paths() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&[
+            "work",
+            "add",
+            "--title",
+            "Record a reviewer finding",
+            "--check",
+            "review:review is recorded",
+        ]),
+        "work_id",
+    );
+    let attempt = string(&project.success(&["work", "start", &work]), "attempt_id");
+
+    let evidence_path = project.work.join("review-findings.txt");
+    let note_path = project.work.join("worker-note.txt");
+    let evidence =
+        "finding: literal `backtick`, $(not-a-command), and \"quotes\"\nref: work/hm-file";
+    let note = "review findings recorded from the local file";
+    fs::write(&evidence_path, evidence).unwrap();
+    fs::write(&note_path, note).unwrap();
+
+    let updated = project.success(&[
+        "attempt",
+        "edit",
+        &attempt,
+        "--satisfied",
+        "review",
+        "--evidence-file",
+        path(&evidence_path),
+        "--note-file",
+        path(&note_path),
+    ]);
+
+    // The paths were only input to this process. Removing both files before
+    // reading the event demonstrates that neither the ledger nor its fold
+    // tries to recover their contents from a shared filesystem.
+    fs::remove_file(&evidence_path).unwrap();
+    fs::remove_file(&note_path).unwrap();
+
+    let sequence = updated["head"].as_u64().unwrap().to_string();
+    let event = project.success(&["debug", "log", "show", &sequence]);
+    assert_eq!(event["event"]["type"], "attempt.updated");
+    let payload = &event["event"]["body"];
+    assert_eq!(payload["checks"][0]["evidence"], evidence);
+    assert_eq!(payload["note"], note);
+    assert!(payload.get("evidence_file").is_none());
+    assert!(payload.get("note_file").is_none());
+
+    let current = project.success(&["show", &attempt]);
+    assert_eq!(current["current"]["checks"]["review"]["evidence"], evidence);
+    assert_eq!(current["current"]["note"], note);
+}
+
+#[test]
 fn observations_distinguish_presence_outage_and_missing_configuration() {
     let project = TestProject::new();
     let work = project.success(&["work", "add", "--title", "Observed work"]);

@@ -370,6 +370,42 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         .status()
         .expect("sh runs");
     assert!(checked.success(), "the resume script is not valid sh");
+
+    let relay = worktree.join(".alder/relay");
+    assert!(relay.is_file(), "a worker has no delivery adapter");
+    assert!(
+        relay
+            .metadata()
+            .expect("the relay script is statable")
+            .permissions()
+            .mode()
+            & 0o111
+            != 0,
+        "the relay script is not executable"
+    );
+    let relay_script = fs::read_to_string(&relay).expect("the relay script is readable");
+    for part in [
+        ".alder/relay <session> <file>",
+        "load-buffer",
+        "paste-buffer",
+        "attempt.updated",
+        "pane_current_command",
+    ] {
+        assert!(
+            relay_script.contains(part),
+            "the relay script omits {part}: {relay_script}"
+        );
+    }
+    assert!(
+        !relay_script.contains("capture-pane"),
+        "the relay reads the pane input line: {relay_script}"
+    );
+    let relay_checked = Command::new("sh")
+        .args(["-n"])
+        .arg(&relay)
+        .status()
+        .expect("sh runs");
+    assert!(relay_checked.success(), "the relay script is not valid sh");
     assert_eq!(
         run(
             &root,

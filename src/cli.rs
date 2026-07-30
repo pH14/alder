@@ -250,10 +250,18 @@ pub struct AttemptEditArgs {
     pub satisfied: Vec<String>,
     #[arg(long, value_name = "CHECK")]
     pub failed: Vec<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "evidence_file")]
     pub evidence: Option<String>,
-    #[arg(long)]
+    /// Read check evidence from this local file; its contents, not its path,
+    /// are appended to the log.
+    #[arg(long, value_name = "PATH", conflicts_with = "evidence")]
+    pub evidence_file: Option<String>,
+    #[arg(long, conflicts_with = "note_file")]
     pub note: Option<String>,
+    /// Read this milestone note from a local file; its contents, not its
+    /// path, are appended to the log.
+    #[arg(long, value_name = "PATH", conflicts_with = "note")]
+    pub note_file: Option<String>,
 }
 
 #[derive(Debug, Args)]

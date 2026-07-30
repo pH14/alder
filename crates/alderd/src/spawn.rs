@@ -752,6 +752,11 @@ fn launch(
         &worktree.join(".alder/config.json"),
     )?;
     host.copy_file(&host.alder_binary(), &worktree.join(".alder/bin/alder"))?;
+    // A ruling is durable before a leader asks a transport to deliver it.
+    // This tmux adapter is deliberately separate from that durable protocol:
+    // another worker transport can read the same ruling from the log without
+    // teaching the event model anything about tmux or a local path.
+    host.write_executable(&worktree.join(".alder/relay"), relay_script())?;
 
     let goal = launch.brief.goal(launch.attempt_id);
     let git_common_dir = git_common_dir(host);
@@ -783,6 +788,140 @@ fn launch(
     // claim that a live session exists.
     bind_attempt(host, launch.attempt_id, launch.session, launch.tier)?;
     Ok(())
+}
+
+/// The tmux delivery adapter installed into every worker worktree.
+///
+/// The file is local input to the leader's process. Its bytes are either
+/// loaded into a tmux buffer directly (an interactive worker), or encoded
+/// before a one-shot Codex shell reconstructs them as an argv value for the
+/// already-generated `.alder/resume` script. In neither route does the helper
+/// inspect the pane's input line: it waits for the session to show a working
+/// engine and for a later `attempt.updated` in the durable log.
+fn relay_script() -> &'static str {
+    r##"#!/bin/sh
+# Deliver a durable ruling to this worktree's tmux worker.
+#
+#     .alder/relay <session> <file>
+#
+# The path is local input only. Record the ruling in Alder before calling this
+# adapter; this script sends its contents, never the path, and appends no
+# transport-specific event. That keeps a non-tmux worker free to pull the
+# same ruling from the log instead.
+set -eu
+
+if [ "$#" -ne 2 ]; then
+  echo "usage: .alder/relay <session> <file>" >&2
+  exit 64
+fi
+
+session=$1
+file=$2
+case "$file" in
+  /*) ;;
+  *) file="$PWD/$file" ;;
+esac
+if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+  echo "relay cannot read local file: $file" >&2
+  exit 66
+fi
+
+here=$(CDPATH= cd "$(dirname "$0")" && pwd)
+alder="$here/bin/alder"
+resume="$here/resume"
+if [ ! -x "$alder" ]; then
+  echo "relay cannot find this worktree's alder binary" >&2
+  exit 69
+fi
+cd "$here/.."
+
+target="=$session"
+attempt_line=$(tmux show-environment -t "$target" ALDER_ATTEMPT 2>/dev/null || :)
+case "$attempt_line" in
+  ALDER_ATTEMPT=*) attempt=${attempt_line#ALDER_ATTEMPT=} ;;
+  *)
+    echo "relay cannot identify an Alder attempt for tmux session $session" >&2
+    exit 69
+    ;;
+esac
+
+snapshot=$("$alder" show "$attempt" --json)
+updated_seq() {
+  printf '%s\n' "$1" | sed -n 's/.*"updated_seq":\([0-9][0-9]*\).*/\1/p'
+}
+before=$(updated_seq "$snapshot")
+case "$before" in
+  ''|*[!0-9]*)
+    echo "relay could not read attempt update sequence for $attempt" >&2
+    exit 69
+    ;;
+esac
+
+buffer="alder-relay-$$"
+cleanup() {
+  tmux delete-buffer -b "$buffer" 2>/dev/null || :
+}
+trap cleanup 0 1 2 15
+
+engine=$(tmux show-environment -t "$target" ALDER_ENGINE 2>/dev/null || :)
+if [ "$engine" != "ALDER_ENGINE=running" ]; then
+  # A one-shot Codex worker is sitting at a shell. Encode the source file so
+  # the text somebody else wrote never becomes shell syntax in that shell.
+  codex_session=$(printf '%s\n' "$snapshot" | sed -n 's/.*"codex-session":"\([^"]*\)".*/\1/p')
+  case "$codex_session" in
+    ''|*[!0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-]*)
+      echo "relay needs the attempt's codex-session metadata before resuming $session" >&2
+      exit 69
+      ;;
+  esac
+  if [ ! -x "$resume" ]; then
+    echo "relay cannot resume this non-running worker" >&2
+    exit 69
+  fi
+  encoded=$(base64 < "$file" | tr -d '\n')
+  case "$encoded" in
+    *[!0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/=]*)
+      echo "relay could not encode local file" >&2
+      exit 69
+      ;;
+  esac
+  command="ruling=\$(printf %s $encoded | base64 -d 2>/dev/null || printf %s $encoded | base64 -D); .alder/resume $codex_session \"\$ruling\""
+  tmux set-buffer -b "$buffer" -- "$command"
+else
+  # tmux reads the local file itself into a server buffer; no command
+  # substitution can trim a newline or make its contents shell syntax.
+  tmux load-buffer -b "$buffer" -- "$file"
+fi
+tmux paste-buffer -d -b "$buffer" -t "$target"
+tmux send-keys -t "$target" Enter
+
+working_engine() {
+  marker=$(tmux show-environment -t "$target" ALDER_ENGINE 2>/dev/null || :)
+  [ "$marker" = "ALDER_ENGINE=running" ] && return 0
+  # A resumed Codex process has replaced the holding bash. This is the
+  # observable engine signal when the original one-shot left ALDER_ENGINE
+  # marked exited; do not read the pane's input line.
+  command=$(tmux display-message -p -t "$target" '#{pane_current_command}' 2>/dev/null || :)
+  [ -n "$command" ] && [ "$command" != "bash" ] && [ "$command" != "sh" ]
+}
+
+deadline=$(( $(date +%s) + 60 ))
+while :; do
+  current=$("$alder" show "$attempt" --json)
+  updated=$(updated_seq "$current")
+  if [ -n "$updated" ] && [ "$updated" -gt "$before" ] \
+    && "$alder" debug log show "$updated" --json | grep -F '"type":"attempt.updated"' >/dev/null \
+    && working_engine; then
+    echo "relayed to $session; $attempt.updated at $updated"
+    exit 0
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "relay is not yet confirmed: need a working engine and a fresh attempt.updated for $attempt" >&2
+    exit 75
+  fi
+  sleep 1
+done
+"##
 }
 
 fn bind_attempt(
@@ -874,16 +1013,25 @@ mod tests {
     use std::{
         cell::RefCell,
         collections::{BTreeMap, BTreeSet},
+        env, fs,
+        os::unix::fs::PermissionsExt,
+        process::Command,
     };
 
     use chrono::Duration;
     use serde_json::json;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::tier::Provider;
 
     fn now() -> DateTime<Utc> {
         "2026-07-29T00:00:00Z".parse().unwrap()
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// A host that records every call and answers from a script.
@@ -1166,7 +1314,8 @@ mod tests {
         fn write_executable(&self, path: &Path, body: &str) -> Result<()> {
             self.calls
                 .borrow_mut()
-                .push(format!("write {} {body}", path.display()));
+                .push(format!("write {}", path.display()));
+            let _ = body;
             Ok(())
         }
 
@@ -1216,6 +1365,7 @@ mod tests {
         assert!(host.called(
             "copy /projects/alder/target/debug/alder /projects/alder-work-al-1/.alder/bin/alder"
         ));
+        assert!(host.called("write /projects/alder-work-al-1/.alder/relay"));
         assert!(!host.called("alderd"));
 
         // The handle and the tier are stamped together.
@@ -1253,6 +1403,151 @@ mod tests {
     }
 
     #[test]
+    fn relay_loads_literal_file_text_and_confirms_a_new_durable_update() {
+        let temporary = TempDir::new().unwrap();
+        let worktree = temporary.path().join("worker");
+        let alder_dir = worktree.join(".alder/bin");
+        let tools = temporary.path().join("tools");
+        fs::create_dir_all(&alder_dir).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+
+        let relay = worktree.join(".alder/relay");
+        write_executable(&relay, relay_script());
+        let finding = temporary.path().join("finding.txt");
+        let sentinel = temporary.path().join("must-not-run");
+        fs::write(
+            &finding,
+            format!(
+                "reviewer text: $(touch {}) and `backticks`\nsecond line\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+
+        let show_count = temporary.path().join("show-count");
+        write_executable(
+            &alder_dir.join("alder"),
+            r##"#!/bin/sh
+case "$1 $2" in
+  "show hm-attempt-1")
+    if [ "$RELAY_ENGINE" = "exited" ]; then
+      metadata='{"codex-session":"019fb2ef-d507-7201-bc36-79d6d5b82336"}'
+    else
+      metadata='{}'
+    fi
+    if [ -f "$RELAY_SHOW_COUNT" ]; then
+      printf '{"current":{"updated_seq":4,"metadata":%s},"history":[{"seq":4,"type":"attempt.updated"}]}' "$metadata"
+    else
+      : > "$RELAY_SHOW_COUNT"
+      printf '{"current":{"updated_seq":3,"metadata":%s},"history":[]}' "$metadata"
+    fi
+    ;;
+  "debug log") printf '%s' '{"event":{"type":"attempt.updated"}}' ;;
+  *) exit 64 ;;
+esac
+"##,
+        );
+        let tmux_calls = temporary.path().join("tmux-calls");
+        write_executable(
+            &tools.join("tmux"),
+            r##"#!/bin/sh
+printf '%s\n' "$*" >> "$RELAY_TMUX_CALLS"
+case "$1" in
+  show-environment)
+    case "$4" in
+      ALDER_ATTEMPT) printf '%s\n' 'ALDER_ATTEMPT=hm-attempt-1' ;;
+      ALDER_ENGINE) printf '%s\n' "ALDER_ENGINE=$RELAY_ENGINE" ;;
+    esac
+    ;;
+  display-message) printf '%s\n' 'codex' ;;
+esac
+"##,
+        );
+        let mut path = vec![tools];
+        path.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+        let relay_path = env::join_paths(path).unwrap();
+        let output = Command::new(&relay)
+            .args(["alder-work-hm", finding.to_str().unwrap()])
+            .env("PATH", &relay_path)
+            .env("RELAY_SHOW_COUNT", &show_count)
+            .env("RELAY_TMUX_CALLS", &tmux_calls)
+            .env("RELAY_ENGINE", "running")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "relay failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hm-attempt-1.updated at 4"),);
+        assert!(
+            !sentinel.exists(),
+            "a reviewer's shell syntax was evaluated by the relay"
+        );
+
+        let calls = fs::read_to_string(&tmux_calls).unwrap();
+        assert!(
+            calls.lines().any(|call| {
+                call.starts_with("load-buffer -b alder-relay-")
+                    && call.ends_with(&format!("-- {}", finding.display()))
+            }),
+            "relay did not give tmux the source file: {calls}"
+        );
+        assert!(calls.contains("paste-buffer -d -b alder-relay-"), "{calls}");
+        assert!(
+            calls.contains("send-keys -t =alder-work-hm Enter"),
+            "{calls}"
+        );
+        assert!(
+            !calls.contains("capture-pane"),
+            "relay read the pane: {calls}"
+        );
+        assert!(
+            !calls.contains("must-not-run"),
+            "relay put finding text in tmux argv: {calls}"
+        );
+        let direct_call_count = calls.lines().count();
+
+        // A Codex worker has left its one-shot engine and is holding a shell.
+        // The same helper must send only a safe encoded resume command, then
+        // use the changed pane process plus the fresh durable update to
+        // confirm it — it must not fall back to pasting the ruling at a shell.
+        write_executable(&worktree.join(".alder/resume"), "#!/bin/sh\nexit 0\n");
+        fs::remove_file(&show_count).unwrap();
+        let codex = Command::new(&relay)
+            .args(["alder-work-hm", finding.to_str().unwrap()])
+            .env("PATH", &relay_path)
+            .env("RELAY_SHOW_COUNT", &show_count)
+            .env("RELAY_TMUX_CALLS", &tmux_calls)
+            .env("RELAY_ENGINE", "exited")
+            .output()
+            .unwrap();
+        assert!(
+            codex.status.success(),
+            "Codex relay failed: {}",
+            String::from_utf8_lossy(&codex.stderr)
+        );
+        let calls = fs::read_to_string(&tmux_calls).unwrap();
+        assert!(
+            calls
+                .lines()
+                .any(|call| call.starts_with("set-buffer -b alder-relay-")),
+            "Codex relay did not prepare a resume command: {calls}"
+        );
+        assert!(
+            !calls
+                .lines()
+                .skip(direct_call_count)
+                .any(|call| call.starts_with("load-buffer")),
+            "Codex relay pasted the ruling into a shell: {calls}"
+        );
+        assert!(
+            !calls.contains("must-not-run"),
+            "Codex relay put reviewer text in a shell command: {calls}"
+        );
+    }
+
+    #[test]
     fn a_codex_worker_is_given_the_git_common_dir_it_must_commit_through() {
         let host = Fake::new();
         spawn(&host, "al-1", tier("luna").unwrap(), None).unwrap();
@@ -1271,20 +1566,21 @@ mod tests {
         // The relay back into a one-shot worker is written where its shell
         // will be sitting, carrying the same rung.
         assert!(host.called("write /projects/alder-work-al-1/.alder/resume"));
-        assert!(host.called("codex exec resume"));
         assert!(host.called("write /projects/alder-work-al-1/.alder/stamp-codex-session"));
         assert!(
             pane.contains(".alder/stamp-codex-session;"),
             "the Codex watcher must start before the worker: {pane}"
         );
 
-        // A claude worker is not sandboxed this way and is given no such root,
-        // and nothing to resume: it sits at a prompt and is typed at.
+        // A claude worker is not sandboxed this way and is given no such root
+        // or resume script: it sits at a prompt and is typed at through the
+        // common relay adapter.
         let host = Fake::new();
         spawn(&host, "al-1", tier("opus").unwrap(), None).unwrap();
         assert!(!host.called("writable_roots"));
         assert!(!host.called(".alder/resume"));
         assert!(!host.called("stamp-codex-session"));
+        assert!(host.called("write /projects/alder-work-al-1/.alder/relay"));
     }
 
     #[test]
