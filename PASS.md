@@ -139,33 +139,63 @@ the weaker of them ends up run wrong:
 
 - **claude-authored** — `codex review`, run in the branch's own worktree:
 
-      codex review --base main \
+      codex review --base main --title "<work-id> — <the item's title>" \
         -c model=gpt-5.6-sol -c model_reasoning_effort=xhigh \
-        -c approval_policy=never -c sandbox_mode=workspace-write \
-        "<the item's spec and checks>"
+        -c approval_policy=never -c sandbox_mode=workspace-write
 
-  Every one of those is explicit because none of them is defaulted anywhere
-  worth trusting. The model and the effort say what reviewed the branch; a run
-  that omits either is a review by whatever `~/.codex/config.toml` said that
-  week, which the log would then record as `sol`. The other two say it runs
-  unattended: nothing answers an approval request inside a review, and a review
-  stopped waiting on one is indistinguishable from a slow one.
+  Every setting is explicit because none is defaulted anywhere worth trusting.
+  The model and the effort say what reviewed the branch; a run that omits
+  either is a review by whatever `~/.codex/config.toml` said that week, which
+  the log would then record as `sol`. The other two say it runs unattended:
+  nothing answers an approval request inside a review, and a review stopped
+  waiting on one is indistinguishable from a slow one.
 
   The model is pinned with `-c model=` and not with `-m` because `codex
   review` has no `-m` — that flag is `codex exec`'s, and review rejects it
-  outright with `error: unexpected argument '-m' found`. This is written from
-  a run, not from the manual; do not "correct" it back.
+  outright with `error: unexpected argument '-m' found`.
 
-  The repository's own `AGENTS.md` is the standing review lens and `codex
-  review` reads it unprompted. The prompt argument carries what that file
-  cannot know — what *this* item was asked to do, and what it must satisfy.
+  **The item cannot be handed to this reviewer.** `AGENTS.md` is the whole
+  lens on this path: `codex review` reads it unprompted, and there is no
+  second channel. Measured on codex-cli 0.146.0-alpha.3.1, in a throwaway
+  repository built so the candidate scopes could be told apart:
+
+  | form | what happened |
+  | --- | --- |
+  | `--base main "<prompt>"` | `error: the argument '--base <BRANCH>' cannot be used with '[PROMPT]'` |
+  | `--base main -`, prompt on stdin | the same error — `-` is still the positional |
+  | `"<prompt>"`, no scope flag | ran, but the scope was the model's own choice: it reached for `git diff HEAD^ HEAD`, reviewed one commit, and never saw a second change in the tree |
+  | `-c instructions="…<token>…"` | accepted by config; the token never surfaced in the review, so nothing measured says it arrives |
+  | `--base main --title "<text>"` | ran |
+
+  `--base`, `--uncommitted`, `--commit` and `[PROMPT]` are alternative scope
+  selectors, not composable, so the trade is real — and it is not close. A
+  prompt buys item context and gives up harness-computed scope, and scope is
+  the one thing a merge gate cannot trade: a review of the last commit on a
+  five-commit branch is worse than no review, because it reports clean.
+
+  `--title` is where the work ID and title go, so the review summary names the
+  item instead of reading as an anonymous run. That is all it is measured to
+  do; the CLI documents it as display, and it is not a way to smuggle the brief
+  in.
+
+  The consequence is worth stating plainly rather than working around: **on
+  this path the branch argues for itself.** A reviewer that cannot be told what
+  the item asked for has the diff, the tests, and the commit messages — which
+  is already why commits here explain why rather than what.
 - **codex-authored** — a fresh `claude` one-shot at the matching rung, run in
   the branch's own worktree:
 
       claude -p --model claude-fable-5 --effort xhigh --permission-mode auto \
         "Review work/<id> against main: git diff main...work/<id>. \
-         The item's spec: <spec>. Its checks: <checks>. \
+         The item is <work-id> — <the item's title>. \
+         Its spec: <spec, or 'none recorded'>. Its checks: <checks>. \
          AGENTS.md is the review lens. Report findings, or say the branch is clean."
+
+  The **title** leads, because it is the only description of the requested
+  change that is always there: a spec is optional in v0
+  (`docs/v0/MODEL.md`), and `Brief::goal` falls back to the title for exactly
+  that reason. A reviewer handed an empty spec and a list of check keys can
+  judge the code but not whether it is the change that was asked for.
 
   The full model ID and the effort are written out for the same reason the
   codex side writes them out, and `claude-fable-5` rather than `fable` because
@@ -186,24 +216,41 @@ Every verdict is durable, on the **authoring** attempt, and it is written
 
     # clean
     alder attempt edit <attempt> --satisfied cross-review \
-      --evidence "gpt-5.6-sol via codex review at c7c8923: clean, 0 findings" \
-      --meta reviewed-by=gpt-5.6-sol --meta reviewed-sha=c7c8923
+      --evidence "gpt-5.6-sol via codex review at 901445f: clean, 0 findings" \
+      --meta reviewed-by=gpt-5.6-sol --meta reviewed-sha=901445f
 
-    # changes requested
+    # changes requested — the findings themselves, not their count
     alder attempt edit <attempt> --failed cross-review \
-      --evidence "gpt-5.6-sol via codex review at c7c8923: changes requested, 6 findings (4 P1)" \
-      --meta reviewed-by=gpt-5.6-sol --meta reviewed-sha=c7c8923
+      --evidence "gpt-5.6-sol via codex review at 901445f: changes requested, 4 findings (3 P1).
+        P1 PASS.md:138 the codex invocation does not run: --base and a prompt cannot compose.
+        P1 PASS.md:165 the claude prompt omits the work title, which is the only always-present
+          description of the change.
+        P1 PASS.md:192 only the finding count is persisted before the relay.
+        P2 PASS.md:240 the grandfather path puts the verdict in a note, which is overwritten." \
+      --meta reviewed-by=gpt-5.6-sol --meta reviewed-sha=901445f
 
-Evidence names four things: the reviewer engine, the commit it read, the
-verdict, and the finding count.
+The verdict itself is the check's status and is not repeated in metadata: two
+places that can disagree about one fact is exactly what this repository refuses
+elsewhere. `reviewed-by` and `reviewed-sha` are there because nothing else
+records them.
+
+Evidence names the reviewer engine, the commit it read, the verdict, the
+finding count — and, when there are findings, **the findings**: one line each,
+severity, `file:line`, and the claim.
+
+**A count is not a finding.** "4 findings (3 P1)" tells the next reader that
+something is wrong and nothing about what, so it buys back none of the review:
+whoever reads it next still has to run the whole thing again. The reviewer's
+full transcript is not the record — the actionable list is, and it is short
+enough to fit in evidence.
 
 **Findings first, feedback second.** A review that ends in a `send-keys` and
 nothing else appended is a review that did not happen: after a rotation or a
-crash, a branch with findings reads exactly like a branch nobody has looked at,
-so the next leader pays for the same review again and the author waits another
-pass for feedback it was already sent. `--failed cross-review` is what makes
-that state readable — it is the level-triggered rule in `AGENTS.md` turned on
-the leader's own work.
+crash, a branch with findings reads exactly like a branch nobody has looked at.
+Appending the findings *before* relaying them is what closes that window — the
+next leader reads them out of the log and relays them, instead of paying for
+the review a second time while the author waits another pass. It is the
+level-triggered rule in `AGENTS.md` turned on the leader's own work.
 
 `reviewed-by` lands beside the `engine` the dispatch stamped, so author ≠
 reviewer is auditable from the log alone, by a reader who was not there.
@@ -238,13 +285,35 @@ gap it closes. An item is admitted long before a branch exists, so there is no
 pass in which declaring it late is the only option.
 
 **Every item admitted before this rule has no such check**, including the one
-that introduced it. Do not end an attempt to add one. Review the branch anyway
-and record the same four facts where they still fit — `--meta
-reviewed-by=<engine> --meta reviewed-sha=<sha>` plus an attempt note carrying
-the verdict and the finding count — then finish the item on the checks it does
-carry. The audit trail comes out identical; what is missing is only the gate,
-so on those items the merge is held by your reading of the log rather than by
-`work finish` refusing. That set shrinks with every admission and never grows.
+that introduced it, and a result cannot be recorded against a check that was
+never declared:
+
+    $ alder attempt edit al-zptgbz-attempt-1 --failed cross-review --evidence "…"
+    error [unknown_check]: attempt `al-zptgbz-attempt-1` has no check named
+      `cross-review`
+
+Do not end an attempt to add one. Review the branch anyway and put every
+durable fact in **metadata**:
+
+    alder attempt edit <attempt> \
+      --meta reviewed-by=gpt-5.6-sol --meta reviewed-sha=<sha> \
+      --meta cross-review=failed \
+      --meta cross-review-findings="P1 PASS.md:138 …; P1 PASS.md:192 …"
+
+Here `cross-review=<verdict>` earns its place: with no check to hold the
+status, metadata is the only field left that persists, so it carries the
+verdict and the findings both.
+
+Metadata, and not a note. An attempt's note is single-valued: the next worker
+milestone replaces it, so a verdict parked there is gone by the time anyone
+reads the item, and what is left says who reviewed which commit while silently
+dropping what they concluded. Metadata merges instead — `attempt.metadata
+.extend(...)` against `attempt.note = Some(note)` in `src/domain/state.rs` —
+and a later round overwrites its own keys, which is the level-triggered
+behaviour you want. Then finish the item on the checks it does carry. What is
+missing on those items is only the gate, so the merge is held by your reading
+of the log rather than by `work finish` refusing. That set shrinks with every
+admission and never grows.
 
 The check is the leader's, and both worker-facing briefs say so: the dispatched
 goal names it apart from the checks the worker owns (`LEADER_CHECKS` and
