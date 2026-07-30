@@ -76,9 +76,9 @@ use std::{
 
 use alder::{
     domain::{
-        AttemptDefinition, AttemptOutcome, AttemptState, EventDraft, EventPayload, PassDefinition,
-        PassOutcome, PassState, PassTrigger, ProjectState, Snapshot, WorkDefinition, WorkOperation,
-        decode_record, encode_draft,
+        AttemptDefinition, AttemptOutcome, AttemptState, CheckDefinition, EventDraft, EventPayload,
+        PassDefinition, PassOutcome, PassState, PassTrigger, ProjectState, Snapshot,
+        WorkDefinition, WorkOperation, decode_record, encode_draft,
     },
     observer::{ReconcileFinding, reconcile},
     projection::{ObservationStatus, ObservedHandle},
@@ -136,50 +136,65 @@ pub enum Site {
 ///
 /// The tripwire is `the_simulated_dispatcher_still_mirrors_the_cli_pack` in
 /// `sim_crash.rs`. It reads `src/app.rs`, narrows to each [`Site`], and fails
-/// if the schema or any mirrored field is not emitted *from that region*. What
-/// it still cannot see is a field the CLI renames in a region this simulator
-/// does not model at all, so a new `alder` sub-command answered here has to
-/// arrive with a row in this table.
+/// if the schema or any mirrored field is not emitted *from that region*.
+///
+/// **A source scan only reaches the keys the CLI writes as literals**, and
+/// production does not write all of them that way. `loop` is a literal, but it
+/// lives in `fn loop_section` rather than `fn status`, so its nested keys are
+/// pinned to the function that actually writes them. `current` and each
+/// `in_flight` item are not literals at all: the CLI serialises a domain value
+/// and the field names live on the type, where no scan of `src/app.rs` will
+/// ever find them. Those are checked by
+/// `the_simulated_dispatcher_serves_no_nested_shape_production_lacks`, which
+/// compares this simulator's answers against the real serialisation rather
+/// than against source text.
+///
+/// What neither check can see is a field the CLI renames in a region this
+/// simulator does not model at all, so a new `alder` sub-command answered here
+/// has to arrive with a row in this table.
 #[derive(Debug, Clone, Copy)]
 pub struct Mirrored {
     /// `alder <command>`, as this simulator dispatches it.
     pub command: &'static str,
     pub site: Site,
-    pub schema: &'static str,
-    /// Every key the simulator's answer carries beyond the envelope.
-    /// Production must still emit all of them from the same region.
+    /// The schema the region must still claim, where the region declares one.
+    /// A region that is spliced into a larger document — the loop section —
+    /// carries none of its own.
+    pub schema: Option<&'static str>,
+    /// Every key the simulator's answer carries beyond the envelope, that
+    /// production writes as a literal in this region.
     pub fields: &'static [&'static str],
 }
 
-pub const MIRRORED: [Mirrored; 9] = [
+pub const MIRRORED: [Mirrored; 10] = [
     Mirrored {
         command: "show",
         site: Site::Function("show"),
-        schema: "alder.show.v0",
+        schema: Some("alder.show.v0"),
         fields: &["head", "id", "kind", "current", "history"],
     },
     Mirrored {
         command: "status",
         site: Site::Function("status"),
-        schema: "alder.status.v0",
+        schema: Some("alder.status.v0"),
         fields: &["head", "revision", "loop"],
     },
     Mirrored {
         command: "status --section in_flight",
         site: Site::Function("status"),
-        schema: "alder.status.v0",
+        schema: Some("alder.status.v0"),
         fields: &["head", "revision", "in_flight"],
     },
     Mirrored {
         command: "refresh",
         site: Site::Function("refresh"),
-        schema: "alder.refresh.v0",
+        schema: Some("alder.refresh.v0"),
         fields: &["head", "changed", "result"],
     },
     Mirrored {
         command: "work start",
         site: Site::MutationCall("alder.work.start.v0"),
-        schema: "alder.work.start.v0",
+        schema: Some("alder.work.start.v0"),
         fields: &["work_id", "attempt_id"],
     },
     Mirrored {
@@ -187,26 +202,53 @@ pub const MIRRORED: [Mirrored; 9] = [
         // and this simulator does not model it.
         command: "attempt edit --handle",
         site: Site::MutationCall(r#""change": "bound""#),
-        schema: "alder.attempt.edit.v0",
+        schema: Some("alder.attempt.edit.v0"),
         fields: &["attempt_id", "change", "handle"],
     },
     Mirrored {
         command: "attempt end",
         site: Site::MutationCall("alder.attempt.end.v0"),
-        schema: "alder.attempt.end.v0",
+        schema: Some("alder.attempt.end.v0"),
         fields: &["attempt_id", "outcome"],
     },
     Mirrored {
         command: "loop wake",
         site: Site::MutationCall("alder.loop.wake.v0"),
-        schema: "alder.loop.wake.v0",
+        schema: Some("alder.loop.wake.v0"),
         fields: &["pass_id", "engine", "handle", "triggers"],
     },
     Mirrored {
         command: "pass end",
         site: Site::MutationCall("alder.pass.end.v0"),
-        schema: "alder.pass.end.v0",
+        schema: Some("alder.pass.end.v0"),
         fields: &["pass_id", "outcome", "rotate"],
+    },
+    Mirrored {
+        // The loop section is a literal of its own, written in its own
+        // function; `fn status` only splices it in under `loop`. Scanning
+        // `fn status` for these would find nothing, and scanning it for
+        // `loop` alone would pass while every key inside had been renamed.
+        // These are what `LoopState` deserialises, so they are checked where
+        // production actually writes them.
+        command: "status (the loop section LoopState reads)",
+        site: Site::Function("loop_section"),
+        schema: None,
+        fields: &[
+            "paused",
+            "pause_reason",
+            "engine",
+            "rotate_pending",
+            "nudge_pending",
+            "open_pass",
+            "last_pass",
+            "id",
+            "handle",
+            "started_at",
+            "outcome",
+            "wake_at",
+            "ended_at",
+            "ended_seq",
+        ],
     },
 ];
 
@@ -562,7 +604,14 @@ impl Simulator {
                     spec: Some("crash anywhere".to_owned()),
                     priority: 1,
                     requires: Vec::new(),
-                    checks: Vec::new(),
+                    // Not decoration: `Brief::from_show` reads `key` and
+                    // `description` off each check, two levels down inside
+                    // `current`, and an empty list would leave that shape
+                    // untested.
+                    checks: vec![CheckDefinition {
+                        key: "converges".to_owned(),
+                        description: "recovery reaches a fixpoint".to_owned(),
+                    }],
                 },
             }],
         });
@@ -594,8 +643,21 @@ impl Simulator {
         self.shared.world.borrow().faults.iter().copied().collect()
     }
 
-    pub fn set_next_agent(&self, script: AgentScript) {
-        self.shared.world.borrow_mut().next_agent = script;
+    /// Script what the leader agent does on its next pass.
+    ///
+    /// Both halves matter, and only one of them is obvious. `next_agent`
+    /// covers a leader session that does not exist yet. Retargeting the live
+    /// session covers the far commoner case: once a daemon has created its
+    /// session it reuses it, so a script set only for the *next* creation
+    /// would never reach the leader that is actually running — the pass would
+    /// end normally and an operation named for a leader death would quietly
+    /// produce none.
+    pub fn script_leader(&self, script: AgentScript) {
+        let mut world = self.shared.world.borrow_mut();
+        world.next_agent = script;
+        if let Some(session) = world.sessions.get_mut(LEADER_SESSION) {
+            session.script = script;
+        }
     }
 
     pub fn advance(&self, ticks: u64) {
@@ -2033,30 +2095,43 @@ pub fn execute_case(case: &Case) -> Digest {
     let mut daemon = Driver::new(host.clone(), config());
     let mut want_worker = false;
     for operation in &case.operations {
-        match operation {
+        // A scheduled fault is a process death, so whatever the daemon
+        // remembered — the session it launched, whether the next injection
+        // must bootstrap, how long a fire condition has been pending — is gone
+        // with it. Keeping the same `Driver` across a crash would let
+        // process-local state outlive the process, and the next operation
+        // would reuse a session a restarted daemon would have replaced. This
+        // is the same reset `recover` performs between rounds.
+        let survived = match operation {
             Operation::SpawnWorker => {
                 want_worker = true;
-                let _ = catch_sim_crash(|| {
+                catch_sim_crash(|| {
                     spawn(
                         &host,
                         WORK_ID,
                         tier("luna").expect("luna exists"),
                         Some("scripted-agent"),
                     )
-                });
+                })
+                .is_some()
             }
             Operation::RestartDaemon => {
                 daemon = Driver::new(host.clone(), config());
+                true
             }
-            Operation::PollDaemon => {
-                let _ = catch_sim_crash(|| daemon.poll_once());
-            }
+            Operation::PollDaemon => catch_sim_crash(|| daemon.poll_once()).is_some(),
             Operation::LeaderDiesMidPass => {
                 host.nudge();
-                host.set_next_agent(AgentScript::DieMidPass);
-                let _ = catch_sim_crash(|| daemon.poll_once());
+                host.script_leader(AgentScript::DieMidPass);
+                catch_sim_crash(|| daemon.poll_once()).is_some()
             }
-            Operation::Tick(ticks) => host.advance(u64::from(*ticks)),
+            Operation::Tick(ticks) => {
+                host.advance(u64::from(*ticks));
+                true
+            }
+        };
+        if !survived {
+            daemon = Driver::new(host.clone(), config());
         }
     }
     host.recover(want_worker);

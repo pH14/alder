@@ -295,13 +295,15 @@ fn the_simulated_dispatcher_still_mirrors_the_cli_pack() {
                 matched[0]
             }
         };
-        assert!(
-            region.contains(&format!("\"{}\"", mirrored.schema)),
-            "`alder {}` no longer answers as `{}` from the region that builds \
-             it; the simulated dispatcher is mirroring a CLI that moved",
-            mirrored.command,
-            mirrored.schema
-        );
+        if let Some(schema) = mirrored.schema {
+            assert!(
+                region.contains(&format!("\"{schema}\"")),
+                "`alder {}` no longer answers as `{schema}` from the region \
+                 that builds it; the simulated dispatcher is mirroring a CLI \
+                 that moved",
+                mirrored.command
+            );
+        }
         for field in mirrored.fields {
             assert!(
                 region.contains(&format!("\"{field}\"")),
@@ -311,6 +313,96 @@ fn the_simulated_dispatcher_still_mirrors_the_cli_pack() {
             );
         }
     }
+}
+
+/// Every key of `simulated` must exist in `real`.
+///
+/// The direction is the whole point. An extra key here means the simulator
+/// serves a shape production does not have, so daemon code could come to
+/// depend on it while the real CLI hands back nothing. A key production has
+/// and the simulator omits is the safe direction: the simulator fails first.
+fn assert_no_invented_keys(what: &str, simulated: &serde_json::Value, real: &serde_json::Value) {
+    let simulated = simulated
+        .as_object()
+        .unwrap_or_else(|| panic!("{what}: the simulated answer is not an object: {simulated}"));
+    let real = real
+        .as_object()
+        .unwrap_or_else(|| panic!("{what}: production's value is not an object: {real}"));
+    for key in simulated.keys() {
+        assert!(
+            real.contains_key(key),
+            "{what}: the simulator serves `{key}`, which production does not \
+             emit; its real keys are {:?}",
+            real.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Every key `production_reads` must exist in `real`.
+fn assert_still_emitted(what: &str, real: &serde_json::Value, production_reads: &[&str]) {
+    for key in production_reads {
+        assert!(
+            real.get(key).is_some(),
+            "{what}: production no longer emits `{key}`, which alderd reads; \
+             its real keys are {:?}",
+            real.as_object()
+                .map(|object| object.keys().collect::<Vec<_>>())
+        );
+    }
+}
+
+/// The half of the drift guard a source scan cannot reach.
+///
+/// `current` and each `in_flight` item are not `json!` literals in the CLI:
+/// production serialises a domain value, so the field names live on the type
+/// and no search of `src/app.rs` will ever find them. Scanning for `current`
+/// or `in_flight` therefore keeps passing while every key *inside* has been
+/// renamed — the same failure the schema sites had one level up. This compares
+/// the simulator's answers against the real serialisation instead.
+#[test]
+fn the_simulated_dispatcher_serves_no_nested_shape_production_lacks() {
+    let host = spawn_probe(17);
+    Driver::new(host.clone(), config()).poll_once().unwrap();
+    let state = host.snapshot().state;
+
+    // `show <work>` — read by `Brief::from_show`, two levels down into checks.
+    let answer = alderd::effects::Effects::alder(&host, &["show", "al-sim"]).unwrap();
+    let work = serde_json::to_value(state.work.get("al-sim").expect("the work item")).unwrap();
+    assert_no_invented_keys("show <work> current", &answer["current"], &work);
+    assert_still_emitted(
+        "show <work> current",
+        &work,
+        &["id", "title", "spec", "checks"],
+    );
+    assert_no_invented_keys(
+        "show <work> current.checks[]",
+        &answer["current"]["checks"][0],
+        &work["checks"][0],
+    );
+    assert_still_emitted(
+        "show <work> current.checks[]",
+        &work["checks"][0],
+        &["key", "description"],
+    );
+
+    // `show <pass>` — read by the driver as /current/state and /current/outcome.
+    let pass_id = state.passes.keys().next().expect("the poll opened a pass");
+    let answer = alderd::effects::Effects::alder(&host, &["show", pass_id]).unwrap();
+    let pass = serde_json::to_value(&state.passes[pass_id]).unwrap();
+    assert_no_invented_keys("show <pass> current", &answer["current"], &pass);
+    assert_still_emitted("show <pass> current", &pass, &["id", "state", "outcome"]);
+
+    // `status --section in_flight` items — read by `spawn::open_attempt`.
+    let answer =
+        alderd::effects::Effects::alder(&host, &["status", "--section", "in_flight"]).unwrap();
+    let attempt = state
+        .attempts
+        .values()
+        .next()
+        .expect("the spawn started one");
+    let attempt = serde_json::to_value(attempt).unwrap();
+    assert_no_invented_keys("in_flight[]", &answer["in_flight"][0], &attempt);
+    assert_still_emitted("in_flight[]", &attempt, &["id", "work_id", "handle"]);
 }
 
 #[test]
@@ -481,6 +573,75 @@ fn generated_case(seed: u64, noise: Vec<u8>, fault_slots: Vec<(u8, u8)>) -> Case
     }
 }
 
+/// A simulated crash has to cost the daemon its memory, not just its stack.
+///
+/// The driver keeps process-local state — the session it launched, whether the
+/// next injection must bootstrap — and a real crash erases all of it. A case
+/// that caught the panic and carried the same `Driver` into the next operation
+/// let that state outlive the process it lived in, and the difference is not
+/// academic: a daemon that still believes it owns the leader session reuses it
+/// instead of restarting it, so it types the next injection straight onto the
+/// text the torn one left behind.
+#[test]
+fn a_daemon_that_died_mid_injection_does_not_reuse_the_pane_it_dirtied() {
+    // The same prefix `execute_case` runs, so boundary ordinals line up.
+    let probe = spawn_probe(23);
+    Driver::new(probe.clone(), config()).poll_once().unwrap();
+    let inject = position_of(&probe.trace(), "pass.inject");
+
+    // Tear the injection — text typed, Enter not — and then let the case go on
+    // to fire again with no restart of its own in between. The one extra poll
+    // matters: it times the abandoned pass out, because while a pass is open
+    // the driver only awaits it and never reaches the injection path at all.
+    // The nudge inside the death operation is what then makes it fire.
+    let mut case = generated_case(23, vec![1], Vec::new());
+    case.fault_schedule = vec![Fault::torn(inject, 0b01)];
+    let digest = execute_case(&case);
+    assert!(
+        digest
+            .trace
+            .iter()
+            .any(|boundary| boundary.contains("torn")),
+        "the injection was never torn: {digest:#?}"
+    );
+}
+
+/// The operation named for a leader death has to actually kill a leader.
+///
+/// It mostly did not. Scripting the death set only what the *next* session
+/// creation would run, and a daemon that already has a session reuses it — so
+/// unless something happened to restart it first, the scripted death never
+/// reached the running leader and the pass ended normally. That matters well
+/// beyond this one operation: it is the generated cases' only source of
+/// mid-pass death, so a whole class of interleavings named for it was not
+/// exercising it, and the convergence evidence read stronger than it was.
+///
+/// This uses the generated shape at its least helpful — no noise, so nothing
+/// restarts the daemon between the poll that creates the leader session and
+/// the operation meant to kill it.
+#[test]
+fn the_leader_death_operation_kills_a_leader_that_is_already_running() {
+    let case = generated_case(21, Vec::new(), Vec::new());
+    let digest = execute_case(&case);
+    let created = digest
+        .trace
+        .iter()
+        .position(|boundary| boundary.contains("pass.session-create"))
+        .expect("the poll before the death creates a leader session");
+    let died = digest
+        .trace
+        .iter()
+        .position(|boundary| boundary.contains("agent.die"))
+        .unwrap_or_else(|| {
+            panic!("no leader died in a case named for a leader death: {digest:#?}")
+        });
+    assert!(
+        created < died,
+        "the leader that died was created after the death, so the operation \
+         never reached a running leader: {digest:#?}"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 48,
@@ -510,7 +671,7 @@ proptest! {
 #[test]
 fn a_leader_stub_can_die_mid_pass_without_stranding_it() {
     let host = Simulator::new(4);
-    host.set_next_agent(AgentScript::DieMidPass);
+    host.script_leader(AgentScript::DieMidPass);
     let mut driver = Driver::new(host.clone(), config());
     driver.poll_once().unwrap();
     host.recover(false);
