@@ -514,6 +514,7 @@ pub fn reconcile(
                             .get("codex_sessions")
                             .and_then(Value::as_array)
                             .is_some_and(|sessions| !sessions.is_empty())
+                            && !attempt.metadata.contains_key("codex-session")
                         // The observer only supplies several candidates
                         // after its direct launch marker was unavailable.
                         // Choosing the newest would recreate `--last`'s
@@ -1253,6 +1254,20 @@ mod tests {
                 &known,
             )
             .is_empty()
+        );
+        assert!(
+            reconcile(
+                &state,
+                &[ambiguous_codex_observation(
+                    "tmux:alder-work-active",
+                    "active",
+                    &[session, "019fb2ef-d507-7201-bc36-79d6d5b82337"],
+                )],
+                &configured,
+                &known,
+            )
+            .is_empty(),
+            "an already stamped attempt needs no candidate selection"
         );
 
         state
