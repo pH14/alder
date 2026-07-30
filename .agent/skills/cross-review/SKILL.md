@@ -14,13 +14,16 @@ verifying that check.
 Before a branch is merged—or, when it is staged for the operator rather than
 merged, before it is presented and again before any re-presentation—it is
 reviewed by an engine on the other vendor's ladder. This review is mandatory.
-The leader's reading of a diff is useful, but it is not the independent review
-because the leader dispatched the work.
+The reviewer is the rung across from the author's or higher: never the
+author's own vendor or session. A reviewer that shares the author's blind
+spots returns a rubber stamp with a receipt on it. The leader's reading of a
+diff is useful, but it is not the independent review because the leader
+dispatched the work.
 
 The author is every vendor that has written on the branch, not merely the
 latest attempt. `alderd spawn` can reuse a branch after a respawn, so inspect
-the `engine` metadata of every attempt in `alder show <work>`. A reviewer may
-not share the authoring vendor or session. The paired rungs are:
+the `engine` metadata of every attempt, not just the newest. A reviewer may not
+share the authoring vendor or session. The paired rungs are:
 
 | authored at | reviewed by |
 | --- | --- |
@@ -32,18 +35,26 @@ not share the authoring vendor or session. The paired rungs are:
 The standing equivalences are `luna` ↔ `sonnet`, `terra` ↔ `opus`, and
 `sol` ↔ `fable`, as the counterpart column in
 `crates/alderd/README.md` records. Thus the hardest Codex work is reviewed by
-`fable`, not `opus`. Every engine invocation names its full model identifier
-and its reasoning effort explicitly; no alias, config default, or inherited
-effort is evidence of a review.
+`fable`, not `opus`; reviewing it one rung down is exactly what “across from
+the author or higher” rules out. Every engine invocation names its full model
+identifier and its reasoning effort explicitly; no alias, config default, or
+inherited effort is evidence of a review.
 
 If both vendors have written on one branch, it needs one whole-diff review from
-each ladder. Record both reviewers comma-joined in `reviewed-by`; the check is
-satisfied only after every authoring vendor has been read by the other. That
-requires two heavy operations and therefore two passes. The model has no durable
-partial-verdict state between pending and satisfied, so avoid this case by
-keeping a respawn on one vendor's fresh branch until product work
-`al-q8qwhy` supplies that fact. When authorship cannot be attributed to a
-commit, count that vendor as an author.
+each ladder: no single review can be outside the authoring vendor for every
+commit. Record both reviewers comma-joined in `reviewed-by`
+(`--meta reviewed-by=gpt-5.6-sol,claude-fable-5`); the check is satisfied only
+after every authoring vendor has been read by the other. That requires two heavy
+operations and therefore two passes.
+
+Between those reviews, the first verdict has nowhere durable to live:
+satisfying the check after one greens a gate over a half-read diff, while
+withholding it leaves a pending check with no evidence. That needs a durable
+fact Alder does not yet have, tracked as `al-q8qwhy`; do not invent one here.
+Until it lands, avoid this case by cutting a fresh branch when a respawn
+switches provider rather than reviewing half a diff or holding a verdict in
+memory. The log does not record which attempt wrote which commit, so when
+authorship cannot be attributed, count that vendor as an author.
 
 ## The weight ladder
 
@@ -91,9 +102,10 @@ recursive.
 ## Run the other ladder
 
 Run the reviewer in the branch's own worktree, where `work/<id>` is checked
-out. A review has two different mechanics according to the authoring vendor.
-The reviewer reads `AGENTS.md` as the repository's review lens and the
-relevant v0 contract document before treating something as a defect.
+out. The two mechanics are not symmetric; treating them as one shape is how the
+weaker one gets run wrong. The reviewer reads `AGENTS.md` as the repository's
+review lens and the relevant v0 contract document before treating something as
+a defect.
 
 ### Claude-authored branch: Codex review
 
@@ -107,35 +119,44 @@ codex review --base main --title "$(cat "$scratch/review-title-<id>.txt")" \
 
 Each explicit setting is deliberate:
 
+- None is defaulted anywhere worth trusting. The model and effort say what
+  reviewed the branch; omitting either runs whatever
+  `~/.codex/config.toml` said that week while the log still calls it `sol`.
 - `--base main` makes the harness review the branch delta from its fork point.
 - `--title` gives the summary the work ID and title; it is display text, not a
   prompt channel.
-- `-c model=gpt-5.6-sol` pins the full review model. `codex review` rejects
-  `-m`; that flag belongs to `codex exec`.
+- `-c model=gpt-5.6-sol` pins the full review model. `codex review` has no
+  `-m`; that flag belongs to `codex exec` and review rejects it with
+  `error: unexpected argument '-m' found`.
 - `-c model_reasoning_effort=xhigh` records the actual review effort rather
   than a moving config default.
 - `approval_policy=never` and `sandbox_mode=workspace-write` say the review
   runs unattended: nothing answers an approval request inside a review, and a
   review stopped waiting on one is indistinguishable from a slow one.
 
-`--base`, `--uncommitted`, `--commit`, and a positional prompt are alternative
-scope selectors in codex-cli 0.146.0-alpha.3.1; they do not compose. A scoped
-review therefore carries **no custom instructions**. `AGENTS.md` is the entire
-lens on this route, which is why it must be complete.
+The item cannot be handed to this reviewer. `--base`, `--uncommitted`,
+`--commit`, and a positional prompt are alternative scope selectors in
+codex-cli 0.146.0-alpha.3.1; they do not compose. A scoped review therefore
+carries **no custom instructions**. `AGENTS.md` is the entire lens on this
+route: `codex review` reads it unprompted, and there is no second channel.
+This was measured in a throwaway repository built so the candidate scopes could
+be told apart.
 
 | form | measured result |
 | --- | --- |
 | `--base main "<prompt>"` | errors: `--base <BRANCH>` cannot be used with `[PROMPT]` |
 | `--base main -`, prompt on stdin | the same error; `-` is still positional |
-| `"<prompt>"`, no scope flag | runs, but chose `git diff HEAD^ HEAD` and missed a second change |
-| `-c instructions="…<token>…"` | accepted, but the token never surfaced in the review |
+| `"<prompt>"`, no scope flag | runs, but the model chose its scope: `git diff HEAD^ HEAD`, one commit, and missed a second change |
+| `-c instructions="…<token>…"` | accepted by config, but the token never surfaced, so nothing measured says it arrives |
 | `--base main --title "<text>"` | runs |
 
 The branch must therefore argue for itself through its diff, tests, and commit
-messages. A prompt buys item context and gives up harness-computed scope, and
-scope is the one thing a merge gate cannot trade: a review of the last commit
-on a five-commit branch is worse than no review, because it reports clean. Do
-not try to smuggle the item brief through `--title` or config.
+messages—which is already why commits here explain why rather than what. A
+prompt buys item context and gives up harness-computed scope, and scope is the
+one thing a merge gate cannot trade: a review of the last commit on a
+five-commit branch is worse than no review, because it reports clean. `--title`
+names the work in the summary; it is display text, not a way to smuggle the
+brief through. Do not try to use config as a second channel either.
 
 ### Codex-authored branch: fresh Claude review
 
@@ -149,9 +170,14 @@ claude -p --model claude-fable-5 --effort xhigh --permission-mode auto \
   "$(cat "$scratch/review-prompt-<id>.txt")"
 ```
 
-The prompt file, outside the worktree, contains the diff scope and the item
-context. The title leads because it is the one requested-change description
-that is always present; a v0 spec is optional.
+The prompt file holds the brief—never inline item-controlled text into the
+command, for the same quoting reason as the verdict below. `$scratch` is
+outside the worktree, so nothing written there can be committed onto the branch
+under review. The title leads because it is the one requested-change description
+that is always present: a spec is optional in v0 (`docs/v0/MODEL.md`), and
+`Brief::goal` falls back to the title for exactly that reason. A reviewer given
+an empty spec and check keys can judge code, but not whether it is the requested
+change.
 
 ```text
 Review work/<id> against main: git diff main...work/<id>.
@@ -160,9 +186,10 @@ Its spec: <spec, or 'none recorded'>. Its checks: <checks>.
 AGENTS.md is the review lens. Report findings, or say the branch is clean.
 ```
 
-Use the full model ID (`claude-fable-5`, not the moving `fable` alias), name
-the effort, and use `--permission-mode auto` because no person is watching for
-a prompt. Freshness is part of the review: a session carrying this pass's
+Use the full model ID (`claude-fable-5`, not the moving `fable` alias) and
+name the effort for the same reason the Codex path does. `--permission-mode
+auto` is the counterpart of `approval_policy=never`: nobody is watching for
+a prompt. Freshness matters as much as the rung: a session carrying this pass's
 context has already agreed with it.
 
 ## Observe a review without observing yourself
@@ -200,7 +227,8 @@ themselves. Each finding is one line with severity, `file:line`, and its claim;
 the worst finding level is therefore explicit and auditable. Include the
 review transcript pointer as well—the Codex rollout UUID or the fresh Claude
 review/session identifier. A count is not a finding: a later reader needs the
-actionable list, not merely proof that a list once existed.
+actionable list, not merely proof that a list once existed. The full transcript
+is not the record; the short actionable list is.
 
 For example:
 
@@ -232,22 +260,41 @@ the exact two endpoints. Rounds are successive reviews of fresh endpoints;
 their later evidence and metadata supersede the earlier round rather than
 pretending an earlier green check covers new code.
 
-`reviewed-sha` is the branch head and `reviewed-base` is its merge base, not
-main's current tip:
+Findings first, feedback second: a review that only sends keys and appends
+nothing disappears after a rotation or crash, leaving a reviewed branch
+indistinguishable from an unread one. Appending findings before relay lets the
+next leader read and relay them instead of paying for the review again; it is
+the level-triggered rule in `AGENTS.md` applied to leader work.
+`reviewed-by` lands beside the dispatch-stamped `engine`, so author ≠ reviewer
+is auditable from the log alone by a reader who was not there. Without
+`reviewed-effort`, a default-effort review reads exactly like one run at
+`xhigh`.
+
+`reviewed-sha` and `reviewed-base` make the verdict a fact about a diff, not a
+branch name. The endpoints are the branch head and its **merge base**, because
+that is where the three-dot delta read by `git diff main...work/<id>` and
+`codex review --base main` begins. Record the merge base, never
+`git rev-parse main`: main's tip is a commit the reviewer did not read, so
+comparing it would attest to an integration context that never existed.
 
 ```sh
 git rev-parse work/<id>
 git merge-base main work/<id>
 ```
 
-The reviewer reads `git diff main...work/<id>`, so the merge base identifies
-the start of that three-dot delta. At merge both comparisons must still hold:
-`reviewed-sha` equals `git rev-parse work/<id>` **and** `reviewed-base` equals
-`git merge-base main work/<id>`. A new author commit moves the head; a rebase
-moves the base. Either makes the review stale and requires another round.
-Main advancing alone moves neither endpoint. It can still make the merge
-result incompatible, which is why gates run again on the local merge result.
-This rule knowingly does not require a second review of that result.
+Either endpoint can move: a new author commit moves the head, leaving a green
+check over code nobody read; a rebase moves the merge base by replaying the
+delta onto a different parent. At merge, `reviewed-sha` must equal
+`git rev-parse work/<id>` **and** `reviewed-base` must equal
+`git merge-base main work/<id>`; otherwise the review is stale and must run
+again.
+
+Main advancing alone moves neither endpoint, so merging one branch does not
+stale the reviews of the others. It can change the merge result: clean deltas
+can still be semantically incompatible together. This rule knowingly does not
+require a second review of that result—it would double every merge's cost, and
+such incompatibility is not a reviewer's opinion. It requires gates on the
+local merge result instead, where that incompatibility shows up.
 
 ## Check declaration and legacy items
 
@@ -259,15 +306,40 @@ alder work add --handoff <handoff> --priority <n> \
   --check cross-review:"reviewed by the other vendor's ladder; the leader records this one, not the worker"
 ```
 
-`work add` takes `--check`; `--add-check` belongs to `work edit`. A check or
-dependency cannot be changed while an attempt is active, so never end a live
-attempt merely to widen its contract. The leader records this check; a worker
-stops after its own checks and says `ready for review`, rather than waiting on
-the independent reviewer.
+Repeat the first form once per handoff-proposed check; those descriptions are
+submitter text and arrive through files, while this document's `cross-review`
+description may be inline. `work add` takes `--check`; `--add-check` is
+`work edit`'s flag and does not exist on add (`src/cli.rs`), so using it here
+fails admission outright. Admission is the only time to declare it because a
+check or dependency cannot change while an attempt is active:
 
-An item admitted before this rule has no `cross-review` check, and no check
-result can be appended to it. Review it anyway. Put the durable result in
-metadata—not its single-valued note, which a worker milestone overwrites:
+```text
+$ alder work edit al-zptgbz --add-check cross-review:"…"
+error [active_attempt]: dependencies and checks cannot change while
+  `al-zptgbz-attempt-1` is active
+```
+
+That is the ordinary `docs/v0/MODEL.md` rule. Do not end a live attempt just
+to widen its contract: an item is admitted before its branch exists, so there
+is no pass where declaring the check late is the only option. The leader
+records this check; the dispatched goal names it apart from worker-owned checks
+through `LEADER_CHECKS` and `Brief::goal` in `crates/alderd/src/spawn.rs`.
+`WORKER.md` therefore has a worker stop after its own checks and say
+`ready for review`; otherwise a leader-only check would strand the worker one
+step short of the marker and deadlock the protocol.
+
+Every item admitted before this rule has no `cross-review` check, including the
+one that introduced it, and no check result can be appended to it:
+
+```text
+$ alder attempt edit al-zptgbz-attempt-1 --failed cross-review --evidence "…"
+error [unknown_check]: attempt `al-zptgbz-attempt-1` has no check named
+  `cross-review`
+```
+
+Do not end its attempt to add one. Review the branch anyway. Put the durable
+result in metadata—not its single-valued note, which a worker milestone
+overwrites:
 
 ```sh
 alder attempt edit <attempt> \
@@ -279,10 +351,17 @@ alder attempt edit <attempt> \
   --meta cross-review-findings="$(cat "$scratch/cross-review-<id>.txt")"
 ```
 
-For a legacy item, `cross-review=<verdict>` and its findings are the durable
-substitute for the absent check. Metadata merges while a later note replaces
-the old one. The leader must still hold merge on the recorded verdict even
-though `work finish` cannot enforce a check that did not exist at admission.
+For a legacy item, `cross-review=<verdict>` earns its place: without a check
+to hold status, metadata is the only persistent field for its verdict and
+findings. Metadata—not a note—is necessary. A note is single-valued, so the
+next worker milestone silently replaces a parked verdict; metadata merges
+instead (`attempt.metadata.extend(...)` versus
+`attempt.note = Some(note)` in `src/domain/state.rs`). A later round
+overwrites its own keys, which is the level-triggered behaviour wanted here.
+
+Finish a legacy item on the checks it actually carries. The missing gate is
+held by reading this durable metadata rather than by `work finish` refusing;
+the grandfathered set shrinks with every admission and never grows.
 
 ## Findings and feedback rounds
 
@@ -291,11 +370,14 @@ delivery is repairable: the next leader reads and relays the durable evidence.
 A relay with no preceding record is a review that disappears at rotation.
 
 The default fix path is a **fresh worker**: start a new attempt on the same
-item and branch. Before changing code, the new worker reads the prior attempts'
-durable review evidence and notes with `alder show <item>`; a launch goal alone
-contains title, spec, checks, and gates. Choose the tier by the size of the
-findings, not the original item; narrow enumerated findings are down-tier work,
-so `luna` or `sonnet` can fix what `sol` found in `terra`'s change.
+item and branch. Before changing code, the new worker reads the previous
+authoring attempt's durable review evidence and notes with
+`alder show <attempt-id>`, using the exact reviewed attempt ID from the
+feedback record; `alder show <work-id>` shows the work and event-type history,
+not attempt evidence. A launch goal alone contains title, spec, checks, and
+gates. Choose the tier by the size of the findings, not the original item;
+narrow enumerated findings are down-tier work, so `luna` or `sonnet` can fix
+what `sol` found in `terra`'s change.
 
 Do not compact or preserve the original author session for a feedback round.
 Compaction pays a full-context read at author tier and preserves laundered
@@ -307,10 +389,20 @@ cheaper than a spawn. Decisions worth keeping must therefore be committed:
 explain them in commit messages and attempt notes, and put binding spec rulings
 in `work edit`, so a fresh worker does not re-litigate them.
 
-A real defect returns as precise feedback. A disagreement that needs authority
-becomes `alder work ask <id>` with options and a recommendation. Until a later
-fresh review satisfies the check, the branch cannot merge. There is no
-override: a finding is fixed, ruled on, or argued down on the record.
+A real defect returns as precise feedback into the live worker session,
+confirmed landed under PASS step 4, or into a fresh worker on the same item and
+branch if that session is gone. The branch stays in flight; a finding is
+evidence, not an order, and the author may argue it down with reasoning. A
+disagreement that needs authority becomes `alder work ask <id>` with options
+and a recommendation. Until a later fresh review satisfies the check, the
+branch cannot merge. There is no override: a finding is fixed, ruled on, or
+argued down on the record.
+
+A re-review is a fresh review of new endpoints: the same command, new
+`reviewed-sha` and `reviewed-base`, and `--satisfied` only after an engine
+outside the authoring vendor has read the code being merged. A cross-review is
+a heavy operation; running it is the pass's heavy operation whether or not a
+merge follows.
 
 ## Known limits
 
@@ -319,18 +411,24 @@ durable fact or a change to the worker brief and are tracked as `al-q8qwhy`.
 
 - **Feedback delivery has no durable receipt.** A verdict is durable before
   relay, but crash-before-send and send-completed look the same in the log.
-  Pane observation remains a limited workaround.
+  PASS step 4's pane observation is a limited workaround.
 - **Spawn does not itself carry a prior attempt's findings.** The fresh-worker
   default works only because the findings are durable check evidence and
-  attempt notes that the new worker must read; a launch goal alone contains
-  only title, spec, and check definitions.
+  attempt notes that the new worker must read with `alder show <attempt-id>`;
+  a launch goal alone contains title, spec, check definitions, and gates. If a
+  reviewed session is gone, its fresh replacement otherwise starts with its
+  own pending checks and never reads what it was meant to fix—especially a
+  Codex one-shot that begins work immediately.
 - **Review intent is not recorded before launch.** A crash during either
-  charged review leaves no durable target or in-progress review to adopt, so a
-  later pass may have to pay again.
+  charged review leaves no durable target SHA or in-progress review to adopt,
+  so a later pass may have to pay again. This is the repository's
+  intent-before-effects rule, not yet applied to leader review.
 - **A two-vendor partial verdict has nowhere durable to live.** One review
   cannot safely satisfy the whole check, and a pending check records no first
-  verdict. This needs per-reviewer state, not a prose workaround.
+  verdict. A per-reviewer check result would change the acceptance-check model,
+  which is the operator's call, not a leader's; this needs new state, not a
+  prose workaround.
 
-Until that work lands, relay carefully, ensure a fresh worker reads the
-recorded findings, expect a crashed review to be paid twice, and keep a branch
-to one vendor where practical.
+Until `al-q8qwhy` lands, these are costs the leader absorbs knowingly: relay
+carefully, make the fresh worker read the recorded findings, expect a crashed
+review to be paid twice, and keep a branch to one vendor where practical.
