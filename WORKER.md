@@ -20,12 +20,20 @@ been amended under you:
 2. Record progress honestly on YOUR attempt:
    - milestones: `.alder/bin/alder attempt edit <your-attempt> --note "..."`
    - satisfied checks: `... attempt edit <your-attempt> --satisfied <check>
-     --evidence "<what proves it>"`
+     --evidence "<what proves it>"` — every check except the ones your goal
+     hands to the leader.
 3. Gates before you call anything done: `cargo fmt --check`, `cargo clippy
    --workspace --all-targets` (zero warnings), `cargo test --workspace` green.
-4. When every check is satisfied and gates are green, leave a final note
-   `--note "ready for review"` and stop. Do NOT run `work finish` — the
-   leader finishes after reviewing your branch.
+4. When every check that is yours is satisfied and gates are green, leave a
+   final note `--note "ready for review"` and stop. Do NOT run `work finish` —
+   the leader finishes after reviewing your branch.
+
+   Your goal names any check the leader records from outside this session; a
+   cross-review by the other vendor's ladder is the standing one. It stays
+   pending while you work, and it is **not** a reason to withhold that final
+   note: the leader is waiting on the note to run the review. A worker that
+   holds the marker until every check is satisfied, including that one, waits
+   on itself forever.
 
 ## Stuck on *how*? Close it yourself.
 
@@ -108,3 +116,7 @@ with the UUID it names; never ask the leader to fall back to `--last`.
 - You may `work ask` on your own item and `attempt edit` your own attempt.
   Every other write to the log belongs to the leader.
 - Never weaken a check to get to done; ask instead.
+- Never satisfy a check your goal assigns to the leader, however true you
+  believe it is. A cross-review means an engine that is not you read the
+  branch; you cannot evidence that, and a stamp in your own hand is worse than
+  no stamp at all.
