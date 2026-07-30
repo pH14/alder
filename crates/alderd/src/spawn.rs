@@ -79,6 +79,12 @@ pub trait SpawnHost {
     ) -> Result<()>;
     fn tmux_kill_session(&self, session: &str) -> Result<()>;
     fn path_exists(&self, path: &Path) -> bool;
+    /// Resolve a path before comparing it with Git's canonical worktree
+    /// registry entries.
+    fn canonical_path(&self, path: &Path) -> Result<PathBuf>;
+    /// Remove one unregistered worktree residue. Implementations must remove
+    /// a symlink itself rather than following it.
+    fn remove_path(&self, path: &Path) -> Result<()>;
     fn create_dir_all(&self, path: &Path) -> Result<()>;
     fn copy_file(&self, from: &Path, to: &Path) -> Result<()>;
     fn write_executable(&self, path: &Path, body: &str) -> Result<()>;
@@ -313,18 +319,16 @@ pub fn spawn(
 ) -> Result<Spawned> {
     let session = format!("alder-work-{work_id}");
     let branch = format!("work/{work_id}");
-    let worktree = host
-        .root()
-        .parent()
-        .ok_or_else(|| {
-            DriverError::new(format!(
-                "`{}` has no parent directory to put a worktree beside",
-                host.root().display()
-            ))
-        })?
-        .join(format!("alder-work-{work_id}"));
+    let worktree_parent = host.root().parent().ok_or_else(|| {
+        DriverError::new(format!(
+            "`{}` has no parent directory to put a worktree beside",
+            host.root().display()
+        ))
+    })?;
+    let worktree = worktree_parent.join(format!("alder-work-{work_id}"));
 
     let brief = Brief::from_show(&host.alder(&["show", work_id])?)?;
+    sweep_unregistered_worktree(host, worktree_parent, &worktree)?;
     let worktree_present = verify_worktree(host, &worktree, &branch)?;
     let observed = host.tmux_session(&session)?;
     let open = current_attempt(host, work_id)?;
@@ -529,6 +533,56 @@ fn open_attempt(document: &Value, work_id: &str) -> Option<OpenAttempt> {
                 handle: text(attempt, "handle"),
             })
         })
+}
+
+/// Remove the expected worktree path only when Git has no record of it.
+///
+/// `git worktree add` creates the directory before its admin entry, so a
+/// process killed in that window leaves a path that is neither a worktree nor
+/// safe for a later `worktree add`. The inverse can happen if `worktree
+/// remove` loses its files after unregistering it. Git's registry is the
+/// authority here: a listed worktree is never removed, even if it otherwise
+/// looks stale.
+fn sweep_unregistered_worktree(
+    host: &impl SpawnHost,
+    worktree_parent: &Path,
+    worktree: &Path,
+) -> Result<()> {
+    if worktree.parent() != Some(worktree_parent) {
+        return Err(DriverError::new(format!(
+            "refusing to sweep `{}` outside worktree parent `{}`",
+            worktree.display(),
+            worktree_parent.display()
+        )));
+    }
+    if !host.path_exists(worktree) {
+        return Ok(());
+    }
+    let canonical_worktree = host.canonical_path(worktree)?;
+
+    let listed = host.git(&["worktree", "list", "--porcelain", "-z"])?;
+    if !listed.ok {
+        return Err(DriverError::new(format!(
+            "cannot list registered worktrees before sweeping `{}`: {}",
+            worktree.display(),
+            first_line(&listed.stderr)
+        )));
+    }
+    let registered = listed
+        .stdout
+        .split('\0')
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .any(|registered| registered == worktree || registered == canonical_worktree);
+    if registered {
+        return Ok(());
+    }
+
+    host.log(&format!(
+        "repair.path-sweep: removing unregistered worktree residue {}",
+        worktree.display()
+    ));
+    host.remove_path(worktree)
 }
 
 fn verify_worktree(host: &impl SpawnHost, worktree: &Path, branch: &str) -> Result<bool> {
@@ -790,6 +844,7 @@ mod tests {
         fail_git: RefCell<BTreeSet<String>>,
         existing_branches: RefCell<BTreeSet<String>>,
         worktrees: RefCell<BTreeMap<PathBuf, String>>,
+        strays: RefCell<BTreeSet<PathBuf>>,
         sessions: RefCell<BTreeMap<String, ObservedSession>>,
         crash_after: RefCell<Option<&'static str>>,
         fail_tmux: bool,
@@ -934,6 +989,21 @@ mod tests {
                     },
                 });
             }
+            if args == ["worktree", "list", "--porcelain", "-z"] {
+                let ok = !self.fail_git.borrow().contains("worktree list");
+                let mut stdout = format!("worktree {}\0bare\0\0", self.root.display());
+                for (path, branch) in self.worktrees.borrow().iter() {
+                    stdout.push_str(&format!(
+                        "worktree {}\0branch refs/heads/{branch}\0\0",
+                        path.display()
+                    ));
+                }
+                return Ok(Run {
+                    ok,
+                    stdout,
+                    stderr: "fatal: it did not work".to_owned(),
+                });
+            }
             if args.first() == Some(&"rev-parse") {
                 let branch = args.last().copied().unwrap_or_default();
                 let ok = self
@@ -955,7 +1025,10 @@ mod tests {
                 } else {
                     args.get(3).copied().unwrap_or_default()
                 };
-                self.worktrees.borrow_mut().insert(path, branch.to_owned());
+                self.worktrees
+                    .borrow_mut()
+                    .insert(path.clone(), branch.to_owned());
+                self.strays.borrow_mut().remove(&path);
                 self.crash_if("worktree add");
             } else if subcommand == "worktree remove" {
                 let path = args.last().copied().unwrap_or_default();
@@ -1007,7 +1080,20 @@ mod tests {
         }
 
         fn path_exists(&self, path: &Path) -> bool {
-            self.worktrees.borrow().contains_key(path)
+            self.worktrees.borrow().contains_key(path) || self.strays.borrow().contains(path)
+        }
+
+        fn canonical_path(&self, path: &Path) -> Result<PathBuf> {
+            Ok(path.to_path_buf())
+        }
+
+        fn remove_path(&self, path: &Path) -> Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("remove {}", path.display()));
+            self.worktrees.borrow_mut().remove(path);
+            self.strays.borrow_mut().remove(path);
+            Ok(())
         }
 
         fn create_dir_all(&self, path: &Path) -> Result<()> {
@@ -1187,7 +1273,86 @@ mod tests {
         );
         spawn(&host, "al-1", tier("terra").unwrap(), None).unwrap();
         assert!(!host.called("git worktree add"));
+        assert!(!host.called("remove /projects/alder-work-al-1"));
         assert!(host.called("adopting the existing worktree"));
+    }
+
+    #[test]
+    fn an_unregistered_directory_from_a_torn_worktree_add_is_swept_before_respawn() {
+        let host = Fake::new();
+        let worktree = PathBuf::from("/projects/alder-work-al-1");
+        // `git worktree add` made the directory, then died before it recorded
+        // the worktree in Git's admin area.
+        host.strays.borrow_mut().insert(worktree.clone());
+
+        spawn(&host, "al-1", tier("terra").unwrap(), None).unwrap();
+
+        let calls = host.calls();
+        let swept = calls
+            .iter()
+            .position(|call| call == "remove /projects/alder-work-al-1")
+            .expect("the unregistered residue is removed");
+        let added = calls
+            .iter()
+            .position(|call| call.starts_with("git worktree add"))
+            .expect("a fresh worktree is created");
+        assert!(swept < added, "{calls:#?}");
+        assert!(host.called("git worktree list --porcelain -z"));
+        assert!(!host.strays.borrow().contains(&worktree));
+    }
+
+    #[test]
+    fn an_unregistered_directory_from_a_torn_worktree_remove_is_swept_before_respawn() {
+        let host = Fake::new();
+        let worktree = PathBuf::from("/projects/alder-work-al-1");
+        // A remove first drops Git's admin entry; its branch remains for the
+        // respawn to reuse while the abandoned files are swept away.
+        host.existing_branches
+            .borrow_mut()
+            .insert("work/al-1".to_owned());
+        host.strays.borrow_mut().insert(worktree.clone());
+
+        spawn(&host, "al-1", tier("terra").unwrap(), None).unwrap();
+
+        assert!(host.called("remove /projects/alder-work-al-1"));
+        assert!(host.called("git worktree add /projects/alder-work-al-1 work/al-1"));
+        assert!(!host.called("-b work/al-1"));
+        assert!(!host.strays.borrow().contains(&worktree));
+    }
+
+    #[test]
+    fn a_sweep_refuses_to_remove_a_path_outside_the_worktree_parent() {
+        let host = Fake::new();
+        let outside = PathBuf::from("/elsewhere/alder-work-al-1");
+        host.strays.borrow_mut().insert(outside.clone());
+
+        let error = sweep_unregistered_worktree(&host, Path::new("/projects"), &outside)
+            .expect_err("the sweep is constrained to the worktree parent");
+
+        assert!(error.message.contains("outside worktree parent"), "{error}");
+        assert!(!host.called("remove /elsewhere/alder-work-al-1"));
+        assert!(host.strays.borrow().contains(&outside));
+    }
+
+    #[test]
+    fn a_sweep_keeps_the_residue_when_git_cannot_list_its_registry() {
+        let host = Fake::new();
+        let worktree = PathBuf::from("/projects/alder-work-al-1");
+        host.strays.borrow_mut().insert(worktree.clone());
+        host.fail_git
+            .borrow_mut()
+            .insert("worktree list".to_owned());
+
+        let error = spawn(&host, "al-1", tier("terra").unwrap(), None)
+            .expect_err("the sweep must fail closed without Git's registry");
+
+        assert!(
+            error.message.contains("cannot list registered worktrees"),
+            "{error}"
+        );
+        assert!(!host.called("remove /projects/alder-work-al-1"));
+        assert!(host.strays.borrow().contains(&worktree));
+        assert!(!host.called("work start"));
     }
 
     #[test]
