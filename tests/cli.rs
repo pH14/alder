@@ -500,6 +500,40 @@ fn attempt_file_values_append_contents_not_local_paths() {
 }
 
 #[test]
+fn blank_evidence_file_names_the_file_valued_flag() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&[
+            "work",
+            "add",
+            "--title",
+            "Reject blank file evidence",
+            "--check",
+            "review:review is recorded",
+        ]),
+        "work_id",
+    );
+    let attempt = string(&project.success(&["work", "start", &work]), "attempt_id");
+    let evidence = project.work.join("blank-evidence.txt");
+    fs::write(&evidence, " \n\t").unwrap();
+
+    let failure = project.failure(&[
+        "attempt",
+        "edit",
+        &attempt,
+        "--satisfied",
+        "review",
+        "--evidence-file",
+        path(&evidence),
+    ]);
+    assert_eq!(failure["code"], "validation_failed");
+    assert_eq!(
+        failure["message"],
+        "--satisfied and --failed require --evidence-file"
+    );
+}
+
+#[test]
 fn observations_distinguish_presence_outage_and_missing_configuration() {
     let project = TestProject::new();
     let work = project.success(&["work", "add", "--title", "Observed work"]);

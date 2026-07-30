@@ -375,6 +375,12 @@ pub fn spawn(
     let brief = Brief::from_show(&host.alder(&["show", work_id])?)?;
     sweep_unregistered_worktree(host, worktree_parent, &worktree)?;
     let worktree_present = verify_worktree(host, &worktree, &branch)?;
+    // Worktrees outlive a driver process.  Put the current delivery adapter
+    // into an adopted checkout too, so a leader never has to fall back to
+    // hand-crafted tmux input merely because the checkout predates the helper.
+    if worktree_present {
+        install_relay(host, &worktree)?;
+    }
     let observed = host.tmux_session(&session)?;
     let open = current_attempt(host, work_id)?;
 
@@ -756,7 +762,7 @@ fn launch(
     // This tmux adapter is deliberately separate from that durable protocol:
     // another worker transport can read the same ruling from the log without
     // teaching the event model anything about tmux or a local path.
-    host.write_executable(&worktree.join(".alder/relay"), relay_script())?;
+    install_relay(host, worktree)?;
 
     let goal = launch.brief.goal(launch.attempt_id);
     let git_common_dir = git_common_dir(host);
@@ -790,14 +796,20 @@ fn launch(
     Ok(())
 }
 
+fn install_relay(host: &impl SpawnHost, worktree: &Path) -> Result<()> {
+    host.create_dir_all(&worktree.join(".alder"))?;
+    host.write_executable(&worktree.join(".alder/relay"), relay_script())
+}
+
 /// The tmux delivery adapter installed into every worker worktree.
 ///
 /// The file is local input to the leader's process. Its bytes are either
 /// loaded into a tmux buffer directly (an interactive worker), or encoded
 /// before a one-shot Codex shell reconstructs them as an argv value for the
 /// already-generated `.alder/resume` script. In neither route does the helper
-/// inspect the pane's input line: it waits for the session to show a working
-/// engine and for a later `attempt.updated` in the durable log.
+/// inspect the pane's input line.  It samples a working engine and a later
+/// `attempt.updated` immediately after delivery; a missing milestone is an
+/// explicit unconfirmed result, not a reason to wait or send the ruling again.
 fn relay_script() -> &'static str {
     r##"#!/bin/sh
 # Deliver a durable ruling to this worktree's tmux worker.
@@ -835,8 +847,9 @@ if [ ! -x "$alder" ]; then
 fi
 cd "$here/.."
 
-target="=$session"
-attempt_line=$(tmux show-environment -t "$target" ALDER_ATTEMPT 2>/dev/null || :)
+session_target="=$session"
+pane_target="$session"
+attempt_line=$(tmux show-environment -t "$session_target" ALDER_ATTEMPT 2>/dev/null || :)
 case "$attempt_line" in
   ALDER_ATTEMPT=*) attempt=${attempt_line#ALDER_ATTEMPT=} ;;
   *)
@@ -863,7 +876,7 @@ cleanup() {
 }
 trap cleanup 0 1 2 15
 
-engine=$(tmux show-environment -t "$target" ALDER_ENGINE 2>/dev/null || :)
+engine=$(tmux show-environment -t "$session_target" ALDER_ENGINE 2>/dev/null || :)
 if [ "$engine" != "ALDER_ENGINE=running" ]; then
   # A one-shot Codex worker is sitting at a shell. Encode the source file so
   # the text somebody else wrote never becomes shell syntax in that shell.
@@ -892,35 +905,36 @@ else
   # substitution can trim a newline or make its contents shell syntax.
   tmux load-buffer -b "$buffer" -- "$file"
 fi
-tmux paste-buffer -d -b "$buffer" -t "$target"
-tmux send-keys -t "$target" Enter
+# `-r` preserves LF as input bytes.  Without it tmux changes every line
+# break to CR, which submits multi-line reviewer text as separate prompts.
+tmux paste-buffer -d -r -b "$buffer" -t "$pane_target"
+tmux send-keys -t "$pane_target" Enter
 
 working_engine() {
-  marker=$(tmux show-environment -t "$target" ALDER_ENGINE 2>/dev/null || :)
+  marker=$(tmux show-environment -t "$session_target" ALDER_ENGINE 2>/dev/null || :)
   [ "$marker" = "ALDER_ENGINE=running" ] && return 0
   # A resumed Codex process has replaced the holding bash. This is the
   # observable engine signal when the original one-shot left ALDER_ENGINE
   # marked exited; do not read the pane's input line.
-  command=$(tmux display-message -p -t "$target" '#{pane_current_command}' 2>/dev/null || :)
+  command=$(tmux display-message -p -t "$pane_target" '#{pane_current_command}' 2>/dev/null || :)
   [ -n "$command" ] && [ "$command" != "bash" ] && [ "$command" != "sh" ]
 }
 
-deadline=$(( $(date +%s) + 60 ))
-while :; do
-  current=$("$alder" show "$attempt" --json)
-  updated=$(updated_seq "$current")
-  if [ -n "$updated" ] && [ "$updated" -gt "$before" ] \
-    && "$alder" debug log show "$updated" --json | grep -F '"type":"attempt.updated"' >/dev/null \
-    && working_engine; then
-    echo "relayed to $session; $attempt.updated at $updated"
-    exit 0
-  fi
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "relay is not yet confirmed: need a working engine and a fresh attempt.updated for $attempt" >&2
-    exit 75
-  fi
-  sleep 1
-done
+current=$("$alder" show "$attempt" --json)
+updated=$(updated_seq "$current")
+if [ -n "$updated" ] && [ "$updated" -gt "$before" ] \
+  && "$alder" debug log show "$updated" --json | grep -F '"type":"attempt.updated"' >/dev/null \
+  && working_engine; then
+  echo "relayed to $session; $attempt.updated at $updated"
+  exit 0
+fi
+
+# A milestone is meaningful progress, not a receipt that must arrive within
+# an arbitrary timeout.  The ruling was sent once; report that it is not yet
+# confirmed and let a later pass observe the durable milestone without typing
+# the same ruling into the worker a second time.
+echo "relay sent once but is not yet confirmed: need a working engine and a fresh attempt.updated for $attempt; do not resend this ruling" >&2
+exit 75
 "##
 }
 
@@ -1016,6 +1030,7 @@ mod tests {
         env, fs,
         os::unix::fs::PermissionsExt,
         process::Command,
+        time::Instant,
     };
 
     use chrono::Duration;
@@ -1435,7 +1450,7 @@ case "$1 $2" in
     else
       metadata='{}'
     fi
-    if [ -f "$RELAY_SHOW_COUNT" ]; then
+    if [ -f "$RELAY_SHOW_COUNT" ] && [ "$RELAY_NO_UPDATE" != "1" ]; then
       printf '{"current":{"updated_seq":4,"metadata":%s},"history":[{"seq":4,"type":"attempt.updated"}]}' "$metadata"
     else
       : > "$RELAY_SHOW_COUNT"
@@ -1493,9 +1508,12 @@ esac
             }),
             "relay did not give tmux the source file: {calls}"
         );
-        assert!(calls.contains("paste-buffer -d -b alder-relay-"), "{calls}");
         assert!(
-            calls.contains("send-keys -t =alder-work-hm Enter"),
+            calls.contains("paste-buffer -d -r -b alder-relay-"),
+            "{calls}"
+        );
+        assert!(
+            calls.contains("send-keys -t alder-work-hm Enter"),
             "{calls}"
         );
         assert!(
@@ -1544,6 +1562,45 @@ esac
         assert!(
             !calls.contains("must-not-run"),
             "Codex relay put reviewer text in a shell command: {calls}"
+        );
+        assert!(
+            calls.contains("display-message -p -t alder-work-hm #{pane_current_command}"),
+            "Codex engine inspection did not target the detached session pane: {calls}"
+        );
+
+        // A worker commonly records its next meaningful milestone later than
+        // relay returns. That is not a reason to spend a minute polling, or to
+        // paste the same ruling again: report an unconfirmed one-shot send.
+        fs::remove_file(&show_count).unwrap();
+        let before_unconfirmed = fs::read_to_string(&tmux_calls).unwrap();
+        let started = Instant::now();
+        let unconfirmed = Command::new(&relay)
+            .args(["alder-work-hm", finding.to_str().unwrap()])
+            .env("PATH", &relay_path)
+            .env("RELAY_SHOW_COUNT", &show_count)
+            .env("RELAY_TMUX_CALLS", &tmux_calls)
+            .env("RELAY_ENGINE", "running")
+            .env("RELAY_NO_UPDATE", "1")
+            .output()
+            .unwrap();
+        assert_eq!(unconfirmed.status.code(), Some(75));
+        assert!(
+            started.elapsed().as_secs() < 2,
+            "relay waited for a milestone instead of reporting one unconfirmed send"
+        );
+        assert!(String::from_utf8_lossy(&unconfirmed.stderr).contains("do not resend this ruling"));
+        let after_unconfirmed = fs::read_to_string(&tmux_calls).unwrap();
+        assert_eq!(
+            after_unconfirmed
+                .lines()
+                .filter(|call| call.starts_with("send-keys"))
+                .count(),
+            before_unconfirmed
+                .lines()
+                .filter(|call| call.starts_with("send-keys"))
+                .count()
+                + 1,
+            "an unconfirmed relay pasted the ruling more than once: {after_unconfirmed}"
         );
     }
 
@@ -1912,6 +1969,7 @@ esac
         assert!(!host.called("worktree add"));
         assert!(!host.called("tmux new-session"));
         assert!(!host.called("attempt edit"));
+        assert!(host.called("write /projects/alder-work-al-1/.alder/relay"));
     }
 
     #[test]

@@ -112,7 +112,7 @@ a defect.
 Run a Codex `sol` review in the branch worktree:
 
 ```sh
-codex review --base main --title "$(cat "$scratch/review-title-<id>.txt")" \
+codex review --base main --title "Cross-review work/<id>" \
   -c model=gpt-5.6-sol -c model_reasoning_effort=xhigh \
   -c approval_policy=never -c sandbox_mode=workspace-write
 ```
@@ -123,8 +123,9 @@ Each explicit setting is deliberate:
   reviewed the branch; omitting either runs whatever
   `~/.codex/config.toml` said that week while the log still calls it `sol`.
 - `--base main` makes the harness review the branch delta from its fork point.
-- `--title` gives the summary the work ID and title; it is display text, not a
-  prompt channel.
+- `--title` gives the summary a leader-authored work ID; it is display text,
+  not a prompt channel. Do not put an item title or other stored text in it:
+  this client has no ratified file-valued title argument.
 - `-c model=gpt-5.6-sol` pins the full review model. `codex review` has no
   `-m`; that flag belongs to `codex exec` and review rejects it with
   `error: unexpected argument '-m' found`.
@@ -165,19 +166,16 @@ worktree. This is a `claude` invocation, not a subagent, precisely because
 a subagent inherits the leader's session effort, which is nowhere in the log;
 otherwise `reviewed-by` could name a rung the review did not run at.
 
-```sh
-claude -p --model claude-fable-5 --effort xhigh --permission-mode auto \
-  "$(cat "$scratch/review-prompt-<id>.txt")"
-```
-
-The prompt file holds the brief—never inline item-controlled text into the
-command, for the same quoting reason as the verdict below. `$scratch` is
-outside the worktree, so nothing written there can be committed onto the branch
-under review. The title leads because it is the one requested-change description
-that is always present: a spec is optional in v0 (`docs/v0/MODEL.md`), and
-`Brief::goal` falls back to the title for exactly that reason. A reviewer given
-an empty spec and check keys can judge code, but not whether it is the requested
-change.
+Claude's one-shot `-p` currently takes its prompt as argv; it has no ratified
+file-valued input. Do not turn a local review-prompt file into a command
+substitution here. This route is an explicitly remaining surface in PASS.md:
+it needs a ratified external-client adapter before it can carry item-controlled
+brief text. `$scratch` may still hold the proposed brief outside the worktree,
+but that fact does not make an argv interpolation safe. The title leads in that
+brief because it is the one requested-change description that is always present:
+a spec is optional in v0 (`docs/v0/MODEL.md`), and `Brief::goal` falls back to
+the title for exactly that reason. A reviewer given an empty spec and check
+keys can judge code, but not whether it is the requested change.
 
 ```text
 Review work/<id> against main: git diff main...work/<id>.
@@ -209,6 +207,11 @@ only 2.5 CPU seconds and never produced a verdict. If output has not grown for
 25 minutes and the review has gained only a few CPU seconds, kill it, record
 the abandonment, and end the pass. Do not keep a pass open waiting for a run
 that cannot be distinguished from a wedge.
+
+That heuristic is for the streaming Codex route. A `claude -p` review buffers
+its output until exit and can sit near zero CPU while thinking, so silence plus
+low CPU is not a wedge signal there. On that route, watch the session
+transcript's growth instead.
 
 In a review sandbox, the real-tmux host test cannot create its private Unix
 socket. A transcript failure shaped like `error: test failed … --test
@@ -245,10 +248,10 @@ Record a non-clean review before relaying it:
 
 ```sh
 alder attempt edit <attempt> --failed cross-review \
-  --evidence "$(cat "$scratch/cross-review-<id>.txt")" \
+  --evidence-file <local-findings-file> \
   --meta reviewed-by=gpt-5.6-sol \
-  --meta reviewed-sha="$(git rev-parse work/<id>)" \
-  --meta reviewed-base="$(git merge-base main work/<id>)" \
+  --meta reviewed-sha=<reviewed-sha> \
+  --meta reviewed-base=<reviewed-base> \
   --meta reviewed-effort=xhigh
 ```
 
@@ -259,6 +262,13 @@ metadata keys—`reviewed-by`, `reviewed-sha`, `reviewed-base`, and
 the exact two endpoints. Rounds are successive reviews of fresh endpoints;
 their later evidence and metadata supersede the earlier round rather than
 pretending an earlier green check covers new code.
+
+`--evidence-file` reads the local file now and carries its contents in the
+event; delete the file and the review record remains whole. `--meta` has no
+file-valued form. Obtain each endpoint with the commands below, then supply
+the resulting SHA as its literal placeholder value—not a command substitution.
+That remaining argv surface is named in PASS.md and needs separate
+ratification to change.
 
 Findings first, feedback second: a review that only sends keys and appends
 nothing disappears after a rotation or crash, leaving a reviewed branch
@@ -302,16 +312,18 @@ Declare `cross-review` at admission, with the other checks:
 
 ```sh
 alder work add --handoff <handoff> --priority <n> \
-  --check "$(cat "$scratch/check-<key>.txt")" \
+  --check <leader-authored-key:description> \
   --check cross-review:"reviewed by the other vendor's ladder; the leader records this one, not the worker"
 ```
 
-Repeat the first form once per handoff-proposed check; those descriptions are
-submitter text and arrive through files, while this document's `cross-review`
-description may be inline. `work add` takes `--check`; `--add-check` is
-`work edit`'s flag and does not exist on add (`src/cli.rs`), so using it here
-fails admission outright. Admission is the only time to declare it because a
-check or dependency cannot change while an attempt is active:
+Repeat the first form once per leader-authored check. A handoff-proposed check
+description is submitter text and `--check` has no ratified file-valued form:
+do not recover the old command-substitution template. Leave that description
+behind a durable pointer or obtain a separate operator ruling before admission.
+`work add` takes `--check`; `--add-check` is `work edit`'s flag and does not
+exist on add (`src/cli.rs`), so using it here fails admission outright.
+Admission is the only time to declare it because a check or dependency cannot
+change while an attempt is active:
 
 ```text
 $ alder work edit al-zptgbz --add-check cross-review:"…"
@@ -332,32 +344,36 @@ Every item admitted before this rule has no `cross-review` check, including the
 one that introduced it, and no check result can be appended to it:
 
 ```text
-$ alder attempt edit al-zptgbz-attempt-1 --failed cross-review --evidence "…"
+$ alder attempt edit al-zptgbz-attempt-1 --failed cross-review --evidence-file <local-findings-file>
 error [unknown_check]: attempt `al-zptgbz-attempt-1` has no check named
   `cross-review`
 ```
 
 Do not end its attempt to add one. Review the branch anyway. Put the durable
-result in metadata—not its single-valued note, which a worker milestone
-overwrites:
+findings into the log first with the ratified note file flag. Its returned
+event sequence is a durable pointer even when a later worker note replaces the
+folded current note:
 
 ```sh
+alder attempt edit <attempt> --note-file <local-findings-file>
+# Read the returned `head` and use that literal event sequence below.
 alder attempt edit <attempt> \
   --meta reviewed-by=gpt-5.6-sol \
-  --meta reviewed-sha="$(git rev-parse work/<id>)" \
-  --meta reviewed-base="$(git merge-base main work/<id>)" \
+  --meta reviewed-sha=<reviewed-sha> \
+  --meta reviewed-base=<reviewed-base> \
   --meta reviewed-effort=xhigh \
   --meta cross-review=failed \
-  --meta cross-review-findings="$(cat "$scratch/cross-review-<id>.txt")"
+  --meta cross-review-findings=<findings-event-seq>
 ```
 
 For a legacy item, `cross-review=<verdict>` earns its place: without a check
-to hold status, metadata is the only persistent field for its verdict and
-findings. Metadata—not a note—is necessary. A note is single-valued, so the
-next worker milestone silently replaces a parked verdict; metadata merges
-instead (`attempt.metadata.extend(...)` versus
-`attempt.note = Some(note)` in `src/domain/state.rs`). A later round
-overwrites its own keys, which is the level-triggered behaviour wanted here.
+to hold status, metadata is the only persistent field for its verdict and the
+event-sequence pointer. The finding text is durable in that earlier note event;
+the folded note may change, which is exactly why the metadata points to the
+event rather than copying submitter text into `--meta`. Metadata merges instead
+(`attempt.metadata.extend(...)` versus `attempt.note = Some(note)` in
+`src/domain/state.rs`). A later round overwrites its own keys, which is the
+level-triggered behaviour wanted here.
 
 Finish a legacy item on the checks it actually carries. The missing gate is
 held by reading this durable metadata rather than by `work finish` refusing;
@@ -384,8 +400,9 @@ Compaction pays a full-context read at author tier and preserves laundered
 memory. The spec, checks, branch, commit messages, findings, and rulings must
 let a fresh worker proceed; if they do not, repair the durable record rather
 than the process. The narrow exception is an original session that is still
-alive and has only trivial findings, where a quoted `send-keys` nudge is
-cheaper than a spawn. Decisions worth keeping must therefore be committed:
+alive and has only trivial findings: record them first, then use its
+`.alder/relay <session> <local-findings-file>` adapter—never a quoted
+`send-keys` nudge. Decisions worth keeping must therefore be committed:
 explain them in commit messages and attempt notes, and put binding spec rulings
 in `work edit`, so a fresh worker does not re-litigate them.
 

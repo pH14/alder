@@ -40,21 +40,35 @@ For a tmux worker, record the ruling first, then call that worktree's
 `.alder/relay <session> <file>`. The helper owns literal tmux delivery and any
 Codex resume mechanics; leaders do not recreate a `send-keys`, command
 substitution, or quoted resume command. It confirms delivery only after both a
-working engine and a fresh `attempt.updated`, never by inspecting a pane's
-input line. For a resumed Codex worker, the strongest engine signal is the
-process table showing the session UUID and the delivered file's contents in
-that process's argv.
+working engine and a fresh `attempt.updated` in its post-delivery sample,
+never by inspecting a pane's input line. For a resumed Codex worker, the
+strongest engine signal is the process table showing the session UUID and the
+delivered file's contents in that process's argv.
+
+A successful exit is that confirmation. Exit 75 means the helper sent the
+ruling once but has not yet seen both signals. A milestone is not expected on
+every poll, so the helper neither waits for an invented 60-second deadline nor
+replays the ruling. Do not run it again merely because it returned 75; later
+passes observe the worker's durable progress. A crash between send and
+confirmation still has no durable receipt, so it cannot be mechanically
+distinguished from a pre-send crash. That is the delivery-receipt gap recorded
+on `al-q8qwhy`, not a licence to type the same ruling twice.
 
 The helper is a tmux adapter, not the delivery concept. The ruling is durable
 in the log before transport, so a future cloud worker can pull it from there
 without a new event or a shared filesystem.
 
-One unratified surface genuinely remains: `--meta KEY=VALUE`. In particular,
-the cross-review `reviewed-sha` and `reviewed-base` values still cannot come
-from files, and legacy review findings have no safe file-valued metadata form.
-The permission classifier has already rejected the manual's command-substituted
-SHA template. Do not add `--meta-file` or revive a shell recipe here; extending
-that CLI surface needs its own operator ruling.
+The ratified surface is deliberately narrow. These text-bearing surfaces still
+lack a file-valued form: `--meta KEY=VALUE` (including reviewed endpoints and
+legacy findings), `question answer`, `work ask`, `work edit --spec/--why`,
+`pass end --report`, and `work add/edit --check` descriptions. External review
+clients' title/prompt arguments are likewise outside this adapter. The
+cross-review manual identifies the affected legacy paths instead of disguising
+them with command substitutions. Do not add `--meta-file` or another flag, or
+revive a shell recipe, without its own operator ruling. For now only
+leader-authored, fixed text belongs in those remaining argv surfaces; text
+someone else supplied needs a durable pointer, an existing ratified file flag,
+or an authority decision.
 
 ## The pass
 
@@ -82,11 +96,13 @@ that CLI surface needs its own operator ruling.
    launch-pinned model, effort, sandbox, and exact `codex-session` UUID. Do
    not hand-write a resume command or infer a session with `--last`.
 
-   The helper waits for a working engine plus a fresh `attempt.updated`; a
-   successful exit is the delivery confirmation. It never reads ghost text or
-   sends a speculative bare `Enter`. If it cannot confirm delivery, do not
-   unblock this pass: the ruling remains recoverable from the log and the next
-   pass can retry the adapter or respawn the worker.
+   A successful helper exit confirms a working engine plus a fresh
+   `attempt.updated`. It never reads ghost text or sends a speculative bare
+   `Enter`. Exit 75 says it sent once but has not yet confirmed those signals:
+   do not unblock this pass on that result and do not retry the adapter merely
+   because the milestone is late. The ruling remains recoverable from the log;
+   a later pass observes the milestone, while the pre-send/post-send crash
+   ambiguity remains the explicitly named `al-q8qwhy` receipt gap.
 
    Only after confirmation, unblock with a repository-authored reason such as
    `alder work unblock <work> --why "answered question relayed"`. A tmux pane
@@ -96,10 +112,11 @@ that CLI surface needs its own operator ruling.
    A worker with no live session gets a fresh spawn instead — and a fresh
    spawn is launched on the *item*, not on the Q&A, which is why an answer
    that amounts to a ruling has to be folded into the item to survive. When an
-   answer amounts to a spec ruling, fold the resulting, leader-authored
-   requirement into the item with `alder work edit --spec --why` so it outlives
-   the Q&A and survives a respawn; do not copy raw answer text into an argv
-   value. A ruling that needs a whole new *check* cannot be folded into a
+   answer amounts to a spec ruling, the question remains the canonical raw
+   ruling; identify its question ID in a concise, leader-authored requirement
+   folded into the item with `alder work edit --spec --why`. Do not replace the
+   ruling with a paraphrase or copy raw answer text into an argv value. A
+   ruling that needs a whole new *check* cannot be folded into a
    running item — checks cannot change while an attempt is active — so it waits
    for the attempt to end and lands with the respawn, or it stays in the spec.
 5. **Review finished workers.** A worker is finished when its attempt says
@@ -131,8 +148,9 @@ that CLI surface needs its own operator ruling.
      (`git worktree remove ../alder-work-<id>`) and delete the branch.
    - If findings need a live worker, first record them with
      `--evidence-file`, then hand the same local file to that worker's
-     `.alder/relay`. Do not inline them or reimplement delivery; leave the
-     item in flight until the helper confirms the fresh `attempt.updated`.
+   `.alder/relay`. Do not inline them or reimplement delivery. Leave the item
+   in flight until the helper confirms the fresh `attempt.updated`; an
+   unconfirmed send is not an invitation to replay it.
 6. **Drain handoffs.** Admit each coherent submitted handoff
    (`alder work add --handoff <id>` with real priority/checks). Workers
    cannot admit work; you are the only gate.

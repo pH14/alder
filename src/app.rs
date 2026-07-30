@@ -1616,9 +1616,16 @@ fn parse_check_results(
         }
         return Ok(Vec::new());
     }
+    let evidence_flag = if evidence_file.is_some() {
+        "--evidence-file"
+    } else {
+        "--evidence"
+    };
     let evidence = read_text_file(evidence, evidence_file, "--evidence-file")?
         .filter(|evidence| !evidence.trim().is_empty())
-        .ok_or_else(|| AlderError::validation("--satisfied and --failed require --evidence"))?;
+        .ok_or_else(|| {
+            AlderError::validation(format!("--satisfied and --failed require {evidence_flag}"))
+        })?;
     let mut seen = BTreeSet::new();
     let mut updates = Vec::new();
     for (keys, status) in [

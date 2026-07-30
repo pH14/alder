@@ -66,8 +66,10 @@ Three rules make that ordering worth having:
   observable. Spawn writes `<worktree>/.alder/relay <session> <file>` for
   literal delivery of a ruling already recorded in the log. The adapter reads
   the leader-local file, confirms a working engine plus a fresh
-  `attempt.updated`, and never treats pane input as an acknowledgement. For a
-  Codex holding shell it uses the private `<worktree>/.alder/resume` script;
+  `attempt.updated` in its post-delivery sample, and never treats pane input
+  as an acknowledgement. An exit 75 is one unconfirmed send, not a timeout or
+  a prompt to replay the ruling; milestones are not expected on every poll.
+  For a Codex holding shell it uses the private `<worktree>/.alder/resume` script;
   leaders never type that command themselves. It exists because `codex exec
   resume` inherits *nothing* from the session it resumes: no model, effort, or
   sandbox. The generated script repeats the launch exactly, and requires the
