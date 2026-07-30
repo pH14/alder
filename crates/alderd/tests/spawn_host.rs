@@ -3,8 +3,9 @@
 //!
 //! The unit tests in `spawn.rs` prove the ordering rules against a fake host.
 //! This proves the parts only the world can answer: that a pane really does
-//! receive the goal as one argv element, that it really does outlive a
-//! one-shot engine, and that a worktree really is cut and carries `alder`.
+//! receive the goal as one argv element, that identity exists at pane
+//! creation, that a live engine is refused, that its exited pane is adopted,
+//! and that a worktree really is cut and carries `alder`.
 //!
 //! The sandbox is the one `host_tmux.rs` documents at length: a `tmux` shim
 //! first on PATH that unsets `TMUX`/`TMUX_PANE` and hands the real tmux an
@@ -84,8 +85,8 @@ fn spawn_runs_against_a_private_tmux_server_and_a_throwaway_repo() {
         "#!/bin/sh\nshift\nexec \"$@\"\n",
     );
     // The log is reached only through this: alderd runs `alder`, never a
-    // library. It records what it was asked and answers the four documents a
-    // spawn reads.
+    // library. It records what it was asked and keeps just enough state for a
+    // second spawn to observe the attempt the first one bound.
     write_executable(
         &bin.path().join("alder"),
         &format!(
@@ -95,10 +96,21 @@ case "$1 $2" in
   "show {WORK}")
     printf '%s' '{{"current":{{"id":"{WORK}","title":"Sandbox item","spec":"docs/S.md","checks":[{{"key":"k","description":"the check reaches the worker"}}]}}}}' ;;
   "status --section")
-    printf '%s' '{{"in_flight":[]}}' ;;
+    if [ -f '{bound}' ]; then
+      printf '%s' '{{"in_flight":[{{"id":"{WORK}-attempt-1","work_id":"{WORK}","handle":"tmux:alder-work-{WORK}"}}]}}'
+    elif [ -f '{started}' ]; then
+      printf '%s' '{{"in_flight":[{{"id":"{WORK}-attempt-1","work_id":"{WORK}","handle":null}}]}}'
+    else
+      printf '%s' '{{"in_flight":[]}}'
+    fi ;;
   "work start")
+    : >'{started}'
     printf '%s' '{{"attempt_id":"{WORK}-attempt-1"}}' ;;
-  "attempt edit"|"attempt end")
+  "attempt edit")
+    : >'{bound}'
+    printf '%s' '{{"ok":true}}' ;;
+  "attempt end")
+    rm -f '{started}' '{bound}'
     printf '%s' '{{"ok":true}}' ;;
   *)
     printf '%s' '{{"code":"unknown","message":"the fake alder was asked for something a spawn does not ask for"}}'
@@ -106,6 +118,8 @@ case "$1 $2" in
 esac
 "#,
             log = work.path().join("alder-calls.log").display(),
+            started = work.path().join("attempt-started").display(),
+            bound = work.path().join("attempt-bound").display(),
         ),
     );
 
@@ -204,16 +218,18 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "-qm", "sandbox"]);
 
-    // The engine stub records the argv it was handed, one line per argument,
-    // and then exits. What happens after it exits is the point.
+    // The engine stub records the argv it was handed, then stays live until
+    // the test releases it. That makes both sides of the repair distinction
+    // observable without timing guesses.
     let argv = work.join("engine-argv");
     let argc = work.join("engine-argc");
     let stub = write_executable(
         &work.join("engine.sh"),
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$#\" >'{argc}'\nprintf '%s\\n' \"$@\" >'{argv}.part' && mv '{argv}.part' '{argv}'\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$#\" >'{argc}'\nprintf '%s\\n' \"$@\" >'{argv}.part' && mv '{argv}.part' '{argv}'\nwhile [ ! -f '{release}' ]; do sleep 0.05; done\n",
             argc = argc.display(),
-            argv = argv.display()
+            argv = argv.display(),
+            release = work.join("release-engine").display(),
         ),
     );
 
@@ -258,16 +274,47 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         assert!(goal.contains(part), "the goal omits `{part}`: {goal}");
     }
 
-    // The pane outlives the engine, so the handle stays observable and a
-    // ruling can be relayed into it afterwards. The engine has written its
-    // argv and exited; a pane that did not end in a shell takes the session
-    // with it, and tmux is not slow about that, so settling for half a second
-    // is what makes this an assertion rather than a race.
-    thread::sleep(Duration::from_millis(500));
+    // Both identity and live state are present on the session from the
+    // new-session effect itself.
+    assert_eq!(
+        session_environment(&session, "ALDER_ATTEMPT").as_deref(),
+        Some("wv-1-attempt-1")
+    );
+    assert_eq!(
+        session_environment(&session, "ALDER_ENGINE").as_deref(),
+        Some("running")
+    );
+
+    // A second spawn while the bound engine is live is genuinely refused.
+    let refused = spawn::spawn(
+        &host,
+        WORK,
+        tier::tier("luna").expect("luna is a rung"),
+        Some(&stub.display().to_string()),
+    )
+    .expect_err("a second live worker is refused");
+    assert!(refused.message.contains("already running"), "{refused}");
+
+    // Once the engine exits, its pane remains and is adopted without another
+    // attempt, worktree, or session.
+    fs::write(work.join("release-engine"), "go").expect("the engine is released");
+    await_true(
+        || session_environment(&session, "ALDER_ENGINE").as_deref() == Some("exited"),
+        "the session records that its engine exited",
+    );
     assert!(
         session_exists(&session),
         "the session died with the engine; the pane does not end `; exec bash`"
     );
+    let adopted = spawn::spawn(
+        &host,
+        WORK,
+        tier::tier("luna").expect("luna is a rung"),
+        Some(&stub.display().to_string()),
+    )
+    .expect("the exited pane is adopted");
+    assert_eq!(adopted.attempt_id, "wv-1-attempt-1");
+    assert!(adopted.adopted);
 
     // The worktree is real, on its own branch, carrying alder and nothing that
     // would let a worker dispatch.
@@ -372,15 +419,14 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         "the pane command does not end in a shell: {tmux_calls}"
     );
 
-    // A second spawn at a live session is refused before it touches anything.
-    let refused = spawn::spawn(
-        &host,
-        WORK,
-        tier::tier("luna").expect("luna is a rung"),
-        Some(&stub.display().to_string()),
-    )
-    .expect_err("a second worker is refused");
-    assert!(refused.message.contains("already exists"), "{refused}");
+    assert_eq!(
+        tmux_calls
+            .lines()
+            .filter(|call| call.starts_with("new-session"))
+            .count(),
+        1,
+        "adoption launched another pane: {tmux_calls}"
+    );
 
     kill_session(&session);
     await_true(|| !session_exists(&session), "the session goes away");
@@ -417,6 +463,20 @@ fn kill_session(session: &str) {
     let _ = Command::new("tmux")
         .args(["kill-session", "-t", &format!("={session}")])
         .output();
+}
+
+fn session_environment(session: &str, name: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .args(["show-environment", "-t", &format!("={session}"), name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .strip_prefix(&format!("{name}="))
+        .map(str::to_owned)
 }
 
 fn temp_dir(prefix: &str) -> TempDir {

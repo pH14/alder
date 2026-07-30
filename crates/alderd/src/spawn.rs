@@ -18,10 +18,10 @@
 //! handle stays observable, `reconcile` stays truthful, and a ruling can be
 //! relayed into the pane afterwards.
 //!
-//! **An attempt is never left phantom.** Everything that can fail before the
-//! attempt exists — an unknown item, a session or worktree already there —
-//! fails first, with nothing created. After the attempt exists, any failure
-//! ends it with the error as its reason and undoes what this run made.
+//! **Repair adopts its own residue.** Each effect says enough about its
+//! identity for the next run to converge: a worktree is accepted only on the
+//! expected branch, a session is stamped with its attempt as it is created,
+//! and an open unbound attempt is reused rather than doubled.
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +42,18 @@ pub const GATES: &str = "cargo fmt --check, cargo clippy --workspace --all-targe
 /// a model. The goal is still appended as the final argument.
 pub const WORKER_CMD_ENV: &str = "ALDER_WORKER_CMD";
 
+pub(crate) const ATTEMPT_ENV: &str = "ALDER_ATTEMPT";
+pub(crate) const ENGINE_ENV: &str = "ALDER_ENGINE";
+pub(crate) const ENGINE_RUNNING: &str = "running";
+pub(crate) const ENGINE_EXITED: &str = "exited";
+
+/// The identity and engine state observable on an existing tmux session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedSession {
+    pub attempt_id: Option<String>,
+    pub engine_live: bool,
+}
+
 /// Everything the spawn does to the world.
 ///
 /// It is a trait for the same reason the driver's [`crate::effects::Effects`]
@@ -57,9 +69,14 @@ pub trait SpawnHost {
     /// Run `git <args>` in the project root. An error means git could not be
     /// run at all; a git command that ran and failed comes back as `Run`.
     fn git(&self, args: &[&str]) -> Result<Run>;
-    fn tmux_session_exists(&self, session: &str) -> Result<bool>;
-    fn tmux_new_session(&self, session: &str, cwd: &Path, command: &str) -> Result<()>;
-    fn tmux_set_environment(&self, session: &str, name: &str, value: &str) -> Result<()>;
+    fn tmux_session(&self, session: &str) -> Result<Option<ObservedSession>>;
+    fn tmux_new_session(
+        &self,
+        session: &str,
+        cwd: &Path,
+        command: &str,
+        attempt_id: &str,
+    ) -> Result<()>;
     fn tmux_kill_session(&self, session: &str) -> Result<()>;
     fn path_exists(&self, path: &Path) -> bool;
     fn create_dir_all(&self, path: &Path) -> Result<()>;
@@ -233,7 +250,7 @@ fn text(value: &Value, key: &str) -> Option<String> {
 /// is quoted, so the goal reaches the engine as one argument however it is
 /// spelled, and `exec bash` replaces the engine when it exits so the session —
 /// and therefore the handle — survives a one-shot run.
-pub fn pane_command(engine: &[String], goal: &str) -> String {
+pub fn pane_command(engine: &[String], goal: &str, session: &str) -> String {
     let mut words = vec!["caffeinate".to_owned(), "-i".to_owned()];
     words.extend(engine.iter().cloned());
     words.push(goal.to_owned());
@@ -241,7 +258,11 @@ pub fn pane_command(engine: &[String], goal: &str) -> String {
         .iter()
         .map(|word| crate::effects::quote(word))
         .collect();
-    format!("{}; exec bash", quoted.join(" "))
+    let target = crate::effects::quote(&format!("={session}"));
+    format!(
+        "{}; tmux set-environment -t {target} {ENGINE_ENV} {ENGINE_EXITED}; exec bash",
+        quoted.join(" ")
+    )
 }
 
 /// The engine invocation, before the goal is appended: the tier's own command,
@@ -303,32 +324,142 @@ pub fn spawn(
         })?
         .join(format!("alder-work-{work_id}"));
 
-    // Everything that can be known before anything is created, is. An unknown
-    // item, a session that is already there, or a worktree left over from a
-    // previous run must fail with no attempt recorded and nothing to clean up.
-    if host.tmux_session_exists(&session)? {
-        return Err(DriverError::new(format!(
-            "session `{session}` already exists"
-        )));
-    }
-    if host.path_exists(&worktree) {
-        return Err(DriverError::new(format!(
-            "worktree `{}` already exists",
-            worktree.display()
-        )));
-    }
     let brief = Brief::from_show(&host.alder(&["show", work_id])?)?;
+    let worktree_present = verify_worktree(host, &worktree, &branch)?;
+    let observed = host.tmux_session(&session)?;
+    let open = current_attempt(host, work_id)?;
 
-    let (attempt_id, adopted) = attempt_for(host, work_id)?;
+    if let Some(open) = open {
+        if let Some(handle) = &open.handle {
+            let expected_handle = format!("tmux:{session}");
+            if handle != &expected_handle {
+                return Err(DriverError::new(format!(
+                    "`{work_id}` already has attempt {} bound to `{handle}`",
+                    open.id
+                )));
+            }
+            let observed = observed.ok_or_else(|| {
+                DriverError::new(format!(
+                    "`{work_id}` has attempt {} bound to `{handle}`, but that session is gone",
+                    open.id
+                ))
+            })?;
+            verify_session_identity(&session, &observed, &open.id)?;
+            if observed.engine_live {
+                return Err(DriverError::new(format!(
+                    "session `{session}` is already running attempt {}",
+                    open.id
+                )));
+            }
+            if !worktree_present {
+                return Err(DriverError::new(format!(
+                    "session `{session}` holds attempt {}, but worktree `{}` is gone",
+                    open.id,
+                    worktree.display()
+                )));
+            }
+            host.log(&format!(
+                "adopting the exited pane {session} already bound to {}",
+                open.id
+            ));
+            return Ok(spawned(
+                work_id, open.id, tier, session, branch, worktree, true,
+            ));
+        }
 
-    // From here the attempt exists, so every exit runs through the same
-    // undo: kill what was started, remove what was cut, and end the attempt
-    // with the error as its reason.
+        host.log(&format!(
+            "adopting the open unbound attempt {} on {work_id}",
+            open.id
+        ));
+        if let Some(observed) = observed {
+            if observed.attempt_id.as_deref() == Some(open.id.as_str()) {
+                if !worktree_present {
+                    return Err(DriverError::new(format!(
+                        "session `{session}` holds attempt {}, but worktree `{}` is gone",
+                        open.id,
+                        worktree.display()
+                    )));
+                }
+                host.log(&format!(
+                    "adopting the session {session} left before attempt {} was bound",
+                    open.id
+                ));
+                bind_attempt(host, &open.id, &session, tier)?;
+                return Ok(spawned(
+                    work_id, open.id, tier, session, branch, worktree, true,
+                ));
+            }
+            if observed.engine_live {
+                return Err(running_session_error(&session, &observed));
+            }
+            host.log(&format!(
+                "replacing the exited pane {session}, which is not attempt {}",
+                open.id
+            ));
+            host.tmux_kill_session(&session)?;
+        }
+        return launch_attempt(
+            host,
+            &brief,
+            open.id,
+            true,
+            worktree_present,
+            tier,
+            override_command,
+            session,
+            branch,
+            worktree,
+        );
+    }
+
+    if let Some(observed) = observed {
+        if observed.engine_live {
+            return Err(running_session_error(&session, &observed));
+        }
+        host.log(&format!(
+            "replacing the exited pane {session}, which has no open attempt"
+        ));
+        host.tmux_kill_session(&session)?;
+    }
+
+    let started = host.alder(&["work", "start", work_id])?;
+    let attempt_id = started
+        .get("attempt_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DriverError::new("`alder work start` reported no attempt ID"))?
+        .to_owned();
+    launch_attempt(
+        host,
+        &brief,
+        attempt_id,
+        false,
+        worktree_present,
+        tier,
+        override_command,
+        session,
+        branch,
+        worktree,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attempt(
+    host: &impl SpawnHost,
+    brief: &Brief,
+    attempt_id: String,
+    adopted: bool,
+    worktree_present: bool,
+    tier: &'static Tier,
+    override_command: Option<&str>,
+    session: String,
+    branch: String,
+    worktree: PathBuf,
+) -> Result<Spawned> {
     let mut made = Made::default();
     let launched = launch(
         host,
         &Launch {
-            brief: &brief,
+            brief,
             attempt_id: &attempt_id,
             tier,
             override_command,
@@ -336,20 +467,13 @@ pub fn spawn(
             branch: &branch,
             worktree: &worktree,
         },
+        worktree_present,
         &mut made,
     );
     match launched {
-        Ok(()) => Ok(Spawned {
-            work_id: work_id.to_owned(),
-            attempt_id,
-            tier: tier.name,
-            model: tier.model,
-            effort: tier.effort,
-            session,
-            branch,
-            worktree,
-            adopted,
-        }),
+        Ok(()) => Ok(spawned(
+            &brief.id, attempt_id, tier, session, branch, worktree, adopted,
+        )),
         Err(error) => {
             undo(host, &made, &session, &worktree);
             end_attempt(host, &attempt_id, &error);
@@ -358,36 +482,34 @@ pub fn spawn(
     }
 }
 
-/// The attempt this dispatch runs under, and whether it was already there.
-///
-/// An open attempt with no handle is not a running worker: it is a `work
-/// start` from a phone, or a crash between recording the attempt and
-/// launching it. Adopting it is what makes `reconcile`'s suggestion to spawn
-/// truthful. An open attempt that *is* bound has a session somewhere, and
-/// launching a second worker on the same branch is never the repair.
-fn attempt_for(host: &impl SpawnHost, work_id: &str) -> Result<(String, bool)> {
-    let in_flight = host.alder(&["status", "--section", "in_flight"])?;
-    if let Some(open) = open_attempt(&in_flight, work_id) {
-        if let Some(handle) = open.handle {
-            return Err(DriverError::new(format!(
-                "`{work_id}` already has attempt {} bound to `{handle}`",
-                open.id
-            )));
-        }
-        host.log(&format!(
-            "adopting the open unbound attempt {} on {work_id}",
-            open.id
-        ));
-        return Ok((open.id, true));
+fn spawned(
+    work_id: &str,
+    attempt_id: String,
+    tier: &'static Tier,
+    session: String,
+    branch: String,
+    worktree: PathBuf,
+    adopted: bool,
+) -> Spawned {
+    Spawned {
+        work_id: work_id.to_owned(),
+        attempt_id,
+        tier: tier.name,
+        model: tier.model,
+        effort: tier.effort,
+        session,
+        branch,
+        worktree,
+        adopted,
     }
-    let started = host.alder(&["work", "start", work_id])?;
-    let attempt_id = started
-        .get("attempt_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| DriverError::new("`alder work start` reported no attempt ID"))?;
-    Ok((attempt_id.to_owned(), false))
 }
 
+fn current_attempt(host: &impl SpawnHost, work_id: &str) -> Result<Option<OpenAttempt>> {
+    let in_flight = host.alder(&["status", "--section", "in_flight"])?;
+    Ok(open_attempt(&in_flight, work_id))
+}
+
+#[derive(Debug)]
 struct OpenAttempt {
     id: String,
     handle: Option<String>,
@@ -409,6 +531,56 @@ fn open_attempt(document: &Value, work_id: &str) -> Option<OpenAttempt> {
         })
 }
 
+fn verify_worktree(host: &impl SpawnHost, worktree: &Path, branch: &str) -> Result<bool> {
+    if !host.path_exists(worktree) {
+        return Ok(false);
+    }
+    let path = worktree.display().to_string();
+    let run = host.git(&["-C", &path, "symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    if !run.ok {
+        return Err(DriverError::new(format!(
+            "cannot adopt worktree `{path}`: {}",
+            first_line(&run.stderr)
+        )));
+    }
+    let actual = run.stdout.trim();
+    if actual != branch {
+        return Err(DriverError::new(format!(
+            "cannot adopt worktree `{path}`: it is on branch `{actual}`, expected `{branch}`"
+        )));
+    }
+    host.log(&format!(
+        "adopting the existing worktree {path} on {branch}"
+    ));
+    Ok(true)
+}
+
+fn verify_session_identity(
+    session: &str,
+    observed: &ObservedSession,
+    attempt_id: &str,
+) -> Result<()> {
+    if let Some(actual) = observed.attempt_id.as_deref()
+        && actual != attempt_id
+    {
+        return Err(DriverError::new(format!(
+            "session `{session}` belongs to attempt `{actual}`, not `{attempt_id}`"
+        )));
+    }
+    Ok(())
+}
+
+fn running_session_error(session: &str, observed: &ObservedSession) -> DriverError {
+    match observed.attempt_id.as_deref() {
+        Some(attempt_id) => DriverError::new(format!(
+            "session `{session}` is already running attempt {attempt_id}"
+        )),
+        None => DriverError::new(format!(
+            "session `{session}` already has a live engine with no attempt identity"
+        )),
+    }
+}
+
 struct Launch<'a> {
     brief: &'a Brief,
     attempt_id: &'a str,
@@ -425,45 +597,52 @@ struct Made {
     session: bool,
 }
 
-fn launch(host: &impl SpawnHost, launch: &Launch<'_>, made: &mut Made) -> Result<()> {
+fn launch(
+    host: &impl SpawnHost,
+    launch: &Launch<'_>,
+    worktree_present: bool,
+    made: &mut Made,
+) -> Result<()> {
     let worktree = launch.worktree;
-    let branch_exists = host
-        .git(&[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{}", launch.branch),
-        ])?
-        .ok;
-    // A respawn keeps the branch it already has; a first launch cuts one from
-    // main. Either way the worktree is new.
-    let add: Vec<String> = if branch_exists {
-        host.log(&format!("reusing the existing branch {}", launch.branch));
-        vec![
-            "worktree".to_owned(),
-            "add".to_owned(),
-            worktree.display().to_string(),
-            launch.branch.to_owned(),
-        ]
-    } else {
-        vec![
-            "worktree".to_owned(),
-            "add".to_owned(),
-            worktree.display().to_string(),
-            "-b".to_owned(),
-            launch.branch.to_owned(),
-            "main".to_owned(),
-        ]
-    };
-    let add: Vec<&str> = add.iter().map(String::as_str).collect();
-    let added = host.git(&add)?;
-    if !added.ok {
-        return Err(DriverError::new(format!(
-            "git worktree add failed: {}",
-            first_line(&added.stderr)
-        )));
+    if !worktree_present {
+        let branch_exists = host
+            .git(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", launch.branch),
+            ])?
+            .ok;
+        // A respawn keeps the branch it already has; a first launch cuts one
+        // from main.
+        let add: Vec<String> = if branch_exists {
+            host.log(&format!("reusing the existing branch {}", launch.branch));
+            vec![
+                "worktree".to_owned(),
+                "add".to_owned(),
+                worktree.display().to_string(),
+                launch.branch.to_owned(),
+            ]
+        } else {
+            vec![
+                "worktree".to_owned(),
+                "add".to_owned(),
+                worktree.display().to_string(),
+                "-b".to_owned(),
+                launch.branch.to_owned(),
+                "main".to_owned(),
+            ]
+        };
+        let add: Vec<&str> = add.iter().map(String::as_str).collect();
+        let added = host.git(&add)?;
+        if !added.ok {
+            return Err(DriverError::new(format!(
+                "git worktree add failed: {}",
+                first_line(&added.stderr)
+            )));
+        }
+        made.worktree = true;
     }
-    made.worktree = true;
 
     // The machine-local config and binary are gitignored, so they do not
     // travel with the checkout; the worker needs both to reach the log. It
@@ -485,26 +664,39 @@ fn launch(host: &impl SpawnHost, launch: &Launch<'_>, made: &mut Made) -> Result
     if let Some(script) = launch.tier.resume_script(Some(&git_common_dir)) {
         host.write_executable(&worktree.join(".alder/resume"), &script)?;
     }
-    host.tmux_new_session(launch.session, worktree, &pane_command(&engine, &goal))?;
+    host.tmux_new_session(
+        launch.session,
+        worktree,
+        &pane_command(&engine, &goal, launch.session),
+        launch.attempt_id,
+    )?;
     made.session = true;
-    // The stamp the tmux observer reads to say which attempt a session is.
-    host.tmux_set_environment(launch.session, "ALDER_ATTEMPT", launch.attempt_id)?;
 
     // Bound last, and only once there is something to bind to: the handle is a
     // claim that a live session exists.
-    let handle = format!("tmux:{}", launch.session);
+    bind_attempt(host, launch.attempt_id, launch.session, launch.tier)?;
+    Ok(())
+}
+
+fn bind_attempt(
+    host: &impl SpawnHost,
+    attempt_id: &str,
+    session: &str,
+    tier: &'static Tier,
+) -> Result<()> {
+    let handle = format!("tmux:{session}");
     host.alder(&[
         "attempt",
         "edit",
-        launch.attempt_id,
+        attempt_id,
         "--handle",
         &handle,
         "--meta",
-        &format!("engine={}", launch.tier.model),
+        &format!("engine={}", tier.model),
         "--meta",
-        &format!("effort={}", launch.tier.effort),
+        &format!("effort={}", tier.effort),
         "--meta",
-        &format!("tier={}", launch.tier.name),
+        &format!("tier={}", tier.name),
     ])?;
     Ok(())
 }
@@ -597,8 +789,9 @@ mod tests {
         fail_alder: RefCell<BTreeSet<String>>,
         fail_git: RefCell<BTreeSet<String>>,
         existing_branches: RefCell<BTreeSet<String>>,
-        existing_paths: RefCell<BTreeSet<PathBuf>>,
-        existing_sessions: RefCell<BTreeSet<String>>,
+        worktrees: RefCell<BTreeMap<PathBuf, String>>,
+        sessions: RefCell<BTreeMap<String, ObservedSession>>,
+        crash_after: RefCell<Option<&'static str>>,
         fail_tmux: bool,
     }
 
@@ -638,6 +831,13 @@ mod tests {
         fn called(&self, needle: &str) -> bool {
             self.calls().iter().any(|call| call.contains(needle))
         }
+
+        fn crash_if(&self, effect: &'static str) {
+            if self.crash_after.borrow().as_ref() == Some(&effect) {
+                self.crash_after.borrow_mut().take();
+                panic!("simulated process crash after {effect}");
+            }
+        }
     }
 
     impl SpawnHost for Fake {
@@ -658,12 +858,54 @@ mod tests {
             if self.fail_alder.borrow().contains(&one) || self.fail_alder.borrow().contains(&two) {
                 return Err(DriverError::new(format!("`alder {two}` failed")));
             }
-            let alder = self.alder.borrow();
-            alder
-                .get(&two)
-                .or_else(|| alder.get(&one))
-                .cloned()
-                .ok_or_else(|| DriverError::new(format!("no scripted answer for `alder {two}`")))
+            let answer = {
+                let alder = self.alder.borrow();
+                alder
+                    .get(&two)
+                    .or_else(|| alder.get(&one))
+                    .cloned()
+                    .ok_or_else(|| {
+                        DriverError::new(format!("no scripted answer for `alder {two}`"))
+                    })?
+            };
+            if two == "work start" {
+                let work_id = args.get(2).copied().unwrap_or("al-1");
+                let attempt_id = answer
+                    .get("attempt_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("al-1-attempt-1");
+                self.alder.borrow_mut().insert(
+                    "status".to_owned(),
+                    json!({"in_flight": [{
+                        "id": attempt_id,
+                        "work_id": work_id,
+                        "handle": null,
+                    }]}),
+                );
+                self.crash_if("work start");
+            } else if two == "attempt edit" && args.contains(&"--handle") {
+                let attempt_id = args.get(2).copied().unwrap_or("al-1-attempt-1");
+                let handle = args
+                    .iter()
+                    .position(|arg| *arg == "--handle")
+                    .and_then(|index| args.get(index + 1))
+                    .copied()
+                    .unwrap_or("tmux:alder-work-al-1");
+                self.alder.borrow_mut().insert(
+                    "status".to_owned(),
+                    json!({"in_flight": [{
+                        "id": attempt_id,
+                        "work_id": "al-1",
+                        "handle": handle,
+                    }]}),
+                );
+                self.crash_if("attempt edit");
+            } else if two == "attempt end" {
+                self.alder
+                    .borrow_mut()
+                    .insert("status".to_owned(), json!({"in_flight": []}));
+            }
+            Ok(answer)
         }
 
         fn git(&self, args: &[&str]) -> Result<Run> {
@@ -675,6 +917,21 @@ mod tests {
                     ok: true,
                     stdout: "/projects/alder/.git\n".to_owned(),
                     stderr: String::new(),
+                });
+            }
+            if args.first() == Some(&"-C") {
+                let path = PathBuf::from(args.get(1).copied().unwrap_or_default());
+                return Ok(match self.worktrees.borrow().get(&path) {
+                    Some(branch) => Run {
+                        ok: true,
+                        stdout: format!("{branch}\n"),
+                        stderr: String::new(),
+                    },
+                    None => Run {
+                        ok: false,
+                        stdout: String::new(),
+                        stderr: "fatal: not a worktree".to_owned(),
+                    },
                 });
             }
             if args.first() == Some(&"rev-parse") {
@@ -691,6 +948,19 @@ mod tests {
                 });
             }
             let subcommand = args.iter().take(2).copied().collect::<Vec<_>>().join(" ");
+            if subcommand == "worktree add" && !self.fail_git.borrow().contains(&subcommand) {
+                let path = PathBuf::from(args.get(2).copied().unwrap_or_default());
+                let branch = if args.get(3) == Some(&"-b") {
+                    args.get(4).copied().unwrap_or_default()
+                } else {
+                    args.get(3).copied().unwrap_or_default()
+                };
+                self.worktrees.borrow_mut().insert(path, branch.to_owned());
+                self.crash_if("worktree add");
+            } else if subcommand == "worktree remove" {
+                let path = args.last().copied().unwrap_or_default();
+                self.worktrees.borrow_mut().remove(Path::new(path));
+            }
             Ok(Run {
                 ok: !self.fail_git.borrow().contains(&subcommand),
                 stdout: String::new(),
@@ -698,28 +968,33 @@ mod tests {
             })
         }
 
-        fn tmux_session_exists(&self, session: &str) -> Result<bool> {
-            Ok(self.existing_sessions.borrow().contains(session))
+        fn tmux_session(&self, session: &str) -> Result<Option<ObservedSession>> {
+            Ok(self.sessions.borrow().get(session).cloned())
         }
 
-        fn tmux_new_session(&self, session: &str, cwd: &Path, command: &str) -> Result<()> {
+        fn tmux_new_session(
+            &self,
+            session: &str,
+            cwd: &Path,
+            command: &str,
+            attempt_id: &str,
+        ) -> Result<()> {
             self.calls.borrow_mut().push(format!(
-                "tmux new-session {session} -c {} {command}",
-                cwd.display()
+                "tmux new-session {session} -c {} -e {ATTEMPT_ENV}={attempt_id} \
+                 -e {ENGINE_ENV}={ENGINE_RUNNING} {command}",
+                cwd.display(),
             ));
             if self.fail_tmux {
                 return Err(DriverError::new("tmux new-session failed: nope"));
             }
-            self.existing_sessions
-                .borrow_mut()
-                .insert(session.to_owned());
-            Ok(())
-        }
-
-        fn tmux_set_environment(&self, session: &str, name: &str, value: &str) -> Result<()> {
-            self.calls
-                .borrow_mut()
-                .push(format!("tmux set-environment {session} {name} {value}"));
+            self.sessions.borrow_mut().insert(
+                session.to_owned(),
+                ObservedSession {
+                    attempt_id: Some(attempt_id.to_owned()),
+                    engine_live: true,
+                },
+            );
+            self.crash_if("tmux new-session");
             Ok(())
         }
 
@@ -727,12 +1002,12 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("tmux kill-session {session}"));
-            self.existing_sessions.borrow_mut().remove(session);
+            self.sessions.borrow_mut().remove(session);
             Ok(())
         }
 
         fn path_exists(&self, path: &Path) -> bool {
-            self.existing_paths.borrow().contains(path)
+            self.worktrees.borrow().contains_key(path)
         }
 
         fn create_dir_all(&self, path: &Path) -> Result<()> {
@@ -785,8 +1060,13 @@ mod tests {
         assert!(ordinal("alder show al-1") < ordinal("alder work start al-1"));
         assert!(ordinal("alder work start al-1") < ordinal("git worktree add"));
         assert!(ordinal("git worktree add") < ordinal("tmux new-session"));
-        assert!(ordinal("tmux new-session") < ordinal("tmux set-environment"));
-        assert!(ordinal("tmux set-environment") < ordinal("alder attempt edit"));
+        assert!(ordinal("tmux new-session") < ordinal("alder attempt edit"));
+        // Identity is part of new-session itself. There is no crash window
+        // where the pane exists but its attempt cannot be observed.
+        assert!(host.called(
+            "tmux new-session alder-work-al-1 -c /projects/alder-work-al-1 \
+             -e ALDER_ATTEMPT=al-1-attempt-1 -e ALDER_ENGINE=running"
+        ));
 
         // The worker gets alder and its config, and nothing else.
         assert!(host.called(
@@ -873,22 +1153,41 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_session_or_worktree_fails_before_anything_is_created() {
+    fn a_live_unattributed_session_is_refused_before_an_attempt_is_created() {
         let host = Fake::new();
-        host.existing_sessions
-            .borrow_mut()
-            .insert("alder-work-al-1".to_owned());
+        host.sessions.borrow_mut().insert(
+            "alder-work-al-1".to_owned(),
+            ObservedSession {
+                attempt_id: None,
+                engine_live: true,
+            },
+        );
         let error = spawn(&host, "al-1", tier("terra").unwrap(), None).unwrap_err();
-        assert!(error.message.contains("already exists"), "{error}");
+        assert!(error.message.contains("live engine"), "{error}");
+        assert!(!host.called("work start"));
+    }
 
+    #[test]
+    fn an_existing_worktree_is_adopted_only_on_the_expected_branch() {
         let host = Fake::new();
-        host.existing_paths
-            .borrow_mut()
-            .insert(PathBuf::from("/projects/alder-work-al-1"));
+        host.worktrees.borrow_mut().insert(
+            PathBuf::from("/projects/alder-work-al-1"),
+            "work/al-other".to_owned(),
+        );
         let error = spawn(&host, "al-1", tier("terra").unwrap(), None).unwrap_err();
-        assert!(error.message.contains("already exists"), "{error}");
+        assert!(error.message.contains("work/al-other"), "{error}");
+        assert!(error.message.contains("expected `work/al-1`"), "{error}");
         assert!(!host.called("work start"));
         assert!(!host.called("attempt end"));
+
+        let host = Fake::new();
+        host.worktrees.borrow_mut().insert(
+            PathBuf::from("/projects/alder-work-al-1"),
+            "work/al-1".to_owned(),
+        );
+        spawn(&host, "al-1", tier("terra").unwrap(), None).unwrap();
+        assert!(!host.called("git worktree add"));
+        assert!(host.called("adopting the existing worktree"));
     }
 
     #[test]
@@ -954,10 +1253,143 @@ mod tests {
                 {"id": "al-1-attempt-1", "work_id": "al-1", "handle": "tmux:alder-work-al-1"},
             ]}),
         );
+        host.sessions.borrow_mut().insert(
+            "alder-work-al-1".to_owned(),
+            ObservedSession {
+                attempt_id: Some("al-1-attempt-1".to_owned()),
+                engine_live: true,
+            },
+        );
         let error = spawn(&host, "al-1", tier("terra").unwrap(), None).unwrap_err();
-        assert!(error.message.contains("already has attempt"), "{error}");
+        assert!(error.message.contains("already running"), "{error}");
+        assert!(!host.called("work start"));
         assert!(!host.called("git worktree"));
         assert!(!host.called("attempt end"));
+    }
+
+    #[test]
+    fn a_process_crash_after_each_effect_converges_on_exactly_one_attempt() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        for boundary in [
+            "work start",
+            "worktree add",
+            "tmux new-session",
+            "attempt edit",
+        ] {
+            let host = Fake::new();
+            host.crash_after.borrow_mut().replace(boundary);
+            let crashed = catch_unwind(AssertUnwindSafe(|| {
+                let _ = spawn(&host, "al-1", tier("terra").unwrap(), None);
+            }));
+            assert!(crashed.is_err(), "{boundary} did not crash");
+
+            let repaired = spawn(&host, "al-1", tier("terra").unwrap(), None);
+            if boundary == "attempt edit" {
+                let error = repaired.expect_err("a bound live engine is already converged");
+                assert!(error.message.contains("already running"), "{error}");
+            } else {
+                let spawned = repaired
+                    .unwrap_or_else(|error| panic!("repair after {boundary} failed: {error}"));
+                assert_eq!(spawned.attempt_id, "al-1-attempt-1", "{boundary}");
+                assert!(spawned.adopted, "{boundary}");
+            }
+            assert_eq!(
+                host.calls()
+                    .iter()
+                    .filter(|call| call.starts_with("alder work start"))
+                    .count(),
+                1,
+                "{boundary}: {:#?}",
+                host.calls()
+            );
+            assert_eq!(
+                host.calls()
+                    .iter()
+                    .filter(|call| call.starts_with("git worktree add"))
+                    .count(),
+                1,
+                "{boundary}: {:#?}",
+                host.calls()
+            );
+            assert_eq!(
+                host.calls()
+                    .iter()
+                    .filter(|call| call.starts_with("tmux new-session"))
+                    .count(),
+                1,
+                "{boundary}: {:#?}",
+                host.calls()
+            );
+            assert_eq!(
+                host.calls()
+                    .iter()
+                    .filter(|call| call.starts_with("alder attempt edit"))
+                    .count(),
+                1,
+                "{boundary}: {:#?}",
+                host.calls()
+            );
+        }
+    }
+
+    #[test]
+    fn an_exited_unattributed_pane_is_replaced() {
+        let host = Fake::new();
+        host.sessions.borrow_mut().insert(
+            "alder-work-al-1".to_owned(),
+            ObservedSession {
+                attempt_id: None,
+                engine_live: false,
+            },
+        );
+        let spawned = spawn(&host, "al-1", tier("terra").unwrap(), None).unwrap();
+        assert_eq!(spawned.attempt_id, "al-1-attempt-1");
+        let calls = host.calls();
+        let killed = calls
+            .iter()
+            .position(|call| call == "tmux kill-session alder-work-al-1")
+            .unwrap();
+        let started = calls
+            .iter()
+            .position(|call| call.contains("alder work start al-1"))
+            .unwrap();
+        let launched = calls
+            .iter()
+            .position(|call| call.starts_with("tmux new-session"))
+            .unwrap();
+        assert!(killed < started && started < launched, "{calls:#?}");
+    }
+
+    #[test]
+    fn an_exited_bound_pane_is_adopted_without_relaunching() {
+        let host = Fake::new();
+        host.alder.borrow_mut().insert(
+            "status".to_owned(),
+            json!({"in_flight": [{
+                "id": "al-1-attempt-1",
+                "work_id": "al-1",
+                "handle": "tmux:alder-work-al-1",
+            }]}),
+        );
+        host.worktrees.borrow_mut().insert(
+            PathBuf::from("/projects/alder-work-al-1"),
+            "work/al-1".to_owned(),
+        );
+        host.sessions.borrow_mut().insert(
+            "alder-work-al-1".to_owned(),
+            ObservedSession {
+                attempt_id: Some("al-1-attempt-1".to_owned()),
+                engine_live: false,
+            },
+        );
+
+        let spawned = spawn(&host, "al-1", tier("terra").unwrap(), None).unwrap();
+        assert!(spawned.adopted);
+        assert!(!host.called("work start"));
+        assert!(!host.called("worktree add"));
+        assert!(!host.called("tmux new-session"));
+        assert!(!host.called("attempt edit"));
     }
 
     #[test]

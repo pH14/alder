@@ -24,7 +24,9 @@ use serde_json::Value;
 use crate::{
     config::{Config, Engine},
     error::{DriverError, Result},
-    spawn::{Run, SpawnHost},
+    spawn::{
+        ATTEMPT_ENV, ENGINE_ENV, ENGINE_EXITED, ENGINE_RUNNING, ObservedSession, Run, SpawnHost,
+    },
 };
 
 pub trait Effects {
@@ -270,33 +272,88 @@ impl SpawnHost for Host {
         })
     }
 
-    fn tmux_session_exists(&self, session: &str) -> Result<bool> {
-        self.session_exists(session)
+    fn tmux_session(&self, session: &str) -> Result<Option<ObservedSession>> {
+        if !self.session_exists(session)? {
+            return Ok(None);
+        }
+        let target = format!("={session}");
+        let environment = |name: &str| -> Result<Option<String>> {
+            let output = self.run("tmux", &["show-environment", "-t", &target, name])?;
+            if !output.status.success() {
+                return Ok(None);
+            }
+            let line = String::from_utf8_lossy(&output.stdout);
+            Ok(line
+                .trim()
+                .strip_prefix(&format!("{name}="))
+                .map(str::to_owned))
+        };
+        let attempt_id = environment(ATTEMPT_ENV)?;
+        let engine_live = match environment(ENGINE_ENV)?.as_deref() {
+            Some(ENGINE_EXITED) => false,
+            Some(ENGINE_RUNNING) => true,
+            Some(_) => true,
+            None => {
+                // Sessions from before the explicit engine marker can still
+                // be repaired. The pane always ends in `exec bash`, so bash
+                // is the observable holding state and everything else is
+                // conservatively treated as a live engine.
+                let output = self.run(
+                    "tmux",
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &target,
+                        "#{pane_current_command}",
+                    ],
+                )?;
+                if !output.status.success() {
+                    return Err(DriverError::new(format!(
+                        "cannot inspect tmux session `{session}`: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )));
+                }
+                String::from_utf8_lossy(&output.stdout).trim() != "bash"
+            }
+        };
+        Ok(Some(ObservedSession {
+            attempt_id,
+            engine_live,
+        }))
     }
 
-    fn tmux_new_session(&self, session: &str, cwd: &Path, command: &str) -> Result<()> {
+    fn tmux_new_session(
+        &self,
+        session: &str,
+        cwd: &Path,
+        command: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
         let cwd = cwd.display().to_string();
+        let attempt = format!("{ATTEMPT_ENV}={attempt_id}");
+        let engine = format!("{ENGINE_ENV}={ENGINE_RUNNING}");
         let output = self.run(
             "tmux",
-            &["new-session", "-d", "-s", session, "-c", &cwd, command],
+            &[
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-c",
+                &cwd,
+                "-e",
+                &attempt,
+                "-e",
+                &engine,
+                command,
+            ],
         )?;
         if output.status.success() {
             Ok(())
         } else {
             Err(DriverError::new(format!(
                 "tmux new-session failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )))
-        }
-    }
-
-    fn tmux_set_environment(&self, session: &str, name: &str, value: &str) -> Result<()> {
-        let output = self.run("tmux", &["set-environment", "-t", session, name, value])?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(DriverError::new(format!(
-                "tmux set-environment failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             )))
         }

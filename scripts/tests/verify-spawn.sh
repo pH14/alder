@@ -9,10 +9,10 @@
 # toolchain, git, tmux and jq.
 #
 # What it proves, which unit tests cannot: that a real tmux pane really does
-# receive the goal as one argv element, that the pane outlives a one-shot
-# engine, that the worktree is really cut and really carries `alder`, that the
-# attempt is really bound with its tier stamped — and that the whole dispatch
-# types nothing and waits for nothing.
+# receive the goal as one argv element, that the pane is attributable from its
+# creation and outlives a one-shot engine, that its exited shell is adopted,
+# that the worktree is really cut and really carries `alder`, and that the
+# attempt is really bound with its tier stamped.
 #
 # Everything happens under one throwaway directory: its own git repo, its own
 # bare "remote" holding the alder log, its own work item, and its own tmux
@@ -247,6 +247,12 @@ fi
 sleep 0.5
 tmux has-session -t "=$SESSION_NAME" 2>/dev/null ||
   fail "the session died with the engine; the pane does not end '; exec bash'"
+[ "$(tmux show-environment -t "=$SESSION_NAME" ALDER_ATTEMPT)" = \
+  "ALDER_ATTEMPT=$ATTEMPT" ] ||
+  fail "the session was not stamped with its attempt at creation"
+[ "$(tmux show-environment -t "=$SESSION_NAME" ALDER_ENGINE)" = \
+  "ALDER_ENGINE=exited" ] ||
+  fail "the session does not expose that its engine exited"
 
 # The worktree, the branch, and what the worker was given to reach the log.
 [ -d "$SB/alder-work-$WORK" ] || fail "worktree missing"
@@ -279,13 +285,14 @@ grep -q -- "$SB/repo/.git" "$RESUME" ||
     >/dev/null ||
   fail "the attempt does not carry model, effort and tier"
 
-# A second spawn at a live worker is refused, and changes nothing.
-if ALDER_BIN=$ALDER ALDER_WORKER_CMD="$SB/stub.sh" \
-  "$ALDERD" spawn "$WORK" luna >"$SB/second.out" 2>&1; then
-  fail "a second worker was spawned onto a live one"
-fi
+# A second spawn adopts the exited holding pane and changes nothing.
+ALDER_BIN=$ALDER ALDER_WORKER_CMD="$SB/stub.sh" \
+  "$ALDERD" spawn "$WORK" luna >"$SB/second.out" 2>&1 ||
+  fail "the exited pane was not adopted: $(cat "$SB/second.out")"
 [ "$("$ALDER" status --section in_flight --json | jq '.in_flight | length')" -eq 1 ] ||
-  fail "the refused second spawn left an extra attempt"
+  fail "adopting the exited pane left an extra attempt"
+[ "$(grep -c '^new-session ' "$TMUX_LOG")" -eq 1 ] ||
+  fail "adopting the exited pane launched another session"
 
 # The sandbox session exists on the sandbox server, alone, and nowhere else.
 # This is the same assertion teardown makes before it kills anything.
@@ -304,4 +311,4 @@ printf '%s\n' "$REAL_AFTER"
 echo
 RUN_STATUS=pass
 echo "PASS: alderd spawn delivered the goal as argv in ${ELAPSED}s, typed nothing," \
-  "left a live pane behind, and stamped luna/gpt-5.6-luna/high on the attempt"
+  "left and adopted its pane, and stamped luna/gpt-5.6-luna/high on the attempt"

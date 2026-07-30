@@ -49,9 +49,9 @@ agent; copy it to `~/Library/LaunchAgents/`, edit the paths, and
 
 `alderd spawn <work-id> [tier]` launches one worker for one item, in this
 order: read the item (`alder show`), record the attempt (`alder work start`, or
-adopt an open unbound one), cut `../alder-work-<id>` on `work/<id>`, copy in
-`.alder/config.json` and the `alder` binary, start the tmux session, and bind
-the handle with the tier stamped on it.
+adopt an open unbound one), cut or adopt `../alder-work-<id>` on `work/<id>`,
+copy in `.alder/config.json` and the `alder` binary, start or adopt the tmux
+session, and bind the handle with the tier stamped on it.
 
 Three rules make that ordering worth having:
 
@@ -69,10 +69,14 @@ Three rules make that ordering worth having:
   quietly continues at another model, with no network access and no writable
   git dir, and can neither commit nor reach the log. The script repeats the
   launch exactly, because the same table writes both.
-- **No phantom workers.** Everything knowable beforehand — unknown item,
-  session or worktree already there, unknown tier — fails with nothing
-  created. After the attempt exists, any failure ends it with the error as its
-  reason and removes what the run made.
+- **Crash residue is adoptive.** Re-running spawn after any completed effect
+  converges on the same attempt. An existing worktree is accepted only after
+  Git proves it is on `work/<id>`. `tmux new-session` stamps
+  `ALDER_ATTEMPT=<attempt>` as part of pane creation, so a crash cannot leave
+  an unattributable pane between creation and binding. An unbound attempt
+  adopts a session bearing its identity; an exited holding pane is adopted or
+  replaced. A bound session whose engine is still live is refused because it
+  is genuinely already running.
 
 The worktree is given `alder` and nothing else, so a worker cannot dispatch.
 
