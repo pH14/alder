@@ -47,16 +47,41 @@ Use `./target/debug/alder` for every alder command.
      codex session in that directory, which is the worker's own unless it
      has been running consults.
 
-   **Then confirm it landed.** `send-keys -l` fills the pane's input buffer and
-   the `Enter` that follows does not reliably commit it: a full feedback
-   message has sat unsent in a worker's buffer for an entire pass — twice —
-   while the log recorded the ruling as relayed. So capture the pane
-   (`tmux capture-pane -pt alder-work-<id> | tail`) and read it: the text must
-   be gone from the input line and the engine must be working. If the message
-   is still sitting there, send a bare `Enter` again and capture again. Do this
-   before `work unblock`, so the log's "relayed" and the worker's reality agree.
-   A tmux pane is not a durable channel — the same lesson as recording a review
-   before relaying it.
+   **Then confirm it landed**, because `send-keys -l` fills the pane's input
+   buffer and the `Enter` that follows does not reliably commit it: a full
+   feedback message has sat unsent in a worker's buffer for an entire pass —
+   twice — while the log recorded the ruling as relayed. Capture the pane
+   (`tmux capture-pane -pt alder-work-<id> | tail`) and read it for the two
+   signals that mean something:
+
+   - **the engine is working** — a claude pane shows a running turn as a
+     spinner line with an elapsed timer and a token count
+     (`✢ Whisking… (1m 39s · ↓ 6.2k tokens)` — the word varies, the shape does
+     not); a codex worker's shell shows the
+     relayed `.alder/resume` command running above a busy prompt;
+   - **the worker moves** — a fresh `attempt.updated` on that attempt is the
+     only *durable* evidence of delivery, and it is what you actually want.
+
+   **Do not read the input line, and never treat text sitting there as an
+   unsent message.** On an idle Claude Code worker that line is never empty: the
+   TUI puts a *suggested* next prompt there as ghost text. Measured on two live
+   panes, neither of which any leader had typed into; it survives `C-a C-k`, a
+   typed character plus `BSpace`, and `Escape`, because it is not buffer
+   content. A leader that keys on emptiness reads every delivered message as
+   undelivered.
+
+   **And do not send a bare `Enter` to a claude pane** on that basis: if the
+   ghost suggestion is what is showing, `Enter` submits it as a real prompt and
+   spends a worker turn on an instruction nobody wrote. A bare `Enter` is only
+   safe at a plain shell prompt — a codex worker's pane — where an empty line
+   does nothing. When you cannot tell, do nothing this pass: check for a fresh
+   `attempt.updated` next pass, and only if there is still none, and the pane is
+   still idle, re-send the **whole** message, text and `Enter` together.
+
+   Do this before `work unblock`, so the log's "relayed" and the worker's
+   reality agree. A tmux pane is not a durable channel — the same lesson as
+   recording a review before relaying it, and the reason the delivery marker
+   under *What this rule does not close* is real work rather than a nicety.
 
    A worker with no live session gets a fresh spawn instead — and a fresh
    spawn is launched on the *item*, not on the Q&A, which is why an answer
@@ -78,8 +103,9 @@ Use `./target/debug/alder` for every alder command.
      failure's warnings, diff, or test output still print in full.
    - Cross-review it before it goes anywhere — see **The cross-review rule**.
      Your own reading is not that review; you dispatched the work.
-   - Good: check that the branch head still equals the `reviewed-sha` you
-     recorded (`git rev-parse work/<id>`), merge locally
+   - Good: check both endpoints against what was reviewed —
+     `git rev-parse work/<id>` equals `reviewed-sha` and `git rev-parse main`
+     equals `reviewed-base` — then merge locally
      (`git merge --no-ff work/<id>`), then
      `alder work finish <id> --attempt <attempt>`, kill the session
      (`tmux kill-session -t alder-work-<id>`), remove the worktree
@@ -116,11 +142,16 @@ Use `./target/debug/alder` for every alder command.
 
 Before a branch is merged — or, when it is being staged for Paul rather than
 merged, before it is presented to him, and again before any re-presentation —
-it is reviewed by an engine on the **other vendor's ladder**. The author's
-engine is the attempt's `engine` metadata; the reviewer is the rung across from
-it or higher. Never the author's own vendor, never the author's own session: a
-reviewer that shares the author's blind spots returns a rubber stamp with a
-receipt on it.
+it is reviewed by an engine on the **other vendor's ladder**. The reviewer is
+the rung across from the author's or higher. Never the author's own vendor,
+never the author's own session: a reviewer that shares the author's blind spots
+returns a rubber stamp with a receipt on it.
+
+**The author is every vendor that has written on the branch, not the last one.**
+`alderd spawn` reuses the branch across a respawn, so a provider switch leaves
+one branch with commits from both ladders while the latest attempt's `engine`
+names only the vendor that finished. Read the `engine` of **every** attempt on
+the item (`alder show <work>` lists them all), not just the newest.
 
 | authored at | reviewed by |
 | --- | --- |
@@ -128,6 +159,16 @@ receipt on it.
 | `luna` | claude `sonnet` or higher |
 | `terra` | claude `opus` or `fable` |
 | `sol` | claude `fable` |
+
+**When both vendors appear, the branch takes two reviews** — one from each
+ladder, each reading the whole diff, because no single review can be "not the
+author's vendor" for commits written by both. Both are recorded, comma-joined
+the way a second consult is (`--meta reviewed-by=gpt-5.6-sol,claude-fable-5`),
+and the check is satisfied only once every vendor on the branch has been read
+by the other. That is two heavy ops and therefore two passes. It is expensive
+on purpose: the cheap way out is to cut a fresh branch when a respawn switches
+provider, not to review half a diff. The log does not record which attempt
+wrote which commit, so when you cannot tell, count the vendor as an author.
 
 The ladders pair by standing — `luna`↔`sonnet`, `terra`↔`opus`, `sol`↔`fable`,
 the counterpart column in `crates/alderd/README.md` — so `sol` is reviewed at
@@ -186,10 +227,17 @@ the weaker of them ends up run wrong:
   the branch's own worktree:
 
       claude -p --model claude-fable-5 --effort xhigh --permission-mode auto \
-        "Review work/<id> against main: git diff main...work/<id>. \
-         The item is <work-id> — <the item's title>. \
-         Its spec: <spec, or 'none recorded'>. Its checks: <checks>. \
-         AGENTS.md is the review lens. Report findings, or say the branch is clean."
+        "$(cat "$scratch/review-prompt-<id>.txt")"
+
+  with that file holding the brief — never the item's own text inlined into the
+  command, for the reason given under *Record the verdict* below. (`$scratch` is
+  any directory outside the worktree, so nothing you write can be committed onto
+  the branch under review.)
+
+      Review work/<id> against main: git diff main...work/<id>.
+      The item is <work-id> — <the item's title>.
+      Its spec: <spec, or 'none recorded'>. Its checks: <checks>.
+      AGENTS.md is the review lens. Report findings, or say the branch is clean.
 
   The **title** leads, because it is the only description of the requested
   change that is always there: a spec is optional in v0
@@ -212,31 +260,48 @@ the weaker of them ends up run wrong:
 ### Record the verdict before you relay it
 
 Every verdict is durable, on the **authoring** attempt, and it is written
-*before* a word of it reaches anyone. Both outcomes are one call:
+*before* a word of it reaches anyone.
 
-    # clean
-    alder attempt edit <attempt> --satisfied cross-review \
-      --evidence "gpt-5.6-sol via codex review at 901445f: clean, 0 findings" \
-      --meta reviewed-by=gpt-5.6-sol --meta reviewed-sha=901445f
+**Reviewer text never travels on a command line.** Write the summary and the
+findings to a file outside the worktree, then pass the file:
 
-    # changes requested — the findings themselves, not their count
+    cat > "$scratch/cross-review-<id>.txt" <<'EOF'
+    gpt-5.6-sol via codex review at 901445f (base main 6eab0cd), effort xhigh:
+    changes requested, 4 findings (3 P1).
+      P1 PASS.md:138 the codex invocation does not run: --base and a prompt cannot compose.
+      P1 PASS.md:165 the claude prompt omits the work title, the only always-present
+        description of the change.
+      P1 PASS.md:192 only the finding count is persisted before the relay.
+      P2 PASS.md:240 the grandfather path puts the verdict in a note, which is overwritten.
+    EOF
+
     alder attempt edit <attempt> --failed cross-review \
-      --evidence "gpt-5.6-sol via codex review at 901445f: changes requested, 4 findings (3 P1).
-        P1 PASS.md:138 the codex invocation does not run: --base and a prompt cannot compose.
-        P1 PASS.md:165 the claude prompt omits the work title, which is the only always-present
-          description of the change.
-        P1 PASS.md:192 only the finding count is persisted before the relay.
-        P2 PASS.md:240 the grandfather path puts the verdict in a note, which is overwritten." \
-      --meta reviewed-by=gpt-5.6-sol --meta reviewed-sha=901445f
+      --evidence "$(cat "$scratch/cross-review-<id>.txt")" \
+      --meta reviewed-by=gpt-5.6-sol \
+      --meta reviewed-sha=901445f --meta reviewed-base=6eab0cd \
+      --meta reviewed-effort=xhigh
+
+A clean verdict is the same call with `--satisfied` and a one-line file. Both
+use `"$(cat …)"` and a quoted heredoc, because a finding is *branch-controlled
+text*: ordinary reviewer output contains backticks and `$(…)`, and pasted
+straight into a double-quoted argument the leader's own shell expands it —
+which silently rewrites the durable evidence, and runs whatever it expanded.
+The content of a command substitution is not re-scanned, so this is the whole
+fix; it is a template change, not a mechanism. Keep the file outside the
+worktree so it cannot be committed onto the branch under review.
+
+The same hole is in the claude prompt: a title, spec, or check description is
+arbitrary logged text. Build that prompt in a file too and pass
+`"$(cat "$scratch/review-prompt-<id>.txt")"`.
 
 The verdict itself is the check's status and is not repeated in metadata: two
 places that can disagree about one fact is exactly what this repository refuses
-elsewhere. `reviewed-by` and `reviewed-sha` are there because nothing else
-records them.
+elsewhere. The three metadata keys are there because nothing else records them
+— **who** reviewed, at **what effort**, and **which two endpoints** they read.
 
-Evidence names the reviewer engine, the commit it read, the verdict, the
-finding count — and, when there are findings, **the findings**: one line each,
-severity, `file:line`, and the claim.
+Evidence names the reviewer engine, the two revisions it read, the effort, the
+verdict, the finding count — and, when there are findings, **the findings**: one
+line each, severity, `file:line`, and the claim.
 
 **A count is not a finding.** "4 findings (3 P1)" tells the next reader that
 something is wrong and nothing about what, so it buys back none of the review:
@@ -254,12 +319,28 @@ level-triggered rule in `AGENTS.md` turned on the leader's own work.
 
 `reviewed-by` lands beside the `engine` the dispatch stamped, so author ≠
 reviewer is auditable from the log alone, by a reader who was not there.
-`reviewed-sha` is what makes the verdict a fact about a **revision** rather
-than about a branch: a satisfied check does not follow new commits, so an
-author who commits one more fix leaves a green check over unreviewed code. **At
-merge, the branch head must equal `reviewed-sha`.** If it has moved — a fix, a
-rebase, one more commit — the review is stale: run it again and record the new
-SHA.
+`reviewed-effort` is there for the same reason as the flag that sets it: without
+it, a review that quietly ran at a default effort reads in the log exactly like
+one run at `xhigh`.
+
+`reviewed-sha` and `reviewed-base` make the verdict a fact about a **diff**
+rather than about a branch name. A review reads two endpoints, and either can
+move:
+
+- the **branch head** moves when the author commits a fix or rebases, and a
+  satisfied check does not follow new commits — that is a green check over code
+  nobody read;
+- **main** moves whenever anything else merges, and then the review describes an
+  integration context that no longer exists. A cross-review can easily consume a
+  pass without merging, so this is not a corner case.
+
+**At merge, `git rev-parse work/<id>` must equal `reviewed-sha` and
+`git rev-parse main` must equal `reviewed-base`.** If either has moved, the
+review is stale: run it again and record both SHAs. The consequence is worth
+saying out loud — merging anything stales every other pending review, so a
+second branch merged after the first needs its own fresh review, in its own
+pass. That is the honest price of a gate that means what it says, and it is
+what the one-heavy-op rule was already charging.
 
 ### The check is declared at admission
 
@@ -296,9 +377,11 @@ Do not end an attempt to add one. Review the branch anyway and put every
 durable fact in **metadata**:
 
     alder attempt edit <attempt> \
-      --meta reviewed-by=gpt-5.6-sol --meta reviewed-sha=<sha> \
+      --meta reviewed-by=gpt-5.6-sol \
+      --meta reviewed-sha=<sha> --meta reviewed-base=<main-sha> \
+      --meta reviewed-effort=xhigh \
       --meta cross-review=failed \
-      --meta cross-review-findings="P1 PASS.md:138 …; P1 PASS.md:192 …"
+      --meta cross-review-findings="$(cat "$scratch/cross-review-<id>.txt")"
 
 Here `cross-review=<verdict>` earns its place: with no check to hold the
 status, metadata is the only field left that persists, so it carries the
@@ -340,12 +423,39 @@ Findings then go one of three ways, all of them after the check already reads
   is not satisfied. There is no override, deliberately: a finding is fixed,
   ruled on, or argued down on the record.
 
-A re-review is a fresh review of a new revision: same command, new
-`reviewed-sha`, and `--satisfied` only once an engine that is not the author has
-read the code that is actually being merged.
+A re-review is a fresh review of new endpoints: same command, new
+`reviewed-sha` and `reviewed-base`, and `--satisfied` only once an engine that
+is not the author has read the code that is actually being merged.
 
 A cross-review is a heavy op. Running one is the pass's heavy op, whether or
 not the merge follows it in the same pass.
+
+### What this rule does not close
+
+Three gaps are known, and none of them can be closed by prose, so this section
+names them instead of pretending otherwise. Each needs a new durable fact or a
+change to what a worker's brief carries — product work, tracked as **al-q8qwhy**
+(which requires this item):
+
+- **Nothing durable records that feedback was delivered.** The verdict is
+  appended before the relay, which is why a crash cannot lose the findings — but
+  crash-before-send and send-completed leave identical log state, so the next
+  leader cannot tell whether the author has been told. Step 4's pane reading is
+  a workaround, and its limits are written out there.
+- **A replacement worker is not told what to fix.** If the reviewed session is
+  gone, the attempt ends and a fresh one starts with its own pending checks,
+  while a brief carries only title, spec, and check definitions. The findings
+  live on the previous attempt, which the new worker never reads — a codex
+  one-shot least of all, since it starts working immediately.
+- **A review records nothing before it launches.** Both invocations start a
+  charged external engine before anything durable names the target SHA or an
+  in-progress review, so a crash mid-review leaves no identity to adopt and the
+  next pass simply pays again. This is the repository's own
+  intent-before-effects rule, not yet applied to the leader.
+
+Until al-q8qwhy lands, these are costs a leader absorbs knowingly: relay
+carefully, respawn with the findings in hand, and expect a crashed review to be
+paid for twice.
 
 ## Triage
 
