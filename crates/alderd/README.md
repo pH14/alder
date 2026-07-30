@@ -41,9 +41,11 @@ needs `.alder/driver.json`; the one-shot commands do not. `alderd` reads the
 store remote and ref from `.alder/config.json` so it watches exactly the ref
 Alder writes.
 
-Logs go to standard error. `contrib/com.alder.alderd.plist` is a sample launchd
-agent; copy it to `~/Library/LaunchAgents/`, edit the paths, and
-`launchctl load` it.
+Logs go to standard error. To opt into launchd supervision for this checkout,
+run `scripts/alderd-install.sh`; it renders
+`contrib/com.alder.alderd.plist` into `~/Library/LaunchAgents/` and loads it.
+Run `scripts/alderd-uninstall.sh` to unload and remove it. Re-running install
+adopts the existing label and converges to the current checkout paths.
 
 ## Dispatch
 

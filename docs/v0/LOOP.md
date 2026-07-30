@@ -55,6 +55,31 @@ lives there.
 **Alder** validates and folds. It never launches a session, never validates an
 engine name, and never enforces the pause it stores.
 
+## Supervision tree
+
+The process tree has a root outside the daemon:
+
+```text
+launchd (KeepAlive, RunAtLoad)
+  └─ alderd
+       └─ leader session
+            └─ worker sessions
+```
+
+`scripts/alderd-install.sh` renders the launchd agent for one checkout and
+loads it; `scripts/alderd-uninstall.sh` unloads and removes it. The rendered
+agent uses the repository as its working directory and sends both standard
+output and standard error to `.alder/alderd.log`. Loading is opt-in: nothing
+in the build or test path invokes `launchctl`.
+
+The daemon must remain safe to kill at any instant. Its useful state is either
+in the durable Alder log or observable from the leader and worker sessions;
+after a kill, the next daemon starts from those facts and applies the stale
+pass repair rule above. This statelessness is what makes `KeepAlive`
+sufficient: launchd only needs to bring back the daemon, not reconstruct an
+in-memory checkpoint or coordinate a binary self-restart. Rebuilding a binary
+does not restart an already-running daemon.
+
 ## Pass lifecycle
 
 ### Intent before effects
