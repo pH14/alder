@@ -1,5 +1,6 @@
 mod change;
 mod codec;
+pub mod invariants;
 mod ledger;
 mod model;
 mod state;
