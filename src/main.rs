@@ -88,3 +88,17 @@ fn field(value: &Value) -> String {
         other => serde_json::to_string(other).expect("error context serialization"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::field;
+    use serde_json::json;
+
+    #[test]
+    fn field_escapes_newlines_to_keep_context_on_one_line() {
+        let rendered = field(&json!("first line\nsecond line"));
+
+        assert_eq!(rendered, r#""first line\nsecond line""#);
+        assert!(!rendered.contains('\n'));
+    }
+}
