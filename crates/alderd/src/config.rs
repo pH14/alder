@@ -149,8 +149,9 @@ mod tests {
 
     #[test]
     fn defaults_fill_in_every_optional_field() {
-        let (_directory, path) =
-            write(r#"{"engines": {"claude": {"cmd": "claude"}}, "passDoc": ".alder/PASS.md"}"#);
+        let (_directory, path) = write(
+            r#"{"engines": {"claude": {"cmd": "claude"}}, "passDoc": ".agent/skills/pass/SKILL.md"}"#,
+        );
         let config = Config::load(&path).unwrap();
         assert_eq!(config.tmux_session, "alder-leader");
         assert_eq!(config.poll_seconds, 60);

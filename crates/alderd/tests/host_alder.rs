@@ -34,7 +34,7 @@ fn stub(directory: &Path, name: &str, body: &str) -> PathBuf {
 fn config(alder: &Path, notify: Option<&str>) -> Config {
     serde_json::from_value(json!({
         "engines": {"claude": {"cmd": "claude"}},
-        "passDoc": ".alder/PASS.md",
+        "passDoc": ".agent/skills/pass/SKILL.md",
         "alder": alder.display().to_string(),
         "notify": notify,
     }))

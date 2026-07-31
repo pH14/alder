@@ -284,7 +284,7 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         "Spec: docs/S.md.",
         "k — the check reaches the worker",
         "cargo clippy --workspace --all-targets",
-        "Read WORKER.md",
+        "Read .agent/skills/worker/SKILL.md",
     ] {
         assert!(goal.contains(part), "the goal omits `{part}`: {goal}");
     }

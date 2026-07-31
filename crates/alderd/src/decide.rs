@@ -335,7 +335,7 @@ pub fn config_for(engines: &[(&str, &str)]) -> Config {
         "engines": map.iter().map(|(name, engine)| {
             (name.clone(), serde_json::json!({"cmd": engine.cmd}))
         }).collect::<serde_json::Map<_, _>>(),
-        "passDoc": ".alder/PASS.md",
+        "passDoc": ".agent/skills/pass/SKILL.md",
     }))
     .expect("a generated config is valid")
 }
@@ -599,7 +599,7 @@ mod tests {
         // The final slice never overshoots the interval.
         let uneven: Config = serde_json::from_value(serde_json::json!({
             "engines": {"claude": {"cmd": "claude"}},
-            "passDoc": ".alder/PASS.md",
+            "passDoc": ".agent/skills/pass/SKILL.md",
             "pollSeconds": 10,
             "hintPollSeconds": 3,
         }))
@@ -695,23 +695,23 @@ mod tests {
         assert_eq!(
             injection(
                 true,
-                ".alder/PASS.md",
+                ".agent/skills/pass/SKILL.md",
                 "hm-pass-3",
                 &[Trigger::Log, Trigger::Due]
             ),
-            "Read .alder/PASS.md, then run one pass (pass-id: hm-pass-3; triggers: log,due)."
+            "Read .agent/skills/pass/SKILL.md, then run one pass (pass-id: hm-pass-3; triggers: log,due)."
         );
         assert_eq!(
             injection(
                 false,
-                ".alder/PASS.md",
+                ".agent/skills/pass/SKILL.md",
                 "hm-pass-4",
                 &[Trigger::Observations]
             ),
             "Run one pass (pass-id: hm-pass-4; triggers: observations)."
         );
         assert_eq!(
-            injection(false, ".alder/PASS.md", "hm-pass-5", &[]),
+            injection(false, ".agent/skills/pass/SKILL.md", "hm-pass-5", &[]),
             "Run one pass (pass-id: hm-pass-5; triggers: none)."
         );
     }

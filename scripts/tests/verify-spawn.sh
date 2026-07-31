@@ -146,7 +146,8 @@ export TMUX_TMPDIR=$SOCKDIR
 git init -q --bare "$SB/store.git"
 
 git init -q -b main "$SB/repo"
-cp "$REPO_UNDER_TEST/WORKER.md" "$SB/repo/"
+mkdir -p "$SB/repo/.agent/skills/worker"
+cp "$REPO_UNDER_TEST/.agent/skills/worker/SKILL.md" "$SB/repo/.agent/skills/worker/"
 git -C "$SB/repo" add -A
 git -C "$SB/repo" -c user.email=v@x -c user.name=v commit -qm "sandbox"
 git -C "$SB/repo" remote add scratch "$SB/store.git"
@@ -225,7 +226,7 @@ received=$(cat "$SB/argv.txt")
 for part in "$WORK" "$ATTEMPT" "Sandbox item for spawn verification" \
   "docs/SANDBOX.md" "the sandbox check description reaches the worker" \
   "the second check reaches the worker too" "cargo clippy --workspace --all-targets" \
-  "Read WORKER.md"; do
+  "Read .agent/skills/worker/SKILL.md"; do
   case $received in
   *"$part"*) ;;
   *) fail "goal omits: $part" ;;
