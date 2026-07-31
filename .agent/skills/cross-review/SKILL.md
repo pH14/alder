@@ -50,7 +50,8 @@ The reviewer is the rung across from the author's or higher — never the
 author's own vendor or session, and never a subagent of the leader (it
 inherits unlogged session effort). The author is every vendor with an attempt
 on the branch; check the `engine` metadata of every attempt, not just the
-newest.
+newest. Attempt IDs take the form `al-<id>-attempt-N`, so inspect each attempt
+by that ID with `alder show <attempt-id>`.
 
 | authored at | reviewed by |
 | --- | --- |
