@@ -453,7 +453,7 @@ pub struct QuestionAnswer {
 
 /// Why the loop was woken. Trigger kinds are informational provenance; they
 /// never limit what the pass must do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PassTrigger {
     Log,

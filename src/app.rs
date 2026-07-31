@@ -929,8 +929,9 @@ fn selected_status_sections(
 }
 
 /// The loop's desired state and its two interesting passes. The driver reads
-/// this section and ignores the rest of `status`.
-fn loop_section(state: &ProjectState) -> Value {
+/// this section and ignores the rest of `status`. Public so the model checker
+/// in `alder-model` reads the loop through the same projection the daemon does.
+pub fn loop_section(state: &ProjectState) -> Value {
     let control = &state.loop_control;
     json!({
         "paused": control.paused,

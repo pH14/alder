@@ -1,0 +1,21 @@
+[package]
+name = "alder-model"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A stateright model of Alder's protocol core, for checking, never for shipping"
+publish = false
+
+[dependencies]
+alder = { path = "../.." }
+alder-log = { path = "../alder-log" }
+alderd = { path = "../alderd" }
+chrono = { version = "0.4", features = ["serde"] }
+# For `ValueEnum`, so alderd's trigger kinds reach the domain's down the real
+# CLI's parse rather than a mapping copied into this crate.
+clap = "4.5"
+serde_json = "1"
+stateright = "0.31"
+
+[lints.rust]
+unsafe_code = "forbid"
