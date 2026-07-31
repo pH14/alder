@@ -160,7 +160,7 @@ properties of the box, not durable project facts.
     "claude": { "cmd": "claude", "args": [] },
     "codex": { "cmd": "codex", "args": ["--full-auto"] }
   },
-  "passDoc": ".alder/PASS.md",
+  "passDoc": ".agent/skills/pass/SKILL.md",
   "tmuxSession": "alder-leader",
   "pollSeconds": 60,
   "debounceSeconds": 20,

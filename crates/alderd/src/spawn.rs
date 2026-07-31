@@ -34,8 +34,9 @@ use crate::{
     tier::{Tier, tier},
 };
 
-/// The gates every worker is held to. Keep in step with WORKER.md, which
-/// states the same list for a worker that needs it after its launch turn.
+/// The gates every worker is held to. Keep in step with
+/// `.agent/skills/worker/SKILL.md`, which states the same list for a worker
+/// that needs it after its launch turn.
 pub const GATES: &str = "cargo fmt --check, cargo clippy --workspace --all-targets with zero warnings, cargo test --workspace green";
 
 /// Checks the leader records from outside the worker's session, so a goal must
@@ -256,7 +257,7 @@ impl Brief {
             }
         }
         parts.push(format!("Gates: {GATES}."));
-        parts.push("Read WORKER.md for the protocol, then begin.".to_owned());
+        parts.push("Read .agent/skills/worker/SKILL.md for the protocol, then begin.".to_owned());
         collapse(&parts.join(" "))
     }
 }
@@ -1390,7 +1391,7 @@ mod tests {
             "Spec: docs/SPEC.md.",
             "one — the first bar; two — the second bar",
             "cargo clippy --workspace --all-targets",
-            "Read WORKER.md for the protocol, then begin.",
+            "Read .agent/skills/worker/SKILL.md for the protocol, then begin.",
         ] {
             assert!(pane.contains(part), "pane command omits `{part}`: {pane}");
         }

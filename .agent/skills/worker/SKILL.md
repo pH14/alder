@@ -1,3 +1,8 @@
+---
+name: worker
+description: Implement exactly one Alder work item and record honest attempt evidence.
+---
+
 # One worker, one item
 
 You are a worker on the alder project. You have exactly one work item, and

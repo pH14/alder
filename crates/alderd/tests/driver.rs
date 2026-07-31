@@ -6,7 +6,7 @@
 
 use std::{
     cell::RefCell,
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicI64, Ordering},
     time::Duration,
 };
@@ -49,6 +49,8 @@ struct World {
     refresh_changed: bool,
     /// The body of the pass document the driver hashes.
     pass_doc: String,
+    /// Paths passed to the hash reader, in order.
+    pass_doc_reads: Vec<PathBuf>,
     /// The mtime of the local append marker, `None` when the file is absent.
     marker: Option<DateTime<Utc>>,
     calls: Vec<String>,
@@ -82,6 +84,10 @@ impl Fake {
 
     fn logs(&self) -> Vec<String> {
         self.world.borrow().logs.clone()
+    }
+
+    fn pass_doc_reads(&self) -> Vec<PathBuf> {
+        self.world.borrow().pass_doc_reads.clone()
     }
 
     /// Move the clock without going through a sleep the driver chose.
@@ -225,8 +231,10 @@ impl Effects for Fake {
         Ok(self.world.borrow().attached)
     }
 
-    fn read_file(&self, _path: &Path) -> Result<Vec<u8>> {
-        Ok(self.world.borrow().pass_doc.clone().into_bytes())
+    fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        let mut world = self.world.borrow_mut();
+        world.pass_doc_reads.push(path.to_path_buf());
+        Ok(world.pass_doc.clone().into_bytes())
     }
 
     fn file_mtime(&self, _path: &Path) -> Option<DateTime<Utc>> {
@@ -287,7 +295,7 @@ fn a_cold_start_creates_the_session_bootstraps_and_records_intent_first() {
     assert!(positions("tmux new") < positions("alder loop wake"));
     assert!(positions("alder loop wake") < positions("tmux send"));
     assert!(calls.iter().any(|call| {
-        call == "tmux send alder-leader Read .alder/PASS.md, then run one pass \
+        call == "tmux send alder-leader Read .agent/skills/pass/SKILL.md, then run one pass \
                  (pass-id: hm-pass-1; triggers: due)."
     }));
     assert!(calls.contains(&"alder show hm-pass-1".to_owned()));
@@ -664,7 +672,7 @@ fn an_observation_change_wakes_the_loop_on_its_own() {
 }
 
 #[test]
-fn a_changed_pass_document_starts_a_new_era() {
+fn a_changed_pass_skill_starts_a_new_era_and_hashes_that_skill() {
     let mut driver = Driver::new(Fake::new(selected("claude")), config());
     driver.poll_once().unwrap();
 
@@ -687,9 +695,17 @@ fn a_changed_pass_document_starts_a_new_era() {
         2
     );
     // A fresh engine has read nothing, so it is pointed at the document again.
-    let bootstrap = "tmux send alder-leader Read .alder/PASS.md, then run one pass \
+    let bootstrap = "tmux send alder-leader Read .agent/skills/pass/SKILL.md, then run one pass \
                      (pass-id: hm-pass-2; triggers: log).";
     assert!(calls.contains(&bootstrap.to_owned()), "{calls:?}");
+    assert_eq!(
+        driver.effects().pass_doc_reads(),
+        vec![
+            PathBuf::from(".agent/skills/pass/SKILL.md"),
+            PathBuf::from(".agent/skills/pass/SKILL.md"),
+        ],
+        "the era hash must read the same skill the bootstrap injection names"
+    );
 }
 
 #[test]

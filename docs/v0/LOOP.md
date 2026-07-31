@@ -250,8 +250,9 @@ ordinary handle. This is entirely process layer: Alder stores attempts,
 handles, questions, and observations exactly as before, the tmux observer
 lists worker sessions like any other observed object, and `reconcile`
 catches dead ones with the same rules. No Alder mechanism knows the word
-"worker". See `PASS.md` and `WORKER.md` in the repository for the process
-itself, and `alderd spawn` for the dispatch.
+"worker". See the [pass](../../.agent/skills/pass/SKILL.md) and
+[worker](../../.agent/skills/worker/SKILL.md) skills for the process itself,
+and `alderd spawn` for the dispatch.
 
 `alderd spawn <work-id> [tier]` is the whole dispatch: it reads the item,
 records the attempt, cuts the worktree and branch, launches the pane with the
@@ -339,7 +340,7 @@ smuggled past the place where it can be read and changed.
     "claude": { "cmd": "claude", "args": [] },
     "codex": { "cmd": "codex", "args": ["--full-auto"] }
   },
-  "passDoc": ".alder/PASS.md",
+  "passDoc": ".agent/skills/pass/SKILL.md",
   "tmuxSession": "alder-leader",
   "pollSeconds": 60,
   "debounceSeconds": 20,

@@ -1,3 +1,8 @@
+---
+name: context-usage
+description: Read Codex or Claude session context usage from local transcript files.
+---
+
 # Reading context usage from disk
 
 How to find how much context a Claude Code or Codex session is using, without

@@ -1,3 +1,8 @@
+---
+name: pass
+description: Drive one bounded Alder leader pass from durable state.
+---
+
 # One pass
 
 You are the leader for the alder project — the repository you are sitting
