@@ -79,12 +79,6 @@ fn spawn_runs_against_a_private_tmux_server_and_a_throwaway_repo() {
             socket = socket.display()
         ),
     );
-    // The pane is wrapped in `caffeinate -i`, which the sandbox answers with
-    // one of its own so the real one is not needed.
-    write_executable(
-        &bin.path().join("caffeinate"),
-        "#!/bin/sh\nshift\nexec \"$@\"\n",
-    );
     // The log is reached only through this: alderd runs `alder`, never a
     // library. It records what it was asked and keeps just enough state for a
     // second spawn to observe the attempt the first one bound.

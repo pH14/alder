@@ -166,8 +166,9 @@ impl Effects for Host {
     }
 
     fn tmux_new_session(&self, session: &str, engine: &Engine) -> Result<()> {
-        // `caffeinate -i` keeps the Mac from idle-sleeping mid-pass.
-        let mut command = vec!["caffeinate".to_owned(), "-i".to_owned(), engine.cmd.clone()];
+        // The pane runs the engine itself. See `spawn::pane_command` for why
+        // nothing wraps it to keep the host awake.
+        let mut command = vec![engine.cmd.clone()];
         command.extend(engine.args.iter().cloned());
         let command = command
             .iter()
