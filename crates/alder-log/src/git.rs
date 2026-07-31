@@ -849,12 +849,59 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_revisions_are_memoized_after_verification() {
-        let log = GitLog::new("/repository", "origin", "refs/heads/log");
-        let revision = "a".repeat(40);
-        assert!(!log.remembers_authoritative(&revision));
-        log.remember_authoritative(&revision);
-        assert!(log.remembers_authoritative(&revision));
+    fn verified_revisions_remain_readable_after_the_remote_goes_away() {
+        fn run(directory: &Path, args: &[&str]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let temporary = TemporaryDirectory::new().unwrap();
+        let remote = temporary.path().join("remote.git");
+        let local = temporary.path().join("local");
+        run(
+            temporary.path(),
+            &["init", "--bare", remote.to_str().unwrap()],
+        );
+        run(temporary.path(), &["init", local.to_str().unwrap()]);
+        run(
+            &local,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+
+        let draft = |id| {
+            RecordDraft::new(
+                crate::RecordId::new(id).unwrap(),
+                chrono::DateTime::parse_from_rfc3339("2026-07-27T12:00:00Z")
+                    .unwrap()
+                    .into(),
+                "test",
+                crate::EventType::new("example.changed").unwrap(),
+                json!({}),
+                crate::SchemaId::new("example.v1").unwrap(),
+            )
+            .unwrap()
+        };
+        let writer = GitLog::new(&local, "origin", "refs/heads/log");
+        let first = writer.append(&Head::empty(), &draft("one")).unwrap();
+        let second = writer.append(&first.observed_head, &draft("two")).unwrap();
+
+        // Verifying the current head remembers the revision fetched from the
+        // remote; verifying its ancestor remembers the result of merge-base.
+        let reader = GitLog::new(&local, "origin", "refs/heads/log");
+        assert_eq!(reader.read_all(&second.observed_head).unwrap().len(), 2);
+        assert_eq!(reader.read_all(&first.observed_head).unwrap().len(), 1);
+        std::fs::rename(&remote, temporary.path().join("remote-offline.git")).unwrap();
+
+        assert_eq!(reader.read_all(&second.observed_head).unwrap().len(), 2);
+        assert_eq!(reader.read_all(&first.observed_head).unwrap().len(), 1);
     }
 
     #[test]
