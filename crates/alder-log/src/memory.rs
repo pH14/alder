@@ -71,3 +71,46 @@ fn memory_head(length: usize) -> Result<Head, LogError> {
         Head::try_from_parts(length as u64, Some(format!("memory-{length}")))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+
+    use super::*;
+    use crate::{EventType, RecordId, SchemaId};
+
+    fn draft() -> RecordDraft {
+        RecordDraft::new(
+            RecordId::new("one").unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 27, 12, 0, 0).unwrap(),
+            "test",
+            EventType::new("example.changed").unwrap(),
+            json!({}),
+            SchemaId::new("example.v1").unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reads_allow_the_head_as_an_exclusive_after_bound() {
+        let log = MemoryLog::new();
+        let head = log.append(&Head::empty(), &draft()).unwrap().observed_head;
+        assert!(log.read(&head, head.sequence()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reads_reject_heads_that_are_too_new_or_name_the_wrong_revision() {
+        let log = MemoryLog::new();
+        log.append(&Head::empty(), &draft()).unwrap();
+        for forged in [
+            Head::try_from_parts(2, Some("memory-2".to_owned())).unwrap(),
+            Head::try_from_parts(1, Some("not-memory-1".to_owned())).unwrap(),
+        ] {
+            assert!(matches!(
+                log.read(&forged, 0),
+                Err(LogError::InvalidHead { .. })
+            ));
+        }
+    }
+}

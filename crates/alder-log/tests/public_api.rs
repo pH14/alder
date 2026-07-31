@@ -146,10 +146,13 @@ fn git_rejects_a_log_shaped_revision_outside_the_authoritative_history() {
         .unwrap()
         .observed_head;
 
-    assert!(matches!(
-        primary.read_all(&unrelated_head),
-        Err(alder_log::LogError::InvalidHead { .. })
-    ));
+    match primary.read_all(&unrelated_head).unwrap_err() {
+        alder_log::LogError::InvalidHead { message } => assert_eq!(
+            message,
+            "the requested revision is not in the authoritative remote history"
+        ),
+        other => panic!("expected an invalid head, got {other:?}"),
+    }
 }
 
 #[test]

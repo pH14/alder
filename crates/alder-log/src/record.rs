@@ -336,8 +336,8 @@ fn validate_record_id(value: &str) -> Result<(), LogError> {
         || value == "."
         || value == ".."
         || value.contains("..")
-        || value.contains('/')
-        || value.contains('\\')
+        // The alphabet below excludes both path separators, so repeating
+        // their checks would add an unobservable branch without more safety.
         || value
             .chars()
             .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
@@ -388,4 +388,154 @@ fn validate_body(value: &Value) -> Result<(), LogError> {
 }
 fn invalid_control(value: &str) -> bool {
     value.contains('\0') || value.contains('\r') || value.contains('\n')
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+
+    use super::*;
+
+    fn assert_invalid_record_id(value: String) {
+        assert!(matches!(
+            validate_record_id(&value),
+            Err(LogError::InvalidRecord { .. })
+        ));
+    }
+
+    fn assert_invalid_identifier(value: String) {
+        assert!(matches!(
+            validate_identifier(&value),
+            Err(LogError::InvalidRecord { .. })
+        ));
+    }
+
+    #[test]
+    fn heads_require_a_consistent_sequence_and_clean_revision() {
+        let longest_revision = "a".repeat(MAX_TEXT_BYTES);
+        let head = Head::try_from_parts(1, Some(longest_revision.clone())).unwrap();
+        assert_eq!(head.revision(), Some(longest_revision.as_str()));
+        assert!(!head.is_empty());
+        assert!(Head::empty().is_empty());
+
+        assert!(matches!(
+            Head::try_from_parts(0, Some("revision".to_owned())),
+            Err(LogError::InvalidHead { .. })
+        ));
+        assert!(matches!(
+            Head::try_from_parts(1, None),
+            Err(LogError::InvalidHead { .. })
+        ));
+        for revision in [
+            String::new(),
+            "a".repeat(MAX_TEXT_BYTES + 1),
+            "revision\0nul".to_owned(),
+            "revision\rreturn".to_owned(),
+            "revision\nnewline".to_owned(),
+        ] {
+            assert!(matches!(
+                Head::try_from_parts(1, Some(revision)),
+                Err(LogError::InvalidHead { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn record_ids_reject_each_disallowed_filename_component_reason() {
+        validate_record_id("record-_.9").unwrap();
+        validate_record_id(&"a".repeat(MAX_TEXT_BYTES)).unwrap();
+
+        for value in [
+            String::new(),
+            "a".repeat(MAX_TEXT_BYTES + 1),
+            ".".to_owned(),
+            "..".to_owned(),
+            "double..period".to_owned(),
+            "slash/name".to_owned(),
+            "backslash\\name".to_owned(),
+            "has space".to_owned(),
+            "non-ascii-é".to_owned(),
+        ] {
+            assert_invalid_record_id(value);
+        }
+    }
+
+    #[test]
+    fn identifiers_reject_each_disallowed_reason() {
+        validate_identifier("event.type_v1-name").unwrap();
+        validate_identifier(&"a".repeat(MAX_TEXT_BYTES)).unwrap();
+
+        for value in [
+            String::new(),
+            "a".repeat(MAX_TEXT_BYTES + 1),
+            "non-ascii-é".to_owned(),
+            "has space".to_owned(),
+        ] {
+            assert_invalid_identifier(value);
+        }
+    }
+
+    #[test]
+    fn actors_reject_empty_oversized_and_each_control_character() {
+        validate_actor("a person").unwrap();
+        validate_actor(&"a".repeat(MAX_TEXT_BYTES)).unwrap();
+
+        for value in [
+            String::new(),
+            "a".repeat(MAX_TEXT_BYTES + 1),
+            "actor\0nul".to_owned(),
+            "actor\rreturn".to_owned(),
+            "actor\nnewline".to_owned(),
+        ] {
+            assert!(matches!(
+                validate_actor(&value),
+                Err(LogError::InvalidRecord { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn bodies_allow_exactly_one_mebibyte_and_reject_one_byte_more() {
+        let at_limit = Value::String("x".repeat(MAX_BODY_BYTES - 2));
+        let over_limit = Value::String("x".repeat(MAX_BODY_BYTES - 1));
+        assert_eq!(serde_json::to_vec(&at_limit).unwrap().len(), MAX_BODY_BYTES);
+        assert_eq!(
+            serde_json::to_vec(&over_limit).unwrap().len(),
+            MAX_BODY_BYTES + 1
+        );
+        validate_body(&at_limit).unwrap();
+        assert!(matches!(
+            validate_body(&over_limit),
+            Err(LogError::InvalidRecord { .. })
+        ));
+    }
+
+    #[test]
+    fn record_and_draft_accessors_return_their_stored_values() {
+        let record: Record = serde_json::from_value(json!({
+            "id": "stored-record",
+            "seq": 1,
+            "at": "2026-07-27T12:00:00Z",
+            "actor": "stored actor",
+            "type": "example.changed",
+            "body": {"state": "stored"},
+            "schema": "example.v1"
+        }))
+        .unwrap();
+        assert_eq!(record.actor(), "stored actor");
+        assert_eq!(record.body(), &json!({"state": "stored"}));
+
+        let draft = RecordDraft::new(
+            RecordId::new("draft-record").unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 27, 12, 0, 0).unwrap(),
+            "draft actor",
+            EventType::new("example.changed").unwrap(),
+            json!({"state": "draft"}),
+            SchemaId::new("example.v1").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(draft.actor(), "draft actor");
+        assert_eq!(draft.body(), &json!({"state": "draft"}));
+    }
 }

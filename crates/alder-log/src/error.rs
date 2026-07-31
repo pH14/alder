@@ -68,3 +68,78 @@ impl From<serde_json::Error> for LogError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_error_has_its_stable_machine_code() {
+        let record_id = RecordId::new("record").unwrap();
+        let cases = [
+            (
+                LogError::InvalidRecord {
+                    message: String::new(),
+                },
+                "invalid_record",
+            ),
+            (
+                LogError::InvalidHead {
+                    message: String::new(),
+                },
+                "invalid_head",
+            ),
+            (
+                LogError::InvalidRange {
+                    after: 2,
+                    through: 1,
+                },
+                "invalid_range",
+            ),
+            (
+                LogError::HeadConflict {
+                    expected: Head::empty(),
+                    observed: Head::empty(),
+                },
+                "head_conflict",
+            ),
+            (
+                LogError::RecordIdCollision { id: record_id },
+                "record_id_collision",
+            ),
+            (
+                LogError::UnknownOutcome {
+                    message: String::new(),
+                },
+                "unknown_append_outcome",
+            ),
+            (
+                LogError::InvalidLog {
+                    message: String::new(),
+                },
+                "invalid_log",
+            ),
+            (
+                LogError::Unavailable {
+                    message: String::new(),
+                },
+                "store_unavailable",
+            ),
+            (
+                LogError::Io {
+                    message: String::new(),
+                },
+                "io_error",
+            ),
+            (
+                LogError::Serialization {
+                    message: String::new(),
+                },
+                "serialization_error",
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.code(), code);
+        }
+    }
+}
