@@ -60,6 +60,8 @@ jobs:
           fi
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
       - uses: taiki-e/install-action@nextest
 
       - run: cargo nextest run --workspace --locked
@@ -75,10 +77,11 @@ jobs:
 
   # GitHub has no per-job `paths:` filter, so the mutation sweep's path gate
   # lives here. A docs-only pull request should not tie up twelve runners.
-  # Anything outside this list cannot change what a mutant does; anything in it
+  # Anything outside this list cannot change mutation results; anything in it
   # can, including the lockfile (dependency behaviour), the toolchain pin
-  # (compiler), and the mutants config itself. Only pull requests are filtered —
-  # a push to main and the nightly always sweep.
+  # (compiler), the test scripts Rust tests execute or source, and the mutants
+  # config itself. Only pull requests are filtered — a push to main and the
+  # nightly always sweep.
   rust-changed:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -100,7 +103,7 @@ jobs:
           fi
           changed=$(git diff --name-only "origin/$BASE...HEAD")
           echo "$changed"
-          if printf '%s\n' "$changed" | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/mutants\.toml$|^\.github/workflows/ci\.yml$'; then
+          if printf '%s\n' "$changed" | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/mutants\.toml$|^scripts/|^\.github/workflows/ci\.yml$'; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"
@@ -148,6 +151,7 @@ jobs:
       # along with it. `test` populates the cache; the shards live off it.
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: ci
           save-if: false
       - uses: taiki-e/install-action@v2
         with:
