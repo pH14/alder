@@ -1,0 +1,170 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 09:00 UTC daily. Every trigger runs the full sweep, so this exists only to
+    # keep an idle main honest — a week with no pushes still gets checked.
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A superseded run on the same ref is not worth finishing.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The gates a branch must pass before it merges, per .agent/skills/gates,
+  # run here against a clean checkout instead of a warm worktree. Clippy is
+  # `-D warnings` because that manual admits no warnings at all.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # tmux is what the worker loop runs in, so the tmux-dependent tests must
+      # actually run here rather than take their "tmux is not installed" skip.
+      # This is the job's real value: .agent/skills/gates notes that a review
+      # sandbox cannot create the private socket host_tmux needs, so a reviewer
+      # is told to record that failure as environmental. A runner can create it,
+      # which makes CI the only place that test is actually exercised.
+      - name: Install tmux and jq
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install tmux jq
+          else
+            sudo apt-get update
+            sudo apt-get install -y tmux jq
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+
+      - run: cargo nextest run --workspace --locked
+
+      # Shell-level tests of the sandbox teardown and of `alderd spawn`. Both
+      # stub the engine and use a private tmux server, so they need nothing
+      # beyond git, jq, tmux and the debug binaries the test run just built.
+      - name: tmux sandbox teardown guard
+        run: scripts/tests/test-teardown-guard.sh
+
+      # macOS only: `alderd spawn` wraps every engine in `caffeinate -i`
+      # (crates/alderd/src/spawn.rs), which exists only on darwin, and this
+      # script deliberately runs the real binary rather than stubbing it. The
+      # Rust integration tests cover the same path on Linux by putting their
+      # own `caffeinate` on PATH.
+      - name: alderd spawn
+        if: runner.os == 'macOS'
+        run: scripts/tests/verify-spawn.sh
+
+  # GitHub has no per-job `paths:` filter, so the mutation sweep's path gate
+  # lives here. A docs-only pull request should not tie up twelve runners.
+  # Anything outside this list cannot change what a mutant does; anything in it
+  # can, including the lockfile (dependency behaviour), the toolchain pin
+  # (compiler), and the mutants config itself. Only pull requests are filtered —
+  # a push to main and the nightly always sweep.
+  rust-changed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "not a pull request; sweeping regardless"
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "origin/$BASE...HEAD")
+          echo "$changed"
+          if printf '%s\n' "$changed" | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/mutants\.toml$|^\.github/workflows/ci\.yml$'; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # IMPLEMENTATION.md:55 makes mutation coverage a standing policy and names
+  # both halves of the loop surface — `alder` and `alderd` — so this runs
+  # `--workspace`. A bare `cargo mutants` mutates only the root crate, which is
+  # 565 of the 1,251 mutants in the workspace and none of alderd's.
+  #
+  # The sweep runs on every event, sharded twelve ways: ~104 mutants a shard,
+  # measured at ~5 seconds each, so a shard is minutes rather than hours. Twelve
+  # shards plus lint plus the two test jobs is fifteen concurrent jobs, inside
+  # the twenty a free account allows. cargo-mutants exits nonzero on a survivor
+  # or a timeout, which is the whole gate. Shards are 0-based: `--shard 12/12`
+  # is an error, not an empty shard.
+  #
+  # `-j 2` is deliberate and beats `-j 4`: each cargo build already parallelizes
+  # across cores, so more concurrent mutants thrash rather than help. Measured
+  # 4.9s vs 6.2s per mutant, and 24 vs 33 CPU-seconds.
+  #
+  # This starts red on purpose. Sampled shards found survivors at src/main.rs:87
+  # and src/app.rs:602 — both real gaps against invariants the docs state — and
+  # the sample rate suggests more. The gate is meant to make that visible rather
+  # than to be green on arrival.
+  mutants:
+    needs: [test, rust-changed]
+    if: needs.rust-changed.outputs.rust == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tmux and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux jq
+
+      # Restore only. Twelve shards each saving their own multi-hundred-MB cache
+      # would blow the 10 GB per-repository ceiling and evict lint's and test's
+      # along with it. `test` populates the cache; the shards live off it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-mutants
+
+      # `test` already proved the unmutated tree is green; re-proving it once
+      # per shard would be twelve redundant baseline builds.
+      - run: cargo mutants --workspace --shard ${{ matrix.shard }}/12 --baseline skip -j 2
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out
