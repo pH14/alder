@@ -74,18 +74,23 @@ pub fn log_folds_cleanly(records: &[Record]) -> bool {
 /// still agree. A fold that ended a pass without recording an outcome would
 /// satisfy each harness's own sentence while breaking the other's, which is
 /// precisely the drift a shared statement exists to catch.
+///
+/// The spellings are compared pass by pass, not by counting each and comparing
+/// the totals. Two totals can agree while pointing at different passes — one
+/// open pass that somehow carries an outcome, one ended pass that carries none,
+/// and each count is one — which is the same state both harnesses would have
+/// disagreed about, waved through by arithmetic.
 pub fn at_most_one_open_pass(state: &ProjectState) -> bool {
-    let by_state = state
-        .passes
-        .values()
-        .filter(|pass| pass.state == PassState::Open)
-        .count();
-    let unfinished = state
-        .passes
-        .values()
-        .filter(|pass| pass.outcome.is_none())
-        .count();
-    by_state == unfinished && by_state <= 1
+    let mut open = 0;
+    for pass in state.passes.values() {
+        if (pass.state == PassState::Open) != pass.outcome.is_none() {
+            return false;
+        }
+        if pass.state == PassState::Open {
+            open += 1;
+        }
+    }
+    open <= 1
 }
 
 /// A `crashed` verdict follows a real crash.
@@ -370,13 +375,26 @@ mod tests {
 
     #[test]
     fn a_pass_ended_without_an_outcome_breaks_the_two_spellings_apart() {
-        // Neither harness alone would notice: counting by state sees one open
-        // pass, counting by outcome sees none, and both are "at most one".
+        // Neither harness alone would notice: the simulator counts no open pass
+        // at all, the model counts one pass still unfinished, and each of those
+        // is within its own "at most one".
         assert!(!at_most_one_open_pass(&state_with(vec![pass(
             "al-pass-1",
             PassState::Ended,
             None
         )])));
+    }
+
+    #[test]
+    fn two_passes_can_disagree_while_the_two_counts_match() {
+        // The reason this is checked pass by pass. One open pass carrying an
+        // outcome and one ended pass carrying none put the totals at one each,
+        // so comparing the counts would wave through a state where the two
+        // spellings name different passes.
+        assert!(!at_most_one_open_pass(&state_with(vec![
+            pass("al-pass-1", PassState::Open, Some(PassOutcome::Ok)),
+            pass("al-pass-2", PassState::Ended, None),
+        ])));
     }
 
     #[test]
