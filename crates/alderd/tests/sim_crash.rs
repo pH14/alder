@@ -16,12 +16,9 @@ mod simulator;
 use alderd::{driver::Driver, loop_state::LoopState, spawn, tier};
 use proptest::prelude::*;
 use simulator::{
-    AgentScript, Boundary, Case, Fault, MIRRORED, MUTATION_ENVELOPE, Operation, Simulator, Site,
+    AgentScript, Boundary, Case, Fault, Operation, Simulator, assert_case_converges,
     catch_sim_crash, config, execute_case,
 };
-
-/// The real CLI, as source, for the drift tripwires below.
-const CLI_SOURCE: &str = include_str!("../../../src/app.rs");
 
 fn spawn_probe(seed: u64) -> Simulator {
     let probe = Simulator::new(seed);
@@ -189,132 +186,6 @@ fn the_harness_contains_no_wall_clock_or_real_sleep() {
     }
 }
 
-/// The body of `fn <name>` in the CLI source.
-fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
-    source
-        .split_once(&format!("\nfn {name}("))
-        .unwrap_or_else(|| panic!("`fn {name}` is gone from src/app.rs"))
-        .1
-        .split_once("\n}\n")
-        .unwrap_or_else(|| panic!("`fn {name}` has no body"))
-        .0
-}
-
-/// Every `mutation_output(...)` call in the CLI source, as source text.
-///
-/// Parens are balanced with string literals skipped, so a `format!` argument
-/// carrying a bracket cannot end a call early.
-fn mutation_calls(source: &str) -> Vec<&str> {
-    let mut calls = Vec::new();
-    for (index, needle) in source.match_indices("mutation_output(") {
-        if source[..index].ends_with("fn ") {
-            continue; // the definition, not a call
-        }
-        let open = index + needle.len() - 1;
-        let mut depth = 0usize;
-        let mut in_string = false;
-        let mut escaped = false;
-        let mut end = None;
-        for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
-            if in_string {
-                match byte {
-                    _ if escaped => escaped = false,
-                    b'\\' => escaped = true,
-                    b'"' => in_string = false,
-                    _ => {}
-                }
-                continue;
-            }
-            match byte {
-                b'"' => in_string = true,
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(open + offset);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        calls.push(&source[open..=end.expect("a `mutation_output` call is balanced")]);
-    }
-    calls
-}
-
-/// The tripwire for the drift risk named in `simulator::MIRRORED`.
-///
-/// The simulated dispatcher hand-mirrors the CLI's `--json` shapes, and
-/// nothing in the type system ties the two together. This reads the CLI's own
-/// source and fails when the mutation envelope moves, or when a mirrored
-/// schema or field stops being emitted *by the region that answers that
-/// command* — which is the point of narrowing rather than searching the whole
-/// file. `alder.attempt.edit.v0` is claimed by two call sites, binding and
-/// updating, and only the binding is modelled here; a whole-file search would
-/// keep passing on the strength of the arm nobody simulates.
-#[test]
-fn the_simulated_dispatcher_still_mirrors_the_cli_pack() {
-    let body = function_body(CLI_SOURCE, "mutation_output");
-    let envelope: Vec<&str> = body
-        .match_indices("object.insert(\"")
-        .map(|(index, needle)| {
-            body[index + needle.len()..]
-                .split('"')
-                .next()
-                .expect("an inserted key is quoted")
-        })
-        .collect();
-    assert_eq!(
-        envelope, MUTATION_ENVELOPE,
-        "the CLI's mutation envelope moved; mirror it in simulator/mod.rs"
-    );
-
-    let calls = mutation_calls(CLI_SOURCE);
-    assert!(
-        calls.len() >= 10,
-        "only {} mutation_output calls parsed out of src/app.rs; the scanner \
-         is broken, not the CLI",
-        calls.len()
-    );
-
-    for mirrored in MIRRORED {
-        let region = match mirrored.site {
-            Site::Function(name) => function_body(CLI_SOURCE, name),
-            Site::MutationCall(needle) => {
-                let matched: Vec<_> = calls.iter().filter(|call| call.contains(needle)).collect();
-                assert_eq!(
-                    matched.len(),
-                    1,
-                    "`alder {}` is pinned to `{needle}`, which now matches {} \
-                     mutation_output calls; the needle no longer names one \
-                     answer",
-                    mirrored.command,
-                    matched.len()
-                );
-                matched[0]
-            }
-        };
-        if let Some(schema) = mirrored.schema {
-            assert!(
-                region.contains(&format!("\"{schema}\"")),
-                "`alder {}` no longer answers as `{schema}` from the region \
-                 that builds it; the simulated dispatcher is mirroring a CLI \
-                 that moved",
-                mirrored.command
-            );
-        }
-        for field in mirrored.fields {
-            assert!(
-                region.contains(&format!("\"{field}\"")),
-                "`alder {}` no longer emits `{field}`, which the simulator's \
-                 answer still carries; mirror the change in simulator/mod.rs",
-                mirrored.command
-            );
-        }
-    }
-}
-
 /// Every key of `simulated` must exist in `real`.
 ///
 /// The direction is the whole point. An extra key here means the simulator
@@ -347,66 +218,6 @@ fn assert_still_emitted(what: &str, real: &serde_json::Value, production_reads: 
              its real keys are {:?}",
             real.as_object()
                 .map(|object| object.keys().collect::<Vec<_>>())
-        );
-    }
-}
-
-/// Every key production's loop section carries, split by whether [`LoopState`]
-/// — the driver's whole view of the durable log — reads it.
-///
-/// Both halves are asserted against the document production just built, so a
-/// field added to `loop_section` fails here until somebody classifies it.
-/// Everything in the read half is then *required* of the simulator, because
-/// `LoopState` defaults every field it can: an omission deserialises to a
-/// default rather than to an error, and the simulated loop would take a
-/// decision production never takes with this guard still green.
-const LOOP_READ: [&str; 7] = [
-    "paused",
-    "pause_reason",
-    "engine",
-    "rotate_pending",
-    "nudge_pending",
-    "open_pass",
-    "last_pass",
-];
-const LOOP_UNREAD: [&str; 0] = [];
-const OPEN_PASS_READ: [&str; 4] = ["id", "engine", "handle", "started_at"];
-const OPEN_PASS_UNREAD: [&str; 2] = ["triggers", "at_head"];
-const LAST_PASS_READ: [&str; 5] = ["id", "outcome", "wake_at", "ended_at", "ended_seq"];
-const LAST_PASS_UNREAD: [&str; 2] = ["engine", "report_line"];
-
-/// One object of the loop section, compared in both directions.
-///
-/// Production is held to its own inventory — exactly `read` plus `unread`, so a
-/// new field cannot arrive unclassified. The simulator is held to inventing
-/// nothing production lacks *and* to omitting nothing the driver reads.
-fn assert_compared_both_ways(
-    what: &str,
-    simulated: &serde_json::Value,
-    real: &serde_json::Value,
-    read: &[&str],
-    unread: &[&str],
-) {
-    let mut classified: Vec<&str> = read.iter().chain(unread).copied().collect();
-    classified.sort_unstable();
-    let emitted: Vec<&str> = real
-        .as_object()
-        .unwrap_or_else(|| panic!("{what}: production's value is not an object: {real}"))
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(
-        emitted, classified,
-        "{what}: production's fields moved. Each one is either read by \
-         `LoopState` or deliberately not, and this test has to say which."
-    );
-    assert_no_invented_keys(what, simulated, real);
-    for key in read {
-        assert!(
-            simulated.get(key).is_some(),
-            "{what}: the simulator omits `{key}`, which the driver reads; \
-             `LoopState` would default it and the simulated loop would decide \
-             on a value production never sent"
         );
     }
 }
@@ -465,23 +276,9 @@ fn the_simulated_dispatcher_serves_no_nested_shape_production_lacks() {
     assert_still_emitted("in_flight[]", &attempt, &["id", "work_id", "handle"]);
 }
 
-/// The loop section, driven end to end: production's own status packer in, a
-/// parsed [`LoopState`] out, compared both ways.
-///
-/// A scan settles none of it. `"loop"` occurs twice in `fn status` — once as
-/// the key the driver reads, once as a heading in the human rendering — so a
-/// search finds a match whichever one went. Inside the section, `id` appears in
-/// `open_pass` and again in `last_pass`, and `engine` at the top level and
-/// again inside `open_pass`.
-///
-/// Nor does building the document around production's section: a test that
-/// supplies the `loop` key itself is supplying the very thing
-/// `LoopState::from_status` looks up, and cannot notice production renaming or
-/// dropping it. So `app::status_document` — the real packer, envelope and key
-/// included — builds the whole document over the state the simulator answered
-/// from. The two documents are then compared field by field in both
-/// directions, and read back through production's own reader, whose parsed
-/// results must be equal.
+/// The simulator serves the production status builder, then the driver's real
+/// reader consumes that document. The scenario makes both pass sub-objects
+/// nonempty, so the check covers more than the empty loop shape.
 #[test]
 fn the_simulated_status_serves_the_loop_section_production_builds() {
     // Both sub-objects have to be populated or half the comparison is vacuous,
@@ -513,62 +310,11 @@ fn the_simulated_status_serves_the_loop_section_production_builds() {
         "no pass has ended to compare"
     );
 
-    // `status_document` is production's packer only for as long as `status`
-    // is what calls it, and that is a question about one unique identifier —
-    // the kind a source scan settles outright, unlike "which of the two
-    // `"loop"` literals is the key the driver reads".
-    assert!(
-        function_body(CLI_SOURCE, "status").contains("status_document("),
-        "`fn status` no longer builds its answer with `status_document`, so \
-         driving that packer proves nothing about what the CLI hands back"
-    );
-
-    // Production's own packer, over the state the simulator just answered
-    // from. `head` and the `loop` key are written by `src/app.rs`; nothing
-    // here reproduces them.
-    let real = alder::app::status_document(&snapshot.head, false, None, state);
+    let real = alder::app::status_document(state, &snapshot.head, false, None);
     let simulated = alderd::effects::Effects::alder(&host, &["status"]).unwrap();
-
-    // The envelope, which used to be a `MIRRORED` row scanned out of the
-    // source. Two produced documents settle it outright, so the row is gone.
-    // `schema` and `revision` are not read by the driver — the simulator
-    // serves them for fidelity — so dropping either shows up as the simulator
-    // inventing a key rather than as production losing one.
-    assert_no_invented_keys("status", &simulated, &real);
     assert_eq!(
-        simulated["schema"], real["schema"],
-        "the simulator answers `status` as a schema production no longer claims"
-    );
-    // `head` and `loop` are the two the driver does read, and the head is the
-    // whole log trigger. Both directions, on both.
-    assert_still_emitted("status", &real, &["head", "loop"]);
-    for key in ["head", "loop"] {
-        assert!(
-            simulated.get(key).is_some(),
-            "the simulator's status carries no `{key}`, which the driver reads"
-        );
-    }
-
-    assert_compared_both_ways(
-        "status loop",
-        &simulated["loop"],
-        &real["loop"],
-        &LOOP_READ,
-        &LOOP_UNREAD,
-    );
-    assert_compared_both_ways(
-        "status loop.open_pass",
-        &simulated["loop"]["open_pass"],
-        &real["loop"]["open_pass"],
-        &OPEN_PASS_READ,
-        &OPEN_PASS_UNREAD,
-    );
-    assert_compared_both_ways(
-        "status loop.last_pass",
-        &simulated["loop"]["last_pass"],
-        &real["loop"]["last_pass"],
-        &LAST_PASS_READ,
-        &LAST_PASS_UNREAD,
+        simulated, real,
+        "the simulator did not serve the CLI builder"
     );
 
     // And production's own reader, over both documents. Parsed states rather
@@ -897,8 +643,13 @@ proptest! {
         fault_slots in prop::collection::vec((any::<u8>(), any::<u8>()), 0..=2),
     ) {
         let case = generated_case(seed, noise, fault_slots);
-        let first = execute_case(&case);
-        let second = execute_case(&case);
+        // `Tick` can leave the daemon between observations, so the generated
+        // prefix itself is not a fixed point. `assert_case_converges` settles
+        // each complete schedule only after its recovery loop has drained that
+        // logical-time work, and asserts the shared and SimHost-local
+        // invariants there before returning this replay witness.
+        let first = assert_case_converges(&case);
+        let second = assert_case_converges(&case);
         prop_assert_eq!(
             first,
             second,

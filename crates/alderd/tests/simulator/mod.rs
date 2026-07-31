@@ -91,7 +91,7 @@ use alderd::{
     effects::Effects,
     error::{DriverError, Result},
     loop_state::LoopState,
-    spawn::{Run, SpawnHost, spawn},
+    spawn::{ObservedSession, Run, SpawnHost, spawn},
     tier::tier,
 };
 use chrono::{DateTime, Utc};
@@ -101,139 +101,6 @@ const ROOT: &str = "/sim/alder";
 const WORK_ID: &str = "al-sim";
 const LEADER_SESSION: &str = "alder-leader";
 const MAX_RECOVERY_ROUNDS: usize = 96;
-
-/// The envelope `src/app.rs::mutation_output` wraps around every mutating
-/// `alder --json` answer. See [`MIRRORED`] for why this is spelled out here.
-pub const MUTATION_ENVELOPE: [&str; 4] = ["schema", "head", "revision", "event_id"];
-
-/// Where in `src/app.rs` the real answer to one dispatched command is built.
-///
-/// The region matters as much as the schema. A whole-file search for a schema
-/// identifier proves almost nothing: `alder.attempt.edit.v0` is claimed by two
-/// call sites — binding a handle and updating metadata — and this simulator
-/// models only the binding, so a rename confined to the binding arm would slip
-/// straight past a search that the *other* arm keeps satisfying.
-#[derive(Debug, Clone, Copy)]
-pub enum Site {
-    /// The body of `fn <name>` in `src/app.rs`, for a read.
-    Function(&'static str),
-    /// The one `mutation_output(...)` call whose source text contains this
-    /// needle. Asserted to match exactly one call, so an ambiguous needle is a
-    /// test failure rather than a silently weakened check.
-    MutationCall(&'static str),
-}
-
-/// One document this simulator hands back, and the CLI region that produces
-/// the real one.
-///
-/// **DRIFT RISK, NAMED OUT LOUD.** This module hand-mirrors the real CLI's
-/// output shapes. Nothing in the build makes the two move together: `alder`'s
-/// documents are `json!` literals in `src/app.rs`, and the simulator's are
-/// `json!` literals here. If the CLI renames `attempt_id`, drops `current`, or
-/// re-wraps a mutation answer, every test in this harness keeps passing while
-/// production breaks — the simulator would simply be faithfully simulating a
-/// CLI that no longer exists.
-///
-/// The tripwire is `the_simulated_dispatcher_still_mirrors_the_cli_pack` in
-/// `sim_crash.rs`. It reads `src/app.rs`, narrows to each [`Site`], and fails
-/// if the schema or any mirrored field is not emitted *from that region*.
-///
-/// **A source scan is the weak guard, and it is used only where nothing
-/// stronger is available.** It sees a key the CLI writes as a literal, but it
-/// cannot tell one occurrence of that key from another, so it is trusted here
-/// only for the flat top level of each document — where a name appears once
-/// and means one thing.
-///
-/// Everything a scan cannot settle is checked instead by comparing a *produced
-/// document* against what production actually builds, which is a guard no
-/// rename slips past. `current` and each `in_flight` item are serialised from
-/// domain types whose field names appear nowhere in `src/app.rs`; the whole
-/// `status` document is a literal, but `loop` occurs twice in `fn status` and
-/// `id` and `engine` each occur at two different depths inside the section, so
-/// a scan for any of them proves nothing. Different reasons, same answer —
-/// both are covered by the `the_simulated_…serves_…` tests, and `alder status`
-/// has no row here at all because that comparison covers its whole document.
-///
-/// What none of it can see is a field the CLI renames in a region this
-/// simulator does not model at all, so a new `alder` sub-command answered here
-/// has to arrive with a row in this table.
-#[derive(Debug, Clone, Copy)]
-pub struct Mirrored {
-    /// `alder <command>`, as this simulator dispatches it.
-    pub command: &'static str,
-    pub site: Site,
-    /// The schema the region must still claim, where the region declares one.
-    /// A region that is spliced into a larger document — the loop section —
-    /// carries none of its own.
-    pub schema: Option<&'static str>,
-    /// Every key the simulator's answer carries beyond the envelope, that
-    /// production writes as a literal in this region.
-    pub fields: &'static [&'static str],
-}
-
-pub const MIRRORED: [Mirrored; 8] = [
-    Mirrored {
-        command: "show",
-        site: Site::Function("show"),
-        schema: Some("alder.show.v0"),
-        fields: &["head", "id", "kind", "current", "history"],
-    },
-    Mirrored {
-        // `alder status` has no row: it is guarded end to end instead, by
-        // `the_simulated_status_serves_the_loop_section_production_builds`,
-        // which drives `app::status_document` — the real packer, envelope and
-        // `loop` key included — and compares the answers as documents and as
-        // parsed `LoopState`s. That subsumes a scan for the schema, `head`,
-        // `revision` and `loop`, and catches the renames a scan cannot see.
-        //
-        // Both `status` answers arrive through the same two packers, this
-        // simulator's `status_pack` and production's `status_document`, so
-        // what is left to scan for here is the one key that distinguishes
-        // this answer and is a literal in `fn status`.
-        command: "status --section in_flight",
-        site: Site::Function("status"),
-        schema: None,
-        fields: &["in_flight"],
-    },
-    Mirrored {
-        command: "refresh",
-        site: Site::Function("refresh"),
-        schema: Some("alder.refresh.v0"),
-        fields: &["head", "changed", "result"],
-    },
-    Mirrored {
-        command: "work start",
-        site: Site::MutationCall("alder.work.start.v0"),
-        schema: Some("alder.work.start.v0"),
-        fields: &["work_id", "attempt_id"],
-    },
-    Mirrored {
-        // Narrowed to the binding arm: the updating arm claims the same schema
-        // and this simulator does not model it.
-        command: "attempt edit --handle",
-        site: Site::MutationCall(r#""change": "bound""#),
-        schema: Some("alder.attempt.edit.v0"),
-        fields: &["attempt_id", "change", "handle"],
-    },
-    Mirrored {
-        command: "attempt end",
-        site: Site::MutationCall("alder.attempt.end.v0"),
-        schema: Some("alder.attempt.end.v0"),
-        fields: &["attempt_id", "outcome"],
-    },
-    Mirrored {
-        command: "loop wake",
-        site: Site::MutationCall("alder.loop.wake.v0"),
-        schema: Some("alder.loop.wake.v0"),
-        fields: &["pass_id", "engine", "handle", "triggers"],
-    },
-    Mirrored {
-        command: "pass end",
-        site: Site::MutationCall("alder.pass.end.v0"),
-        schema: Some("alder.pass.end.v0"),
-        fields: &["pass_id", "outcome", "rotate"],
-    },
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentScript {
@@ -497,6 +364,9 @@ struct World {
     /// running it consumes it, so one `script_leader` means one scripted pass,
     /// whichever session ends up handling it.
     pending_script: AgentScript,
+    /// The witness the shared crashed-verdict predicate needs: how many live
+    /// leader sessions the simulator actually saw disappear.
+    real_leader_deaths: usize,
     notices: Vec<String>,
     messages: Vec<String>,
 }
@@ -515,6 +385,7 @@ impl World {
             directories: BTreeSet::new(),
             files: BTreeSet::new(),
             pending_script: AgentScript::Complete,
+            real_leader_deaths: 0,
             notices: Vec::new(),
             messages: Vec::new(),
         }
@@ -562,8 +433,8 @@ pub struct Case {
 enum Answer {
     /// A read: no footprint, and the document as it stands.
     Read(Result<Value>),
-    /// A mutation: one append to stage, plus the fields the CLI packs around
-    /// it. See [`MIRRORED`] for the drift risk this shape carries.
+    /// A mutation: one append to stage, plus the command-specific fields that
+    /// the shared CLI document builder packs around its receipt.
     Mutation {
         payload: EventPayload,
         schema: &'static str,
@@ -649,10 +520,7 @@ impl Simulator {
     pub fn snapshot(&self) -> Snapshot {
         let head = self.shared.log.head().expect("the memory log has a head");
         let events = self
-            .shared
-            .log
-            .read_all(&head)
-            .expect("the memory log is readable")
+            .records()
             .iter()
             .map(decode_record)
             .collect::<alder::error::Result<Vec<_>>>()
@@ -663,6 +531,14 @@ impl Simulator {
             events,
             state,
         }
+    }
+
+    fn records(&self) -> Vec<alder_log::Record> {
+        let head = self.shared.log.head().expect("the memory log has a head");
+        self.shared
+            .log
+            .read_all(&head)
+            .expect("the memory log is readable")
     }
 
     pub fn stale_cas_is_rejected(&self) -> bool {
@@ -945,7 +821,12 @@ impl Simulator {
                 }
             }
             Mutation::SessionRemove(name) => {
-                self.shared.world.borrow_mut().sessions.remove(name);
+                let mut world = self.shared.world.borrow_mut();
+                if name == LEADER_SESSION && world.sessions.remove(name).is_some() {
+                    world.real_leader_deaths += 1;
+                } else {
+                    world.sessions.remove(name);
+                }
             }
             Mutation::WorktreeEntryRemoved(path) => {
                 self.shared.world.borrow_mut().worktrees.remove(path);
@@ -986,82 +867,16 @@ impl Simulator {
         }
     }
 
-    /// A mutation answer, packed the way `src/app.rs::mutation_output` packs
-    /// one: the fields, plus the envelope, with the head read *after* the
-    /// append landed — exactly where the real CLI reads it.
+    /// A mutation answer built by the same packer the CLI uses, with the head
+    /// read after the simulated append landed.
     fn pack(&self, schema: &str, event_id: &str, fields: Value) -> Value {
-        let mut object = self.headed(schema, fields);
         let head = self.shared.log.head().expect("the memory log has a head");
-        object.insert("revision".to_owned(), json!(head.revision()));
-        object.insert("event_id".to_owned(), json!(event_id));
-        Value::Object(object)
-    }
-
-    /// The two keys every `alder --json` document carries, whatever it is.
-    ///
-    /// Read envelopes are deliberately **not** shared beyond this. `status`
-    /// carries a `revision` and `show` and `refresh` do not, and a common
-    /// packer that added one to all three would be drift in the dangerous
-    /// direction: daemon code could come to depend on a field production has
-    /// never emitted, and this harness would keep passing while the real CLI
-    /// handed back nothing. Omitting a field production does have is the safe
-    /// direction — the simulator fails first — so each read says for itself.
-    fn headed(&self, schema: &str, fields: Value) -> serde_json::Map<String, Value> {
-        let head = self.shared.log.head().expect("the memory log has a head");
-        let mut object = match fields {
-            Value::Object(object) => object,
-            _ => serde_json::Map::new(),
-        };
-        object.insert("schema".to_owned(), json!(schema));
-        object.insert("head".to_owned(), json!(head.sequence()));
-        object
-    }
-
-    /// `alder show --json`: schema, head, and the item. No revision.
-    fn show_pack(&self, fields: Value) -> Value {
-        Value::Object(self.headed("alder.show.v0", fields))
-    }
-
-    /// `alder refresh --json`: schema, head, and what the sweep saw. No
-    /// revision.
-    fn refresh_pack(&self, fields: Value) -> Value {
-        Value::Object(self.headed("alder.refresh.v0", fields))
-    }
-
-    /// `alder status --json`, the one read that does carry a revision.
-    fn status_pack(&self, fields: Value) -> Value {
-        let head = self.shared.log.head().expect("the memory log has a head");
-        let mut object = self.headed("alder.status.v0", fields);
-        object.insert("revision".to_owned(), json!(head.revision()));
-        Value::Object(object)
+        alder::app::mutation_document(&head, schema, event_id, &fields)
     }
 
     fn status_document(&self) -> Value {
         let snapshot = self.snapshot();
-        let state = &snapshot.state;
-        let control = &state.loop_control;
-        self.status_pack(json!({
-            "loop": {
-                "paused": control.paused,
-                "pause_reason": control.pause_reason,
-                "engine": control.engine,
-                "rotate_pending": control.rotate_pending(),
-                "nudge_pending": control.nudge_pending(),
-                "open_pass": state.open_pass().map(|pass| json!({
-                    "id": pass.id,
-                    "engine": pass.engine,
-                    "handle": pass.handle,
-                    "started_at": pass.started_at,
-                })),
-                "last_pass": state.last_ended_pass().map(|pass| json!({
-                    "id": pass.id,
-                    "outcome": pass.outcome.map(PassOutcome::as_str),
-                    "wake_at": pass.wake_at,
-                    "ended_at": pass.ended_at,
-                    "ended_seq": pass.ended_seq,
-                })),
-            }
-        }))
+        alder::app::status_document(&snapshot.state, &snapshot.head, false, None)
     }
 
     fn observations(&self) -> Vec<ObservedHandle> {
@@ -1167,16 +982,6 @@ impl Simulator {
             })
         {
             anomalies.push(format!("desired:{WORK_ID}"));
-        }
-        if snapshot
-            .state
-            .passes
-            .values()
-            .filter(|pass| pass.state == PassState::Open)
-            .count()
-            > 1
-        {
-            anomalies.push("passes:multiple-open".to_owned());
         }
         anomalies
     }
@@ -1405,23 +1210,41 @@ impl Simulator {
     }
 
     pub fn assert_invariant(&self, want_worker: bool) {
+        use alder::domain::invariants;
+
+        let records = self.records();
         let snapshot = self.snapshot();
         let findings = self.reconcile();
+        assert!(
+            invariants::log_folds_cleanly(&records),
+            "the simulated log does not fold cleanly"
+        );
+        assert!(
+            invariants::at_most_one_open_pass(&snapshot.state),
+            "the shared open-pass safety predicate failed"
+        );
+        let real_leader_deaths = self.shared.world.borrow().real_leader_deaths;
+        assert!(
+            invariants::crashed_verdicts_follow_real_crashes(&snapshot.state, real_leader_deaths,),
+            "the log has more crashed pass verdicts than observed leader deaths"
+        );
+        assert!(
+            invariants::rotate_pending_mirrors_the_request_log(&snapshot.state, &snapshot.events),
+            "the shared rotation-log safety predicate failed"
+        );
+        assert!(
+            invariants::acknowledged_handoffs_are_never_lost(
+                &snapshot.state,
+                &snapshot.events,
+                &[],
+            ),
+            "the shared handoff safety predicate failed"
+        );
         assert!(findings.is_empty(), "unreconciled findings: {findings:#?}");
         assert!(
             self.anomalies(want_worker).is_empty(),
             "stranded world state: {:?}",
             self.anomalies(want_worker)
-        );
-        assert!(
-            snapshot
-                .state
-                .passes
-                .values()
-                .filter(|pass| pass.state == PassState::Open)
-                .count()
-                <= 1,
-            "more than one pass is open"
         );
         assert!(
             snapshot.state.open_pass().is_none(),
@@ -1530,10 +1353,8 @@ impl Simulator {
         }
     }
 
-    /// The simulated `alder <args> --json`.
-    ///
-    /// Every shape here is hand-mirrored from `src/app.rs`; see
-    /// [`MIRRORED`] for the drift risk that carries.
+    /// The simulated `alder <args> --json`, built with production's JSON
+    /// builders over the simulator's current state and append receipts.
     fn alder_command(&self, args: &[&str]) -> Result<Value> {
         let label = dispatch_label(args);
         match self.answer(args) {
@@ -1562,65 +1383,48 @@ impl Simulator {
         match args {
             ["show", id] if *id == WORK_ID => {
                 let snapshot = self.snapshot();
-                let Some(work) = snapshot.state.work.get(*id) else {
-                    return Answer::Read(Err(DriverError::coded("not_found", "work not found")));
-                };
-                Answer::Read(Ok(self.show_pack(json!({
-                    "id": work.id,
-                    "kind": "work",
-                    "current": {
-                        "id": work.id,
-                        "title": work.title,
-                        "spec": work.spec,
-                        "checks": work.checks,
-                        "state": work.state.as_str(),
-                    },
-                    "history": [],
-                }))))
+                Answer::Read(
+                    alder::app::show_document(
+                        &snapshot.state,
+                        &snapshot.events,
+                        &snapshot.head,
+                        id,
+                    )
+                    .map_err(|error| DriverError::new(error.to_string())),
+                )
             }
             ["show", id] if id.contains("-pass-") => {
                 self.run_agent_if_ready(id);
                 let snapshot = self.snapshot();
-                let Some(pass) = snapshot.state.passes.get(*id) else {
-                    return Answer::Read(Err(DriverError::coded("not_found", "pass not found")));
-                };
-                Answer::Read(Ok(self.show_pack(json!({
-                    "id": pass.id,
-                    "kind": "pass",
-                    "current": {
-                        "id": pass.id,
-                        "state": match pass.state {
-                            PassState::Open => "open",
-                            PassState::Ended => "ended",
-                        },
-                        "outcome": pass.outcome.map(PassOutcome::as_str),
-                    },
-                    "history": [],
-                }))))
+                Answer::Read(
+                    alder::app::show_document(
+                        &snapshot.state,
+                        &snapshot.events,
+                        &snapshot.head,
+                        id,
+                    )
+                    .map_err(|error| DriverError::new(error.to_string())),
+                )
             }
             ["status"] => Answer::Read(Ok(self.status_document())),
             ["status", "--section", "in_flight"] => {
                 let snapshot = self.snapshot();
-                let in_flight: Vec<_> = snapshot
-                    .state
-                    .attempts
-                    .values()
-                    .filter(|attempt| {
-                        matches!(attempt.state, AttemptState::Starting | AttemptState::Active)
-                    })
-                    .map(|attempt| {
-                        json!({
-                            "id": attempt.id,
-                            "work_id": attempt.work_id,
-                            "handle": attempt.handle,
-                        })
-                    })
-                    .collect();
-                Answer::Read(Ok(self.status_pack(json!({"in_flight": in_flight}))))
+                let mut document =
+                    alder::app::status_document(&snapshot.state, &snapshot.head, false, None);
+                document
+                    .as_object_mut()
+                    .expect("status document is an object")
+                    .insert(
+                        "in_flight".to_owned(),
+                        alder::app::in_flight_section(&snapshot.state),
+                    );
+                Answer::Read(Ok(document))
             }
-            ["refresh"] => Answer::Read(Ok(
-                self.refresh_pack(json!({"changed": false, "result": {"changed": false}}))
-            )),
+            ["refresh"] => {
+                let head = self.shared.log.head().expect("the memory log has a head");
+                let result = json!({"changed": false});
+                Answer::Read(Ok(alder::app::refresh_document(&head, false, &result)))
+            }
             ["work", "start", work_id] => {
                 let snapshot = self.snapshot();
                 let ordinal = snapshot
@@ -1794,6 +1598,36 @@ impl SpawnHost for Simulator {
                 .unwrap_or_default();
             run.ok = self.shared.world.borrow().branches.contains(branch);
             ("spawn.branch-probe", Footprint::read_only())
+        } else if args.starts_with(&["worktree", "list", "--porcelain", "-z"]) {
+            run.stdout = self
+                .shared
+                .world
+                .borrow()
+                .worktrees
+                .keys()
+                .map(|path| format!("worktree {}\\0", path.display()))
+                .collect();
+            ("repair.worktree-list", Footprint::read_only())
+        } else if args.first() == Some(&"-C")
+            && args.get(2) == Some(&"symbolic-ref")
+            && args.last() == Some(&"HEAD")
+        {
+            let path = PathBuf::from(args.get(1).copied().unwrap_or_default());
+            let branch = self
+                .shared
+                .world
+                .borrow()
+                .worktrees
+                .get(&path)
+                .map(|worktree| worktree.branch.clone());
+            match branch {
+                Some(branch) => run.stdout = format!("{branch}\\n"),
+                None => {
+                    run.ok = false;
+                    run.stderr = "worktree is not registered".to_owned();
+                }
+            }
+            ("spawn.worktree-probe", Footprint::read_only())
         } else if args.starts_with(&["worktree", "add"]) {
             let path = PathBuf::from(args[2]);
             let branch = if let Some(index) = args.iter().position(|arg| *arg == "-b") {
@@ -1844,13 +1678,32 @@ impl SpawnHost for Simulator {
         Ok(run)
     }
 
-    fn tmux_session_exists(&self, session: &str) -> Result<bool> {
-        let exists = self.shared.world.borrow().sessions.contains_key(session);
+    fn tmux_session(&self, session: &str) -> Result<Option<ObservedSession>> {
+        let observed = self
+            .shared
+            .world
+            .borrow()
+            .sessions
+            .get(session)
+            .map(|session| {
+                ObservedSession {
+                    attempt_id: session.attempt_id.clone(),
+                    // Simulated worker panes stay alive after their scripted
+                    // command, just as the production pane ends in `exec bash`.
+                    engine_live: true,
+                }
+            });
         self.effect("spawn.session-probe", Footprint::read_only());
-        Ok(exists)
+        Ok(observed)
     }
 
-    fn tmux_new_session(&self, session: &str, cwd: &Path, _command: &str) -> Result<()> {
+    fn tmux_new_session(
+        &self,
+        session: &str,
+        cwd: &Path,
+        _command: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
         if self.shared.world.borrow().sessions.contains_key(session) {
             return Err(DriverError::new("session already exists"));
         }
@@ -1861,28 +1714,17 @@ impl SpawnHost for Simulator {
         };
         self.effect(
             label,
-            Footprint::tearable(vec![Mutation::SessionCreate {
-                name: session.to_owned(),
-                cwd: cwd.to_path_buf(),
-            }]),
+            Footprint::tearable(vec![
+                Mutation::SessionCreate {
+                    name: session.to_owned(),
+                    cwd: cwd.to_path_buf(),
+                },
+                Mutation::SessionStamp {
+                    name: session.to_owned(),
+                    attempt_id: attempt_id.to_owned(),
+                },
+            ]),
         );
-        Ok(())
-    }
-
-    fn tmux_set_environment(&self, session: &str, name: &str, value: &str) -> Result<()> {
-        if !self.shared.world.borrow().sessions.contains_key(session) {
-            return Err(DriverError::new("session missing"));
-        }
-        // Only the attempt stamp is world state the observer can read back.
-        let footprint = if name == "ALDER_ATTEMPT" {
-            Footprint::tearable(vec![Mutation::SessionStamp {
-                name: session.to_owned(),
-                attempt_id: value.to_owned(),
-            }])
-        } else {
-            Footprint::read_only()
-        };
-        self.effect("spawn.session-stamp", footprint);
         Ok(())
     }
 
@@ -1902,6 +1744,22 @@ impl SpawnHost for Simulator {
         drop(world);
         self.effect("spawn.path-probe", Footprint::read_only());
         exists
+    }
+
+    fn canonical_path(&self, path: &Path) -> Result<PathBuf> {
+        self.effect("repair.path-canonicalize", Footprint::read_only());
+        Ok(path.to_path_buf())
+    }
+
+    fn remove_path(&self, path: &Path) -> Result<()> {
+        self.effect(
+            "repair.path-sweep",
+            Footprint::tearable(vec![
+                Mutation::FilesRemovedUnder(path.to_path_buf()),
+                Mutation::DirectoriesRemovedUnder(path.to_path_buf()),
+            ]),
+        );
+        Ok(())
     }
 
     fn create_dir_all(&self, path: &Path) -> Result<()> {
@@ -1965,7 +1823,17 @@ impl Effects for Simulator {
     }
 
     fn tmux_new_session(&self, session: &str, _engine: &Engine) -> Result<()> {
-        <Self as SpawnHost>::tmux_new_session(self, session, &self.root, "scripted leader")
+        if self.shared.world.borrow().sessions.contains_key(session) {
+            return Err(DriverError::new("session already exists"));
+        }
+        self.effect(
+            "pass.session-create",
+            Footprint::tearable(vec![Mutation::SessionCreate {
+                name: session.to_owned(),
+                cwd: self.root.clone(),
+            }]),
+        );
+        Ok(())
     }
 
     fn tmux_kill_session(&self, session: &str) -> Result<()> {
@@ -2068,7 +1936,16 @@ pub fn catch_sim_crash<T>(action: impl FnOnce() -> T) -> Option<T> {
     }
 }
 
-pub fn execute_case(case: &Case) -> Digest {
+/// Execute a generated schedule and assert the recovered fixed point.
+///
+/// [`Operation::Tick`] may legitimately leave an ordinary live state between
+/// operations: it advances only the logical clock, and no daemon poll has yet
+/// observed a newly due timeout. Convergence is therefore not a valid claim
+/// after every operation. It is valid after `recover`, which repeats observe,
+/// reconcile, decide, and repair until the clock drives no unfinished work;
+/// that is where this function asserts both shared log safety and SimHost's
+/// local world-state predicates.
+pub fn assert_case_converges(case: &Case) -> Digest {
     let host = Simulator::new(case.seed);
     host.schedule_faults(case.fault_schedule.clone());
     let mut daemon = Driver::new(host.clone(), config());
@@ -2114,12 +1991,19 @@ pub fn execute_case(case: &Case) -> Digest {
         }
     }
     host.recover(want_worker);
+    host.assert_invariant(want_worker);
     assert!(
         host.remaining_faults().is_empty(),
         "case ended before scheduled crashes fired: {case:#?}; remaining={:?}",
         host.remaining_faults()
     );
     host.digest()
+}
+
+/// Run a case through the same convergence assertion that generated cases
+/// exercise, then return its replay digest.
+pub fn execute_case(case: &Case) -> Digest {
+    assert_case_converges(case)
 }
 
 /// The trace label one simulated `alder` invocation is recorded under.
