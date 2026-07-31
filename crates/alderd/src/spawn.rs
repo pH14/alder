@@ -1043,6 +1043,8 @@ mod tests {
         existing_branches: RefCell<BTreeSet<String>>,
         worktrees: RefCell<BTreeMap<PathBuf, String>>,
         strays: RefCell<BTreeSet<PathBuf>>,
+        common_dir: RefCell<Option<Run>>,
+        canonical_paths: RefCell<BTreeMap<PathBuf, PathBuf>>,
         sessions: RefCell<BTreeMap<String, ObservedSession>>,
         crash_after: RefCell<Option<&'static str>>,
         fail_tmux: bool,
@@ -1166,6 +1168,9 @@ mod tests {
                 .borrow_mut()
                 .push(format!("git {}", args.join(" ")));
             if args.contains(&"--git-common-dir") {
+                if let Some(run) = self.common_dir.borrow().clone() {
+                    return Ok(run);
+                }
                 return Ok(Run {
                     ok: true,
                     stdout: "/projects/alder/.git\n".to_owned(),
@@ -1282,7 +1287,12 @@ mod tests {
         }
 
         fn canonical_path(&self, path: &Path) -> Result<PathBuf> {
-            Ok(path.to_path_buf())
+            Ok(self
+                .canonical_paths
+                .borrow()
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| path.to_path_buf()))
         }
 
         fn remove_path(&self, path: &Path) -> Result<()> {
@@ -1370,6 +1380,132 @@ mod tests {
             "alder attempt edit al-1-attempt-1 --handle tmux:alder-work-al-1 \
              --meta engine=gpt-5.6-luna --meta effort=high --meta tier=luna"
         ));
+    }
+
+    #[test]
+    fn spawned_summary_names_the_identity_and_whether_it_was_adopted() {
+        let started = Spawned {
+            work_id: "al-1".to_owned(),
+            attempt_id: "al-1-attempt-1".to_owned(),
+            tier: "terra",
+            model: "gpt-5.6-terra",
+            effort: "xhigh",
+            session: "alder-work-al-1".to_owned(),
+            branch: "work/al-1".to_owned(),
+            worktree: PathBuf::from("/projects/alder-work-al-1"),
+            adopted: false,
+        };
+        let adopted = Spawned {
+            adopted: true,
+            ..started.clone()
+        };
+
+        assert_eq!(
+            started.summary(),
+            "spawned alder-work-al-1 on work/al-1 at /projects/alder-work-al-1 (tier terra, model gpt-5.6-terra, effort xhigh, attempt al-1-attempt-1 started)"
+        );
+        assert!(
+            adopted
+                .summary()
+                .ends_with("attempt al-1-attempt-1 adopted)")
+        );
+    }
+
+    #[test]
+    fn git_common_directory_requires_a_successful_nonempty_answer() {
+        let host = Fake::new();
+        host.common_dir.borrow_mut().replace(Run {
+            ok: true,
+            stdout: "/shared/alder.git\n".to_owned(),
+            stderr: String::new(),
+        });
+        assert_eq!(git_common_dir(&host), "/shared/alder.git");
+
+        host.common_dir.borrow_mut().replace(Run {
+            ok: true,
+            stdout: " \n".to_owned(),
+            stderr: String::new(),
+        });
+        assert_eq!(git_common_dir(&host), "/projects/alder/.git");
+
+        host.common_dir.borrow_mut().replace(Run {
+            ok: false,
+            stdout: "/misleading/alder.git\n".to_owned(),
+            stderr: "fatal: not a repository".to_owned(),
+        });
+        assert_eq!(git_common_dir(&host), "/projects/alder/.git");
+    }
+
+    #[test]
+    fn a_registered_canonical_worktree_is_never_swept_as_residue() {
+        let host = Fake::new();
+        let worktree = PathBuf::from("/projects/alder-work-al-1");
+        let canonical = PathBuf::from("/private/projects/alder-work-al-1");
+        host.strays.borrow_mut().insert(worktree.clone());
+        host.canonical_paths
+            .borrow_mut()
+            .insert(worktree.clone(), canonical.clone());
+        host.worktrees
+            .borrow_mut()
+            .insert(canonical, "work/al-1".to_owned());
+
+        sweep_unregistered_worktree(&host, Path::new("/projects"), &worktree)
+            .expect("a registered canonical worktree is retained");
+
+        assert!(!host.called("remove /projects/alder-work-al-1"));
+        assert!(host.strays.borrow().contains(&worktree));
+    }
+
+    #[test]
+    fn a_session_bearing_another_attempt_is_never_adopted() {
+        let observed = ObservedSession {
+            attempt_id: Some("al-1-attempt-2".to_owned()),
+            engine_live: true,
+        };
+        let error = verify_session_identity("alder-work-al-1", &observed, "al-1-attempt-1")
+            .expect_err("a session identity is not interchangeable");
+        assert!(
+            error
+                .message
+                .contains("belongs to attempt `al-1-attempt-2`"),
+            "{error}"
+        );
+        verify_session_identity(
+            "alder-work-al-1",
+            &ObservedSession {
+                attempt_id: None,
+                engine_live: true,
+            },
+            "al-1-attempt-1",
+        )
+        .expect("an old unmarked session can be repaired");
+    }
+
+    #[test]
+    fn undo_reports_a_failed_worktree_removal_and_first_line_is_useful() {
+        let host = Fake::new();
+        host.fail_git
+            .borrow_mut()
+            .insert("worktree remove".to_owned());
+        undo(
+            &host,
+            &Made {
+                worktree: true,
+                session: false,
+            },
+            "alder-work-al-1",
+            Path::new("/projects/alder-work-al-1"),
+        );
+        assert!(
+            host.called("could not remove /projects/alder-work-al-1: fatal: it did not work"),
+            "{:#?}",
+            host.calls()
+        );
+        assert_eq!(
+            first_line("\n  first useful line\nsecond line\n"),
+            "first useful line"
+        );
+        assert_eq!(first_line("\n \t\n"), "no output");
     }
 
     #[test]

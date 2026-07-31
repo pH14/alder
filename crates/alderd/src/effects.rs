@@ -469,4 +469,39 @@ mod tests {
         assert!(residue.symlink_metadata().is_err());
         assert_eq!(std::fs::read_to_string(protected).unwrap(), "keep");
     }
+
+    #[test]
+    fn spawn_host_paths_are_real_and_missing_residue_is_harmless() {
+        let root = tempfile::TempDir::new().expect("a project root");
+        let nested_binary = root.path().join("bin/alder");
+        std::fs::create_dir_all(nested_binary.parent().unwrap()).unwrap();
+        std::fs::write(&nested_binary, "#!/bin/sh\n").unwrap();
+        let host = Host::for_command(root.path().to_path_buf(), "bin/alder".to_owned());
+
+        assert_eq!(
+            SpawnHost::alder_binary(&host),
+            nested_binary,
+            "a configured relative path is rooted in the project"
+        );
+        assert_eq!(
+            SpawnHost::canonical_path(&host, root.path()).unwrap(),
+            std::fs::canonicalize(root.path()).unwrap(),
+        );
+        SpawnHost::remove_path(&host, &root.path().join("already-gone"))
+            .expect("removing absent residue converges");
+    }
+
+    #[test]
+    fn removing_residue_does_not_hide_non_not_found_errors() {
+        let root = tempfile::TempDir::new().expect("a project root");
+        let not_a_directory = root.path().join("file");
+        std::fs::write(&not_a_directory, "not a directory").unwrap();
+        let impossible_child = not_a_directory.join("child");
+        let host = Host::for_command(root.path().to_path_buf(), "alder".to_owned());
+
+        let error = SpawnHost::remove_path(&host, &impossible_child)
+            .expect_err("only a missing path is safe to ignore");
+
+        assert!(error.message.contains("cannot inspect"), "{error}");
+    }
 }

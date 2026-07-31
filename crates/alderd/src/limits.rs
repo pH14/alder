@@ -106,6 +106,13 @@ mod tests {
     }
 
     #[test]
+    fn an_error_other_than_a_missing_file_is_not_an_empty_state() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let error = Limits::load(directory.path()).expect_err("a directory is not a limits file");
+        assert!(error.message.contains("cannot read"), "{error}");
+    }
+
+    #[test]
     fn a_limit_expires_on_its_own_without_being_swept() {
         let mut limits = Limits::default();
         limits.set(
@@ -130,6 +137,13 @@ mod tests {
         assert!(limits.providers.contains_key("codex"));
         limits.clear(Provider::Codex);
         assert!(limits.providers.is_empty());
+    }
+
+    #[test]
+    fn a_limit_at_its_exact_deadline_is_expired() {
+        let mut limits = Limits::default();
+        limits.set(Provider::Codex, now(), None);
+        assert!(limits.limited(Provider::Codex, now()).is_none());
     }
 
     #[test]

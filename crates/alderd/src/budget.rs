@@ -440,6 +440,29 @@ mod tests {
     }
 
     #[test]
+    fn codex_spend_includes_both_edges_of_its_time_window() {
+        let now = now();
+        let home = tempfile::TempDir::new().unwrap();
+        let since = now - Duration::hours(1);
+        write(
+            &home.path().join("sessions/2026/07/29/window.jsonl"),
+            &[
+                codex_turn(&(since - Duration::seconds(1)).to_rfc3339(), 1_000, 1_000),
+                codex_turn(&since.to_rfc3339(), 10, 1),
+                codex_turn(&now.to_rfc3339(), 20, 2),
+                codex_turn(&(now + Duration::seconds(1)).to_rfc3339(), 2_000, 2_000),
+            ],
+        );
+
+        let (spend, unread) = codex_spend(home.path(), since, now);
+
+        assert_eq!(unread, None);
+        assert_eq!(spend.input_tokens, 30);
+        assert_eq!(spend.output_tokens, 3);
+        assert_eq!(spend.sessions, 1);
+    }
+
+    #[test]
     fn claude_spend_takes_one_figure_per_session_and_skips_subagents() {
         let now = now();
         let home = tempfile::TempDir::new().unwrap();
@@ -465,6 +488,29 @@ mod tests {
         assert_eq!(spend.input_tokens, 307);
         assert_eq!(spend.output_tokens, 33);
         assert_eq!(spend.sessions, 2);
+    }
+
+    #[test]
+    fn claude_spend_adds_each_input_usage_component_once() {
+        let now = now();
+        let home = tempfile::TempDir::new().unwrap();
+        let mut turn = claude_turn(&at(now, 10), false, 100, 7);
+        let usage = turn
+            .pointer_mut("/message/usage")
+            .expect("the fixture has usage");
+        usage["cache_creation_input_tokens"] = json!(20);
+        usage["cache_read_input_tokens"] = json!(3);
+        write(
+            &home.path().join("projects/-Users-x-alder/one.jsonl"),
+            &[turn],
+        );
+
+        let (spend, unread) = claude_spend(home.path(), now - Duration::hours(1), now);
+
+        assert_eq!(unread, None);
+        assert_eq!(spend.input_tokens, 123);
+        assert_eq!(spend.output_tokens, 7);
+        assert_eq!(spend.sessions, 1);
     }
 
     #[test]
@@ -528,5 +574,24 @@ mod tests {
         assert!(text.contains("rate-limited until"), "{text}");
         assert!(text.contains("429 mid-turn"), "{text}");
         assert!(text.contains("real spend in the window"), "{text}");
+    }
+
+    #[test]
+    fn a_rate_limit_without_a_reason_is_still_rendered() {
+        let now = now();
+        let mut limits = Limits::default();
+        limits.set(Provider::Codex, now + Duration::hours(1), None);
+        let report = report(
+            now,
+            24,
+            &limits,
+            Path::new("/nonexistent/codex"),
+            Path::new("/nonexistent/claude"),
+        );
+
+        let text = report.lines().join("\n");
+
+        assert!(text.contains("rate-limited until"), "{text}");
+        assert!(!text.contains("rate-limited until  ("), "{text}");
     }
 }
