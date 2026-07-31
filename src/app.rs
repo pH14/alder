@@ -15,9 +15,9 @@ use crate::{
     },
     config::{Project, initialize},
     domain::{
-        AppendResult, AttemptOutcome, ChangeMode, CheckDefinition, CheckStatus, CheckUpdate, Event,
-        EventPayload, GraphChangeDocument, NullableString, PassOutcome, PassTrigger, ProjectLog,
-        ProjectState, Question, Snapshot, WorkStateChange, prepare_change,
+        AppendResult, Attempt, AttemptOutcome, ChangeMode, CheckDefinition, CheckStatus,
+        CheckUpdate, Event, EventPayload, GraphChangeDocument, Head, NullableString, PassOutcome,
+        PassTrigger, ProjectLog, ProjectState, Question, Snapshot, WorkStateChange, prepare_change,
     },
     error::{AlderError, Result},
     observer,
@@ -645,6 +645,57 @@ fn attempt_edit(context: &Context, args: &AttemptEditArgs) -> Result<Output> {
     ))
 }
 
+/// The part of `alder status --json` every answer carries: the read envelope,
+/// and the loop section filed under the key the driver reads it from. `status`
+/// inserts the observation, question, and count sections — and whichever
+/// listings were asked for — on top of this.
+///
+/// Public, and split out of `status`, so a test can drive the real packer over
+/// a state it built rather than assembling the document itself. `alderd`'s
+/// `LoopState::from_status` looks `loop` and `head` up by name, and a test that
+/// writes those keys by hand cannot notice production renaming or dropping
+/// either. Neither can a scan of this file: `status` spells `"loop"` a second
+/// time for the human rendering, so a search finds a match whichever
+/// occurrence went.
+pub fn status_document(
+    state: &ProjectState,
+    head: &Head,
+    hypothetical: bool,
+    source: Option<&str>,
+) -> Value {
+    json!({
+        "schema": "alder.status.v0",
+        "head": head.sequence(),
+        "revision": head.revision(),
+        "hypothetical": hypothetical,
+        "source": source,
+        "loop": loop_section(state),
+    })
+}
+
+/// The active-attempt listing a targeted `alder status --section in_flight`
+/// answer carries. It is derived from the current state each time, in the same
+/// order as the full status document.
+pub fn in_flight_section(state: &ProjectState) -> Value {
+    json!(in_flight_attempts(state))
+}
+
+fn in_flight_attempts(state: &ProjectState) -> Vec<Attempt> {
+    let mut in_flight: Vec<_> = state
+        .attempts
+        .values()
+        .filter(|attempt| {
+            matches!(
+                attempt.state,
+                crate::domain::AttemptState::Starting | crate::domain::AttemptState::Active
+            )
+        })
+        .cloned()
+        .collect();
+    in_flight.sort_by_key(|attempt| attempt.started_seq);
+    in_flight
+}
+
 fn status(
     context: &mut Context,
     changes: Option<&str>,
@@ -680,18 +731,7 @@ fn status(
         .cloned()
         .collect();
     handoffs.sort_by_key(|handoff| handoff.submitted_seq);
-    let mut in_flight: Vec<_> = state
-        .attempts
-        .values()
-        .filter(|attempt| {
-            matches!(
-                attempt.state,
-                crate::domain::AttemptState::Starting | crate::domain::AttemptState::Active
-            )
-        })
-        .cloned()
-        .collect();
-    in_flight.sort_by_key(|attempt| attempt.started_seq);
+    let in_flight = in_flight_attempts(&state);
     let ready: Vec<_> = state.ready().into_iter().cloned().collect();
     let mut all_questions: Vec<_> = state.questions.values().cloned().collect();
     all_questions.sort_by_key(|question| question.asked_seq);
@@ -724,7 +764,6 @@ fn status(
         .cloned()
         .collect();
     blocked.sort_by_key(|work| work.opened_seq);
-    let loop_section = loop_section(&state);
     let counts = json!({
         "attention": findings.len(),
         "handoffs": handoffs.len(),
@@ -733,21 +772,22 @@ fn status(
         "waiting_on_human": questions.len(),
         "blocked": blocked.len(),
     });
-    let mut json = json!({
-        "schema": "alder.status.v0",
-        "head": context.snapshot.head.sequence(),
-        "revision": context.snapshot.head.revision(),
-        "hypothetical": hypothetical,
-        "source": source,
-        "loop": loop_section,
-        "observations": {
+    let mut json = status_document(
+        &state,
+        &context.snapshot.head,
+        hypothetical,
+        source.as_deref(),
+    );
+    let object = json.as_object_mut().expect("status json is an object");
+    object.insert(
+        "observations".to_owned(),
+        json!({
             "runs": runs,
             "handles": observations,
-        },
-        "questions": rendered_questions,
-        "counts": counts,
-    });
-    let object = json.as_object_mut().expect("status json is an object");
+        }),
+    );
+    object.insert("questions".to_owned(), json!(rendered_questions));
+    object.insert("counts".to_owned(), counts);
     if full {
         object.insert("attention".to_owned(), json!(findings));
         object.insert("handoffs".to_owned(), json!(handoffs));
@@ -928,8 +968,11 @@ fn selected_status_sections(
 }
 
 /// The loop's desired state and its two interesting passes. The driver reads
-/// this section and ignores the rest of `status`. Public so the model checker
-/// in `alder-model` reads the loop through the same projection the daemon does.
+/// this section and ignores the rest of `status`. It is public so the model
+/// checker and the simulator read the loop through the same projection the
+/// daemon does. [`status_document`] files this value under the `loop` key,
+/// letting simulator tests compare the full production document instead of
+/// grepping source literals.
 pub fn loop_section(state: &ProjectState) -> Value {
     let control = &state.loop_control;
     json!({
@@ -1079,20 +1122,27 @@ fn overlay_state(
     Ok((state, true, Some(path.to_owned())))
 }
 
-fn show(context: &Context, id: &str) -> Result<Output> {
+/// The JSON document returned by `alder show`.
+///
+/// It has no I/O of its own: the state and the complete event history it
+/// renders are passed in. That lets consumers which already own an in-memory
+/// project state use the same document builder as the CLI rather than keeping
+/// a second copy of this agent-facing contract.
+pub fn show_document(
+    state: &ProjectState,
+    events: &[Event],
+    head: &Head,
+    id: &str,
+) -> Result<Value> {
     let (kind, current, related): (&str, Value, BTreeSet<String>) =
-        if let Some(value) = context.snapshot.state.work.get(id) {
-            let related = context
-                .snapshot
-                .state
+        if let Some(value) = state.work.get(id) {
+            let related = state
                 .attempts
                 .values()
                 .filter(|attempt| attempt.work_id == id)
                 .map(|attempt| attempt.id.clone())
                 .chain(
-                    context
-                        .snapshot
-                        .state
+                    state
                         .questions
                         .values()
                         .filter(|question| question.work_id == id)
@@ -1101,25 +1151,25 @@ fn show(context: &Context, id: &str) -> Result<Output> {
                 .chain(std::iter::once(id.to_owned()))
                 .collect();
             ("work", serde_json::to_value(value)?, related)
-        } else if let Some(value) = context.snapshot.state.attempts.get(id) {
+        } else if let Some(value) = state.attempts.get(id) {
             (
                 "attempt",
                 serde_json::to_value(value)?,
                 BTreeSet::from([id.to_owned()]),
             )
-        } else if let Some(value) = context.snapshot.state.questions.get(id) {
+        } else if let Some(value) = state.questions.get(id) {
             (
                 "question",
-                question_value(&context.snapshot.state, value)?,
+                question_value(state, value)?,
                 BTreeSet::from([id.to_owned()]),
             )
-        } else if let Some(value) = context.snapshot.state.handoffs.get(id) {
+        } else if let Some(value) = state.handoffs.get(id) {
             (
                 "handoff",
                 serde_json::to_value(value)?,
                 BTreeSet::from([id.to_owned()]),
             )
-        } else if let Some(value) = context.snapshot.state.passes.get(id) {
+        } else if let Some(value) = state.passes.get(id) {
             (
                 "pass",
                 serde_json::to_value(value)?,
@@ -1128,9 +1178,7 @@ fn show(context: &Context, id: &str) -> Result<Output> {
         } else {
             return Err(AlderError::not_found("object", id));
         };
-    let history: Vec<_> = context
-        .snapshot
-        .events
+    let history: Vec<_> = events
         .iter()
         .filter(|event| {
             related
@@ -1139,15 +1187,30 @@ fn show(context: &Context, id: &str) -> Result<Output> {
         })
         .map(event_summary)
         .collect();
+    Ok(json!({
+        "schema": "alder.show.v0",
+        "head": head.sequence(),
+        "id": id,
+        "kind": kind,
+        "current": current,
+        "history": history,
+    }))
+}
+
+fn show(context: &Context, id: &str) -> Result<Output> {
+    let document = show_document(
+        &context.snapshot.state,
+        &context.snapshot.events,
+        &context.snapshot.head,
+        id,
+    )?;
+    let current = document["current"].clone();
+    let history = document["history"]
+        .as_array()
+        .expect("show document history is an array")
+        .clone();
     Ok(Output::new(
-        json!({
-            "schema": "alder.show.v0",
-            "head": context.snapshot.head.sequence(),
-            "id": id,
-            "kind": kind,
-            "current": current,
-            "history": history,
-        }),
+        document,
         format!(
             "{}\n\nhistory\n{}",
             serde_json::to_string_pretty(&current)?,
@@ -1158,6 +1221,18 @@ fn show(context: &Context, id: &str) -> Result<Output> {
                 .join("\n")
         ),
     ))
+}
+
+/// The JSON document returned by `alder refresh` after observation has run.
+/// The observation result is already a value at this boundary, so this stays a
+/// pure packer rather than teaching a caller about the projection.
+pub fn refresh_document(head: &Head, changed: bool, result: &Value) -> Value {
+    json!({
+        "schema": "alder.refresh.v0",
+        "head": head.sequence(),
+        "changed": changed,
+        "result": result,
+    })
 }
 
 fn refresh(context: &Context) -> Result<Output> {
@@ -1185,13 +1260,9 @@ fn refresh(context: &Context) -> Result<Output> {
     if result.changed {
         lines.push("changed since the previous refresh".to_owned());
     }
+    let result_value = serde_json::to_value(&result)?;
     Ok(Output::new(
-        json!({
-            "schema": "alder.refresh.v0",
-            "head": context.snapshot.head.sequence(),
-            "changed": result.changed,
-            "result": result,
-        }),
+        refresh_document(&context.snapshot.head, result.changed, &result_value),
         lines.join("\n"),
     ))
 }
@@ -1489,27 +1560,38 @@ fn configured_kinds(context: &Context) -> BTreeSet<String> {
         .collect()
 }
 
+/// The common document envelope emitted by every successful mutation.
+///
+/// The event and head are facts an append returned; packing them is otherwise
+/// pure, which keeps consumers from recreating this stable JSON shape.
+pub fn mutation_document(head: &Head, schema: &str, event_id: &str, fields: &Value) -> Value {
+    let mut object = match fields {
+        Value::Object(object) => object.clone(),
+        _ => serde_json::Map::new(),
+    };
+    object.insert("schema".to_owned(), json!(schema));
+    object.insert("head".to_owned(), json!(head.sequence()));
+    object.insert("revision".to_owned(), json!(head.revision()));
+    object.insert("event_id".to_owned(), json!(event_id));
+    Value::Object(object)
+}
+
 fn mutation_output(
     schema: &str,
     result: &AppendResult,
     fields: Value,
     human: impl Into<String>,
 ) -> Output {
-    let mut object = match fields {
-        Value::Object(object) => object,
-        _ => serde_json::Map::new(),
-    };
-    object.insert("schema".to_owned(), json!(schema));
-    object.insert("head".to_owned(), json!(result.head.sequence()));
-    object.insert("revision".to_owned(), json!(result.head.revision()));
-    object.insert("event_id".to_owned(), json!(result.event.id));
-    Output::new(Value::Object(object), human)
+    Output::new(
+        mutation_document(&result.head, schema, &result.event.id, &fields),
+        human,
+    )
 }
 
 /// A question rendered with its derived visibility. `stranded` is not stored;
 /// it is read back out of the work's current state every time, which is what
 /// makes `work reopen` restore the question with no repair event.
-fn question_value(state: &ProjectState, question: &Question) -> Result<Value> {
+pub fn question_value(state: &ProjectState, question: &Question) -> Result<Value> {
     let mut value = serde_json::to_value(question)?;
     let stranded = state
         .stranded(question)
@@ -1531,7 +1613,7 @@ fn stranded_note(questions: &[String]) -> String {
     }
 }
 
-fn event_summary(event: &Event) -> Value {
+pub fn event_summary(event: &Event) -> Value {
     json!({
         "seq": event.seq,
         "id": event.id,
