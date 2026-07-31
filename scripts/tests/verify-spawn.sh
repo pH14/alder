@@ -17,7 +17,7 @@
 # Everything happens under one throwaway directory: its own git repo, its own
 # bare "remote" holding the alder log, its own work item, and its own tmux
 # SERVER, so no session leaks into the project's observer and nothing is
-# appended to the project's ledger. Nothing is written inside the checkout.
+# appended to the project's log. Nothing is written inside the checkout.
 #
 # Isolating that server is the whole safety story, and TMUX_TMPDIR does NOT do
 # it. When this script runs inside a tmux pane — which it does, because workers

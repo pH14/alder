@@ -16,7 +16,7 @@ use crate::{
     config::{Project, initialize},
     domain::{
         AppendResult, AttemptOutcome, ChangeMode, CheckDefinition, CheckStatus, CheckUpdate, Event,
-        EventPayload, GraphChangeDocument, Ledger, NullableString, PassOutcome, PassTrigger,
+        EventPayload, GraphChangeDocument, NullableString, PassOutcome, PassTrigger, ProjectLog,
         ProjectState, Question, Snapshot, WorkStateChange, prepare_change,
     },
     error::{AlderError, Result},
@@ -44,7 +44,7 @@ pub struct App;
 
 struct Context {
     project: Project,
-    ledger: Ledger<GitLog>,
+    log: ProjectLog<GitLog>,
     projection: Projection,
     snapshot: Snapshot,
 }
@@ -75,7 +75,7 @@ impl App {
                     require_reason("--why", Some(&args.why))?;
                     let result =
                         context
-                            .ledger
+                            .log
                             .end_attempt(&args.attempt, outcome, args.why.clone())?;
                     Ok(mutation_output(
                         "alder.attempt.end.v0",
@@ -87,7 +87,7 @@ impl App {
             },
             Command::Question(args) => match &args.command {
                 QuestionCommand::Answer(args) => {
-                    let result = context.ledger.answer(&args.question, args.answer.clone())?;
+                    let result = context.log.answer(&args.question, args.answer.clone())?;
                     Ok(mutation_output(
                         "alder.question.answer.v0",
                         &result,
@@ -98,7 +98,7 @@ impl App {
             },
             Command::Handoff(args) => match &args.command {
                 HandoffCommand::Add(args) => {
-                    let (result, id) = context.ledger.add_handoff(
+                    let (result, id) = context.log.add_handoff(
                         args.title.clone(),
                         args.artifact_ref.clone(),
                         args.note.clone(),
@@ -113,7 +113,7 @@ impl App {
                 HandoffCommand::Withdraw(args) => {
                     require_reason("--why", Some(&args.why))?;
                     let result = context
-                        .ledger
+                        .log
                         .withdraw_handoff(&args.handoff, args.why.clone())?;
                     Ok(mutation_output(
                         "alder.handoff.withdraw.v0",
@@ -127,7 +127,7 @@ impl App {
             Command::Pass(args) => match &args.command {
                 PassCommand::End(args) => {
                     let wake_after = args.wake.as_deref().map(parse_duration).transpose()?;
-                    let (result, id) = context.ledger.end_pass(
+                    let (result, id) = context.log.end_pass(
                         args.pass.as_deref(),
                         args.outcome.into(),
                         args.report.clone(),
@@ -194,17 +194,17 @@ fn load_context() -> Result<Context> {
     let project = Project::discover(&cwd)?;
     let actor = actor();
     let marker = project.append_marker();
-    let ledger = Ledger::new(project.store(), &project.config.prefix, actor)
+    let log = ProjectLog::new(project.store(), &project.config.prefix, actor)
         // The marker is a hint: a failed touch must never fail the append.
         .with_on_append(move || {
             let _ = fs::write(&marker, b"");
         });
-    let snapshot = ledger.snapshot()?;
+    let snapshot = log.snapshot()?;
     let projection = Projection::new(project.state_db());
     projection.sync(&snapshot.head, &snapshot.events, &snapshot.state)?;
     Ok(Context {
         project,
-        ledger,
+        log,
         projection,
         snapshot,
     })
@@ -222,7 +222,7 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
         WorkCommand::Edit(args) => work_edit(context, args),
         WorkCommand::Start(args) => {
             let metadata = parse_metadata(&args.meta)?;
-            let (result, id) = context.ledger.start(&args.work, metadata)?;
+            let (result, id) = context.log.start(&args.work, metadata)?;
             Ok(mutation_output(
                 "alder.work.start.v0",
                 &result,
@@ -242,7 +242,7 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
                 ));
             }
             let stranded = context.snapshot.state.unanswered_questions(&args.work);
-            let result = context.ledger.finish(
+            let result = context.log.finish(
                 &args.work,
                 args.attempt.clone(),
                 args.external,
@@ -262,7 +262,7 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
         }
         WorkCommand::Drop(args) => {
             let stranded = context.snapshot.state.unanswered_questions(&args.work);
-            let result = context.ledger.drop_work(
+            let result = context.log.drop_work(
                 &args.work,
                 args.attempt.clone(),
                 args.outcome.map(Into::into),
@@ -293,7 +293,7 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
         }
         WorkCommand::Reopen(args) => {
             require_reason("--why", Some(&args.why))?;
-            let result = context.ledger.reopen(&args.work, args.why.clone())?;
+            let result = context.log.reopen(&args.work, args.why.clone())?;
             Ok(mutation_output(
                 "alder.work.reopen.v0",
                 &result,
@@ -303,7 +303,7 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
         }
         WorkCommand::Block(args) => {
             require_reason("--why", Some(&args.why))?;
-            let result = context.ledger.set_work_state(
+            let result = context.log.set_work_state(
                 &args.work,
                 WorkStateChange::Block {
                     reason: args.why.clone(),
@@ -318,7 +318,7 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
         }
         WorkCommand::Unblock(args) => {
             require_reason("--why", Some(&args.why))?;
-            let result = context.ledger.set_work_state(
+            let result = context.log.set_work_state(
                 &args.work,
                 WorkStateChange::Unblock {
                     reason: args.why.clone(),
@@ -332,7 +332,7 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
             ))
         }
         WorkCommand::Ask(args) => {
-            let (result, id) = context.ledger.ask(&args.work, args.question.clone())?;
+            let (result, id) = context.log.ask(&args.work, args.question.clone())?;
             Ok(mutation_output(
                 "alder.work.ask.v0",
                 &result,
@@ -354,7 +354,7 @@ fn loop_command(context: &Context, command: &LoopCommand) -> Result<Output> {
             }
             triggers.sort();
             triggers.dedup();
-            let (result, id) = context.ledger.wake_loop(
+            let (result, id) = context.log.wake_loop(
                 args.engine.clone(),
                 args.handle.clone(),
                 triggers.clone(),
@@ -372,7 +372,7 @@ fn loop_command(context: &Context, command: &LoopCommand) -> Result<Output> {
             ))
         }
         LoopCommand::Pause(args) => {
-            let result = context.ledger.pause_loop(args.why.clone())?;
+            let result = context.log.pause_loop(args.why.clone())?;
             Ok(mutation_output(
                 "alder.loop.pause.v0",
                 &result,
@@ -381,7 +381,7 @@ fn loop_command(context: &Context, command: &LoopCommand) -> Result<Output> {
             ))
         }
         LoopCommand::Resume => {
-            let result = context.ledger.resume_loop()?;
+            let result = context.log.resume_loop()?;
             Ok(mutation_output(
                 "alder.loop.resume.v0",
                 &result,
@@ -390,7 +390,7 @@ fn loop_command(context: &Context, command: &LoopCommand) -> Result<Output> {
             ))
         }
         LoopCommand::Use(args) => {
-            let result = context.ledger.select_engine(args.engine.clone())?;
+            let result = context.log.select_engine(args.engine.clone())?;
             Ok(mutation_output(
                 "alder.loop.use.v0",
                 &result,
@@ -399,7 +399,7 @@ fn loop_command(context: &Context, command: &LoopCommand) -> Result<Output> {
             ))
         }
         LoopCommand::Rotate(args) => {
-            let result = context.ledger.request_rotation(args.why.clone())?;
+            let result = context.log.request_rotation(args.why.clone())?;
             Ok(mutation_output(
                 "alder.loop.rotate.v0",
                 &result,
@@ -408,7 +408,7 @@ fn loop_command(context: &Context, command: &LoopCommand) -> Result<Output> {
             ))
         }
         LoopCommand::Nudge(args) => {
-            let result = context.ledger.request_nudge(args.why.clone())?;
+            let result = context.log.request_nudge(args.why.clone())?;
             Ok(mutation_output(
                 "alder.loop.nudge.v0",
                 &result,
@@ -425,11 +425,11 @@ fn work_add(context: &Context, args: &WorkAddArgs) -> Result<Output> {
         let document = read_change(path)?;
         let prepared =
             context
-                .ledger
+                .log
                 .allocate_change(&context.snapshot, &document, ChangeMode::AddOnly)?;
         let mappings = prepared.mappings.clone();
         let result = context
-            .ledger
+            .log
             .commit_change(&context.snapshot, &document, prepared)?;
         let human = mappings
             .iter()
@@ -445,7 +445,7 @@ fn work_add(context: &Context, args: &WorkAddArgs) -> Result<Output> {
     }
     let checks = parse_checks(&args.check)?;
     if let Some(handoff) = args.handoff.as_deref() {
-        let (result, id) = context.ledger.integrate_handoff(
+        let (result, id) = context.log.integrate_handoff(
             handoff,
             args.title.clone(),
             args.spec.clone(),
@@ -464,7 +464,7 @@ fn work_add(context: &Context, args: &WorkAddArgs) -> Result<Output> {
         .title
         .clone()
         .ok_or_else(|| AlderError::validation("work add requires --title"))?;
-    let (result, id) = context.ledger.add_work(
+    let (result, id) = context.log.add_work(
         title,
         args.spec.clone(),
         args.priority,
@@ -505,12 +505,12 @@ fn work_edit(context: &Context, args: &WorkEditArgs) -> Result<Output> {
         let document = read_change(path)?;
         let prepared =
             context
-                .ledger
+                .log
                 .allocate_change(&context.snapshot, &document, ChangeMode::Edit)?;
         let mappings = prepared.mappings.clone();
         let edited: Vec<_> = document.edit.iter().map(|edit| edit.id.clone()).collect();
         let result = context
-            .ledger
+            .log
             .commit_change(&context.snapshot, &document, prepared)?;
         let mut lines: Vec<_> = mappings
             .iter()
@@ -565,12 +565,11 @@ fn work_edit(context: &Context, args: &WorkEditArgs) -> Result<Output> {
             remove_checks: args.remove_check.clone(),
         }],
     };
-    let prepared =
-        context
-            .ledger
-            .allocate_change(&context.snapshot, &document, ChangeMode::Edit)?;
+    let prepared = context
+        .log
+        .allocate_change(&context.snapshot, &document, ChangeMode::Edit)?;
     let result = context
-        .ledger
+        .log
         .commit_change(&context.snapshot, &document, prepared)?;
     Ok(mutation_output(
         "alder.edit.work.v0",
@@ -610,7 +609,7 @@ fn attempt_edit(context: &Context, args: &AttemptEditArgs) -> Result<Output> {
             ));
         }
         let result = context
-            .ledger
+            .log
             .bind_attempt(&args.attempt, handle.clone(), metadata)?;
         return Ok(mutation_output(
             "alder.attempt.edit.v0",
@@ -636,7 +635,7 @@ fn attempt_edit(context: &Context, args: &AttemptEditArgs) -> Result<Output> {
         ));
     }
     let result = context
-        .ledger
+        .log
         .update_attempt(&args.attempt, metadata, note, checks)?;
     Ok(mutation_output(
         "alder.attempt.edit.v0",

@@ -267,7 +267,7 @@ the existing local Codex rollouts, finds the first new `session_meta` whose
 `cwd` is the worktree, and stamps that UUID as `codex-session` on the attempt.
 This is deliberately outside the worker turn: a one-shot that dies before its
 first tool call still has a durable resume handle. The sidecar leaves a local
-marker first; when a ledger append is temporarily unavailable, the tmux
+marker first; when a log append is temporarily unavailable, the tmux
 observer recovers the fresh rollout UUID and supplies it to `reconcile`, which names a
 `codex_session_unstamped` finding and its exact `attempt edit` repair. A
 resume without that UUID is refused rather than guessing from `--last`, since
@@ -310,7 +310,7 @@ driver repeats those kinds in the message it injects.
 A pass woken by `observations` runs its complete sync — status, handoffs,
 reconcile, questions, selection — exactly like a pass woken by `due`. The
 driver cannot know what else changed while it was not looking, and the whole
-point of a durable ledger is that the leader does not have to be told; it
+point of a durable log is that the leader does not have to be told; it
 reads.
 
 The injected message therefore takes one of two forms and nothing else:

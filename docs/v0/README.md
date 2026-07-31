@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Alder is a durable work-and-attempt ledger for autonomous engineering
+Alder is a durable work-and-attempt log for autonomous engineering
 workflows.
 
 It must let a fresh agent answer, without relying on a previous session's

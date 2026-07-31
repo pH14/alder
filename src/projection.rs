@@ -796,7 +796,7 @@ mod tests {
     use super::*;
     use crate::domain::{
         AttemptOutcome, CheckDefinition, CheckStatus, CheckUpdate, EventPayload, HandoffDefinition,
-        Ledger, WorkState,
+        ProjectLog, WorkState,
     };
     use alder_log::MemoryLog as MemoryStore;
 
@@ -845,22 +845,19 @@ mod tests {
 
     #[test]
     fn a_respawn_may_reuse_the_handle_of_an_ended_attempt() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "tester");
-        let (_, work_id) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "tester");
+        let (_, work_id) = log
             .add_work("Build".to_owned(), None, 42, Vec::new(), Vec::new())
             .unwrap();
-        let (_, first) = ledger.start(&work_id, BTreeMap::new()).unwrap();
-        ledger
-            .bind_attempt(&first, "tmux:leader".to_owned(), BTreeMap::new())
+        let (_, first) = log.start(&work_id, BTreeMap::new()).unwrap();
+        log.bind_attempt(&first, "tmux:leader".to_owned(), BTreeMap::new())
             .unwrap();
-        ledger
-            .end_attempt(&first, AttemptOutcome::Lost, "handle absent".to_owned())
+        log.end_attempt(&first, AttemptOutcome::Lost, "handle absent".to_owned())
             .unwrap();
-        let (_, second) = ledger.start(&work_id, BTreeMap::new()).unwrap();
-        ledger
-            .bind_attempt(&second, "tmux:leader".to_owned(), BTreeMap::new())
+        let (_, second) = log.start(&work_id, BTreeMap::new()).unwrap();
+        log.bind_attempt(&second, "tmux:leader".to_owned(), BTreeMap::new())
             .unwrap();
-        let snapshot = ledger.snapshot().unwrap();
+        let snapshot = log.snapshot().unwrap();
 
         let temporary = TempDir::new().unwrap();
         let projection = Projection::new(temporary.path().join("state.db"));
@@ -925,8 +922,8 @@ mod tests {
 
     #[test]
     fn projection_round_trips_the_complete_fold_and_observation_state() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "tester");
-        let (_, work_id) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "tester");
+        let (_, work_id) = log
             .add_work(
                 "Build".to_owned(),
                 Some("Specification".to_owned()),
@@ -938,25 +935,23 @@ mod tests {
                 }],
             )
             .unwrap();
-        let (_, attempt_id) = ledger.start(&work_id, BTreeMap::new()).unwrap();
-        ledger
-            .bind_attempt(&attempt_id, "tmux:one".to_owned(), BTreeMap::new())
+        let (_, attempt_id) = log.start(&work_id, BTreeMap::new()).unwrap();
+        log.bind_attempt(&attempt_id, "tmux:one".to_owned(), BTreeMap::new())
             .unwrap();
-        ledger
-            .update_attempt(
-                &attempt_id,
-                BTreeMap::from([("engine".to_owned(), json!("opus"))]),
-                Some("working".to_owned()),
-                vec![CheckUpdate {
-                    key: "test".to_owned(),
-                    status: CheckStatus::Satisfied,
-                    evidence: "CI 42".to_owned(),
-                }],
-            )
-            .unwrap();
-        let (_, question_id) = ledger.ask(&work_id, "Ship?".to_owned()).unwrap();
-        ledger.answer(&question_id, "Yes".to_owned()).unwrap();
-        let snapshot = ledger.snapshot().unwrap();
+        log.update_attempt(
+            &attempt_id,
+            BTreeMap::from([("engine".to_owned(), json!("opus"))]),
+            Some("working".to_owned()),
+            vec![CheckUpdate {
+                key: "test".to_owned(),
+                status: CheckStatus::Satisfied,
+                evidence: "CI 42".to_owned(),
+            }],
+        )
+        .unwrap();
+        let (_, question_id) = log.ask(&work_id, "Ship?".to_owned()).unwrap();
+        log.answer(&question_id, "Yes".to_owned()).unwrap();
+        let snapshot = log.snapshot().unwrap();
 
         let temporary = TempDir::new().unwrap();
         let projection = Projection::new(temporary.path().join("state.db"));
@@ -1030,12 +1025,12 @@ mod tests {
 
     #[test]
     fn verification_detects_each_projection_mismatch() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "tester");
-        let (_, work_id) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "tester");
+        let (_, work_id) = log
             .add_work("Build".to_owned(), None, 0, Vec::new(), Vec::new())
             .unwrap();
-        ledger.start(&work_id, BTreeMap::new()).unwrap();
-        let snapshot = ledger.snapshot().unwrap();
+        log.start(&work_id, BTreeMap::new()).unwrap();
+        let snapshot = log.snapshot().unwrap();
         let temporary = TempDir::new().unwrap();
         let projection = Projection::new(temporary.path().join("state.db"));
 

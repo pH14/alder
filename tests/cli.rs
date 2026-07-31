@@ -480,7 +480,7 @@ fn attempt_file_values_append_contents_not_local_paths() {
     ]);
 
     // The paths were only input to this process. Removing both files before
-    // reading the event demonstrates that neither the ledger nor its fold
+    // reading the event demonstrates that neither the log nor its fold
     // tries to recover their contents from a shared filesystem.
     fs::remove_file(&evidence_path).unwrap();
     fs::remove_file(&note_path).unwrap();

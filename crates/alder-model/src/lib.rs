@@ -474,7 +474,7 @@ fn daemon_handle(config: &Config) -> String {
 
 /// The trigger kinds a decision produced, in the spelling the wake records.
 ///
-/// The driver does not hand `alderd`'s enum to the ledger: it puts
+/// The driver does not hand `alderd`'s enum to the log: it puts
 /// `trigger.as_str()` on `alder loop wake --trigger`, clap parses that into a
 /// [`TriggerKind`], and `alder`'s own `From` turns it into a [`PassTrigger`].
 /// Walking the same three steps here keeps the mapping out of this crate — if
@@ -483,7 +483,7 @@ fn daemon_handle(config: &Config) -> String {
 ///
 /// The sort and dedup are the CLI's, not an embellishment: `loop wake`
 /// normalizes before it appends, so a model that skipped it would record
-/// orderings the ledger never writes.
+/// orderings the log never writes.
 fn pass_triggers(triggers: &[Trigger]) -> Vec<PassTrigger> {
     let mut kinds: Vec<PassTrigger> = triggers
         .iter()
@@ -1031,9 +1031,9 @@ impl Model for Scenario {
                     )
                 })
             }),
-            Property::<Self>::always("rotate_pending mirrors the request ledger", |_, state| {
+            Property::<Self>::always("rotate_pending mirrors the request log", |_, state| {
                 interpret(&state.log).is_some_and(|(events, project)| {
-                    invariants::rotate_pending_mirrors_the_request_ledger(&project, &events)
+                    invariants::rotate_pending_mirrors_the_request_log(&project, &events)
                 })
             }),
             Property::<Self>::always("an acknowledged handoff is never lost", |_, state| {
@@ -1066,7 +1066,7 @@ impl Model for Scenario {
             // the ghost mirror to do it — but three `sometimes` properties and
             // the daemon-ordering `always` are all derived from that mirror,
             // so a mirror that drifted would let them report on a rotation
-            // ledger nobody has. Checking it against the fold keeps them
+            // log nobody has. Checking it against the fold keeps them
             // honest, and costs one comparison.
             Property::<Self>::always("the rotation ghost tracks the fold", |_, state| {
                 fold(&state.log).is_some_and(|project| {

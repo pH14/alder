@@ -127,7 +127,7 @@ reason and no other.
    `concurrent_wakes_leave_at_most_one_open_pass`.
 2. **A pending rotation is consumed exactly once, and a crashed pass never
    silently consumes one.** The shared
-   `rotate_pending_mirrors_the_request_ledger` holds the fold's sequence
+   `rotate_pending_mirrors_the_request_log` holds the fold's sequence
    arithmetic against a straight scan of the history in log order, in every
    state; the shared `crashed_verdicts_follow_real_crashes` holds the log's
    crash attributions against the deaths this run actually injected; and —
@@ -217,7 +217,7 @@ closures started delegating to them, each mutation aimed at one sentence:
 dropping the handoff append instead of only its response is caught by
 `acknowledged_handoffs_are_never_lost`; making the fold's `rotate_pending`
 ignore the consuming wake is caught by
-`rotate_pending_mirrors_the_request_ledger`; writing a clean pass end as a
+`rotate_pending_mirrors_the_request_log`; writing a clean pass end as a
 `crashed` verdict is caught by `crashed_verdicts_follow_real_crashes` in
 every scenario, including the fault-free one.
 

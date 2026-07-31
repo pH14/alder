@@ -119,7 +119,7 @@ pub enum EventPayload {
 }
 
 impl EventPayload {
-    /// A new arm here also belongs in `EVERY_EVENT` in the ledger tests, which
+    /// A new arm here also belongs in `EVERY_EVENT` in the log tests, which
     /// sweeps every mutation for how it reports losing a compare-and-append.
     pub fn type_name(&self) -> &'static str {
         match self {

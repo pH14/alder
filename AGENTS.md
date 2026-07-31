@@ -15,7 +15,7 @@ there**. That reader is the whole point of the project.
 ## The log is the authority, and `alder` is its only writer
 
 Durable truth is the event log in the store ref. SQLite is a memoized fold of
-it and is disposable; observations are local input and never become ledger
+it and is disposable; observations are local input and never become log
 facts. Flag anything that treats the projection as a source: a read that skips
 head synchronization, a mutation that writes SQLite as part of committing, an
 incremental projection update, or a fallback to a local branch or

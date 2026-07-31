@@ -243,7 +243,7 @@ exec codex exec resume "$session" {flags} "$1"
     /// and claims the first new rollout whose session metadata names this
     /// worktree. It is outside the sandbox and independent of the model's
     /// progress. The marker lets reconciliation surface a repair if its log
-    /// append loses a race or the ledger is temporarily unavailable.
+    /// append loses a race or the log is temporarily unavailable.
     pub fn codex_session_stamp_script(&self) -> Option<&'static str> {
         (self.provider == Provider::Codex).then_some(CODEX_SESSION_STAMP_SCRIPT)
     }

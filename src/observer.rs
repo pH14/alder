@@ -1246,7 +1246,7 @@ mod tests {
             Some(repair.as_str())
         );
 
-        // Once the watcher append reaches the ledger, the exact same live
+        // Once the watcher append reaches the log, the exact same live
         // session is healthy and reconciliation stops asking a leader to
         // repair it.
         state

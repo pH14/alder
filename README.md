@@ -1,6 +1,6 @@
 # alder
 
-A durable work-and-attempt ledger for autonomous engineering workflows.
+A durable work-and-attempt log for autonomous engineering workflows.
 
 Alder exists so a fresh agent can answer, without a previous session's
 memory: what is actionable now, what has already been launched, what is
@@ -11,7 +11,7 @@ is authoritative, so independent writers coordinate through compare-and-append
 against it rather than through a server. Current state is a deterministic
 fold of those events into a local SQLite database, rebuildable from the log
 at any time. Observations of external systems are refreshed into separate
-local tables and never masquerade as ledger facts.
+local tables and never masquerade as log facts.
 
 The model: work items with dependencies and acceptance checks, attempts at
 that work, questions that park work on a human decision, and handoffs

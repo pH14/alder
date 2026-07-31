@@ -3,7 +3,7 @@ name = "alder"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "A durable work-and-attempt ledger for autonomous engineering workflows"
+description = "A durable work-and-attempt log for autonomous engineering workflows"
 
 [dependencies]
 alder-log = { path = "crates/alder-log" }

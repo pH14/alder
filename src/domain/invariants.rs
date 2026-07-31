@@ -117,7 +117,7 @@ pub fn crashed_verdicts(state: &ProjectState) -> usize {
         .count()
 }
 
-/// `rotate_pending` mirrors the request ledger.
+/// `rotate_pending` mirrors the request log.
 ///
 /// Rotation is derived, never stored: it is pending when the latest request is
 /// later in the log than the latest wake. The fold computes that by comparing
@@ -129,7 +129,7 @@ pub fn crashed_verdicts(state: &ProjectState) -> usize {
 ///
 /// Both harnesses maintained this mirror by hand, one in ghost state and one
 /// implicitly through the status document. Neither needs to now.
-pub fn rotate_pending_mirrors_the_request_ledger(state: &ProjectState, events: &[Event]) -> bool {
+pub fn rotate_pending_mirrors_the_request_log(state: &ProjectState, events: &[Event]) -> bool {
     state.loop_control.rotate_pending() == rotation_is_pending(events)
 }
 
@@ -441,13 +441,13 @@ mod tests {
         ];
         let (history, state) = folded(requested.clone());
         assert!(state.loop_control.rotate_pending());
-        assert!(rotate_pending_mirrors_the_request_ledger(&state, &history));
+        assert!(rotate_pending_mirrors_the_request_log(&state, &history));
 
         let mut consumed = requested;
         consumed.push(wake("wake-2", "al-pass-2"));
         let (history, state) = folded(consumed);
         assert!(!state.loop_control.rotate_pending());
-        assert!(rotate_pending_mirrors_the_request_ledger(&state, &history));
+        assert!(rotate_pending_mirrors_the_request_log(&state, &history));
     }
 
     #[test]
@@ -457,7 +457,7 @@ mod tests {
             end("end-1", "al-pass-1", PassOutcome::Ok, true),
         ]);
         assert!(state.loop_control.rotate_pending());
-        assert!(rotate_pending_mirrors_the_request_ledger(&state, &history));
+        assert!(rotate_pending_mirrors_the_request_log(&state, &history));
     }
 
     #[test]
@@ -466,7 +466,7 @@ mod tests {
             wake("wake-1", "al-pass-1"),
             end("end-1", "al-pass-1", PassOutcome::Ok, false),
         ]);
-        assert!(rotate_pending_mirrors_the_request_ledger(&state, &history));
+        assert!(rotate_pending_mirrors_the_request_log(&state, &history));
     }
 
     #[test]
@@ -478,7 +478,7 @@ mod tests {
         // Stand in for a fold that dropped the request on the floor: the
         // history still holds it, so the two derivations must part company.
         state.loop_control.rotate_requested_seq = None;
-        assert!(!rotate_pending_mirrors_the_request_ledger(&state, &history));
+        assert!(!rotate_pending_mirrors_the_request_log(&state, &history));
     }
 
     #[test]

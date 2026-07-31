@@ -30,7 +30,7 @@ pub struct AppendResult {
     pub event: Event,
 }
 
-pub struct Ledger<S> {
+pub struct ProjectLog<S> {
     store: S,
     prefix: String,
     actor: String,
@@ -40,7 +40,7 @@ pub struct Ledger<S> {
     on_append: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
-impl<S: Log> Ledger<S> {
+impl<S: Log> ProjectLog<S> {
     pub fn new(store: S, prefix: impl Into<String>, actor: impl Into<String>) -> Self {
         Self {
             store,
@@ -766,21 +766,20 @@ mod tests {
 
     #[test]
     fn attempts_consume_ordinals_and_late_updates_are_rejected() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
-        let (_, work) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
+        let (_, work) = log
             .add_work("work".to_owned(), None, 0, vec![], vec![])
             .unwrap();
-        let (_, first) = ledger.start(&work, BTreeMap::new()).unwrap();
-        ledger
-            .end_attempt(
-                &first,
-                AttemptOutcome::NotStarted,
-                "launch failed".to_owned(),
-            )
-            .unwrap();
-        let (_, second) = ledger.start(&work, BTreeMap::new()).unwrap();
+        let (_, first) = log.start(&work, BTreeMap::new()).unwrap();
+        log.end_attempt(
+            &first,
+            AttemptOutcome::NotStarted,
+            "launch failed".to_owned(),
+        )
+        .unwrap();
+        let (_, second) = log.start(&work, BTreeMap::new()).unwrap();
         assert!(second.ends_with("-attempt-2"));
-        let error = ledger
+        let error = log
             .update_attempt(&first, BTreeMap::new(), Some("late".to_owned()), vec![])
             .unwrap_err();
         assert_eq!(error.code, "attempt_ended");
@@ -788,13 +787,13 @@ mod tests {
 
     #[test]
     fn asking_blocks_and_answering_does_not_unblock() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
-        let (_, work) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
+        let (_, work) = log
             .add_work("work".to_owned(), None, 0, vec![], vec![])
             .unwrap();
-        let (_, question) = ledger.ask(&work, "which path?".to_owned()).unwrap();
-        ledger.answer(&question, "path A".to_owned()).unwrap();
-        let snapshot = ledger.snapshot().unwrap();
+        let (_, question) = log.ask(&work, "which path?".to_owned()).unwrap();
+        log.answer(&question, "path A".to_owned()).unwrap();
+        let snapshot = log.snapshot().unwrap();
         assert_eq!(snapshot.state.work[&work].state, WorkState::Blocked);
         assert_eq!(
             snapshot.state.questions[&question].answer.as_deref(),
@@ -804,8 +803,8 @@ mod tests {
 
     #[test]
     fn later_attempt_gets_the_complete_check_contract() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
-        let (_, work) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
+        let (_, work) = log
             .add_work(
                 "work".to_owned(),
                 None,
@@ -823,12 +822,11 @@ mod tests {
                 ],
             )
             .unwrap();
-        let (_, first) = ledger.start(&work, BTreeMap::new()).unwrap();
-        ledger
-            .end_attempt(&first, AttemptOutcome::Failed, "failed".to_owned())
+        let (_, first) = log.start(&work, BTreeMap::new()).unwrap();
+        log.end_attempt(&first, AttemptOutcome::Failed, "failed".to_owned())
             .unwrap();
-        let (_, second) = ledger.start(&work, BTreeMap::new()).unwrap();
-        let snapshot = ledger.snapshot().unwrap();
+        let (_, second) = log.start(&work, BTreeMap::new()).unwrap();
+        let snapshot = log.snapshot().unwrap();
         assert_eq!(snapshot.state.attempts[&second].checks.len(), 2);
         assert!(
             snapshot.state.attempts[&second]
@@ -840,19 +838,18 @@ mod tests {
 
     #[test]
     fn reopening_a_prerequisite_rejects_active_downstream_work() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
-        let (_, prerequisite) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
+        let (_, prerequisite) = log
             .add_work("A".to_owned(), None, 0, vec![], vec![])
             .unwrap();
-        let (_, first_attempt) = ledger.start(&prerequisite, BTreeMap::new()).unwrap();
-        ledger
-            .finish(&prerequisite, Some(first_attempt), false, None)
+        let (_, first_attempt) = log.start(&prerequisite, BTreeMap::new()).unwrap();
+        log.finish(&prerequisite, Some(first_attempt), false, None)
             .unwrap();
-        let (_, downstream) = ledger
+        let (_, downstream) = log
             .add_work("B".to_owned(), None, 0, vec![prerequisite.clone()], vec![])
             .unwrap();
-        let (_, downstream_attempt) = ledger.start(&downstream, BTreeMap::new()).unwrap();
-        let error = ledger
+        let (_, downstream_attempt) = log.start(&downstream, BTreeMap::new()).unwrap();
+        let error = log
             .reopen(&prerequisite, "regressed".to_owned())
             .unwrap_err();
         assert_eq!(error.code, "active_downstream");
@@ -864,20 +861,19 @@ mod tests {
 
     #[test]
     fn dropping_active_work_ends_the_named_attempt_atomically() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
-        let (_, work) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
+        let (_, work) = log
             .add_work("work".to_owned(), None, 0, vec![], vec![])
             .unwrap();
-        let (_, attempt) = ledger.start(&work, BTreeMap::new()).unwrap();
-        ledger
-            .drop_work(
-                &work,
-                Some(attempt.clone()),
-                Some(AttemptOutcome::Cancelled),
-                "no longer useful".to_owned(),
-            )
-            .unwrap();
-        let snapshot = ledger.snapshot().unwrap();
+        let (_, attempt) = log.start(&work, BTreeMap::new()).unwrap();
+        log.drop_work(
+            &work,
+            Some(attempt.clone()),
+            Some(AttemptOutcome::Cancelled),
+            "no longer useful".to_owned(),
+        )
+        .unwrap();
+        let snapshot = log.snapshot().unwrap();
         assert_eq!(snapshot.state.work[&work].state, WorkState::Dropped);
         assert_eq!(
             snapshot.state.attempts[&attempt].outcome,
@@ -891,43 +887,41 @@ mod tests {
 
     #[test]
     fn revised_answers_keep_history_and_still_require_explicit_unblock() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
-        let (_, work) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
+        let (_, work) = log
             .add_work("work".to_owned(), None, 0, vec![], vec![])
             .unwrap();
-        let (_, question) = ledger.ask(&work, "which?".to_owned()).unwrap();
-        ledger.answer(&question, "A".to_owned()).unwrap();
-        ledger.answer(&question, "B".to_owned()).unwrap();
-        let snapshot = ledger.snapshot().unwrap();
+        let (_, question) = log.ask(&work, "which?".to_owned()).unwrap();
+        log.answer(&question, "A".to_owned()).unwrap();
+        log.answer(&question, "B".to_owned()).unwrap();
+        let snapshot = log.snapshot().unwrap();
         assert_eq!(snapshot.state.questions[&question].answers.len(), 2);
         assert_eq!(snapshot.state.work[&work].state, WorkState::Blocked);
 
-        ledger
-            .set_work_state(
-                &work,
-                WorkStateChange::Unblock {
-                    reason: "decision incorporated".to_owned(),
-                },
-            )
-            .unwrap();
+        log.set_work_state(
+            &work,
+            WorkStateChange::Unblock {
+                reason: "decision incorporated".to_owned(),
+            },
+        )
+        .unwrap();
         assert_eq!(
-            ledger.snapshot().unwrap().state.work[&work].state,
+            log.snapshot().unwrap().state.work[&work].state,
             WorkState::Open
         );
     }
 
     #[test]
     fn external_completion_is_distinct_and_needs_evidence() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
-        let (_, work) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
+        let (_, work) = log
             .add_work("work".to_owned(), None, 0, vec![], vec![])
             .unwrap();
-        let missing = ledger.finish(&work, None, true, None).unwrap_err();
+        let missing = log.finish(&work, None, true, None).unwrap_err();
         assert_eq!(missing.code, "validation_failed");
-        ledger
-            .finish(&work, None, true, Some("merged outside Alder".to_owned()))
+        log.finish(&work, None, true, Some("merged outside Alder".to_owned()))
             .unwrap();
-        let snapshot = ledger.snapshot().unwrap();
+        let snapshot = log.snapshot().unwrap();
         match &snapshot.events.last().unwrap().payload {
             EventPayload::WorkFinished { external, .. } => assert!(*external),
             _ => panic!("expected external work finish"),
@@ -936,11 +930,11 @@ mod tests {
 
     #[test]
     fn starts_report_every_unmet_dependency_and_questions_are_per_work() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
-        let (_, prerequisite) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
+        let (_, prerequisite) = log
             .add_work("prerequisite".to_owned(), None, 0, vec![], vec![])
             .unwrap();
-        let (_, dependent) = ledger
+        let (_, dependent) = log
             .add_work(
                 "dependent".to_owned(),
                 None,
@@ -950,22 +944,21 @@ mod tests {
             )
             .unwrap();
 
-        let error = ledger.start(&dependent, BTreeMap::new()).unwrap_err();
+        let error = log.start(&dependent, BTreeMap::new()).unwrap_err();
         assert_eq!(error.code, "work_not_ready");
         assert_eq!(
             error.context["unmet_dependencies"],
             json!([prerequisite.clone()])
         );
 
-        let (_, first) = ledger.ask(&dependent, "first?".to_owned()).unwrap();
-        let (_, second) = ledger.ask(&dependent, "second?".to_owned()).unwrap();
-        let (_, other) = ledger.ask(&prerequisite, "other?".to_owned()).unwrap();
+        let (_, first) = log.ask(&dependent, "first?".to_owned()).unwrap();
+        let (_, second) = log.ask(&dependent, "second?".to_owned()).unwrap();
+        let (_, other) = log.ask(&prerequisite, "other?".to_owned()).unwrap();
         assert_eq!(first, format!("{dependent}-question-1"));
         assert_eq!(second, format!("{dependent}-question-2"));
         assert_eq!(other, format!("{prerequisite}-question-1"));
         assert_eq!(
-            ledger
-                .ask("hm-missing", "missing?".to_owned())
+            log.ask("hm-missing", "missing?".to_owned())
                 .unwrap_err()
                 .code,
             "not_found"
@@ -974,7 +967,7 @@ mod tests {
 
     #[test]
     fn handoff_submission_retries_only_head_conflicts_and_recovers_ambiguity() {
-        let retry = Ledger::new(
+        let retry = ProjectLog::new(
             ConflictStore::new(ConflictBehavior::Once),
             "hm",
             "side-channel",
@@ -993,7 +986,7 @@ mod tests {
         assert_eq!(result.event.actor, "side-channel");
         assert_eq!(result.event.schema, "alder.event.v0");
 
-        let ambiguous = Ledger::new(
+        let ambiguous = ProjectLog::new(
             ConflictStore::new(ConflictBehavior::CommitThenReport),
             "hm",
             "side-channel",
@@ -1008,7 +1001,7 @@ mod tests {
             "branch:topic"
         );
 
-        let unavailable = Ledger::new(
+        let unavailable = ProjectLog::new(
             ConflictStore::new(ConflictBehavior::OtherError),
             "hm",
             "side-channel",
@@ -1021,7 +1014,7 @@ mod tests {
             "store_unavailable"
         );
 
-        let exhausted = Ledger::new(
+        let exhausted = ProjectLog::new(
             ConflictStore::new(ConflictBehavior::Always),
             "hm",
             "side-channel",
@@ -1035,18 +1028,18 @@ mod tests {
 
     #[test]
     fn integration_uses_handoff_defaults_and_is_single_use() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
-        let (_, handoff) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
+        let (_, handoff) = log
             .add_handoff(
                 "candidate".to_owned(),
                 "branch:topic".to_owned(),
                 Some("ready".to_owned()),
             )
             .unwrap();
-        let (_, work) = ledger
+        let (_, work) = log
             .integrate_handoff(&handoff, None, None, 7, vec![], vec![])
             .unwrap();
-        let snapshot = ledger.snapshot().unwrap();
+        let snapshot = log.snapshot().unwrap();
         assert_eq!(snapshot.state.work[&work].title, "candidate");
         assert_eq!(
             snapshot.state.work[&work].spec.as_deref(),
@@ -1054,7 +1047,7 @@ mod tests {
         );
         assert_eq!(snapshot.state.work[&work].priority, 7);
 
-        let error = ledger
+        let error = log
             .integrate_handoff(
                 &handoff,
                 Some("replacement".to_owned()),
@@ -1069,15 +1062,15 @@ mod tests {
 
     #[test]
     fn withdrawing_a_handoff_retires_it_and_frees_nothing_to_integrate() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
-        let (_, handoff) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
+        let (_, handoff) = log
             .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
             .unwrap();
 
-        let result = ledger
+        let result = log
             .withdraw_handoff(&handoff, "superseded by a follow-up".to_owned())
             .unwrap();
-        let snapshot = ledger.snapshot().unwrap();
+        let snapshot = log.snapshot().unwrap();
         assert_eq!(
             snapshot.state.handoffs[&handoff].state,
             crate::domain::HandoffState::Withdrawn
@@ -1085,13 +1078,13 @@ mod tests {
         assert_eq!(result.event.payload.type_name(), "handoff.withdrawn");
 
         // Rejection: an already-withdrawn handoff cannot be integrated.
-        let error = ledger
+        let error = log
             .integrate_handoff(&handoff, None, None, 0, vec![], vec![])
             .unwrap_err();
         assert_eq!(error.code, "invalid_transition");
 
         // Rejection: an already-withdrawn handoff cannot be withdrawn again.
-        let error = ledger
+        let error = log
             .withdraw_handoff(&handoff, "again".to_owned())
             .unwrap_err();
         assert_eq!(error.code, "invalid_transition");
@@ -1099,12 +1092,11 @@ mod tests {
 
     #[test]
     fn passes_take_serial_ordinals_and_carry_the_head_they_saw() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "alderd");
-        ledger
-            .add_work("work".to_owned(), None, 0, vec![], vec![])
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "alderd");
+        log.add_work("work".to_owned(), None, 0, vec![], vec![])
             .unwrap();
 
-        let (_, first) = ledger
+        let (_, first) = log
             .wake_loop(
                 "claude".to_owned(),
                 "tmux:alder-leader".to_owned(),
@@ -1112,9 +1104,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first, "hm-pass-1");
-        assert_eq!(ledger.snapshot().unwrap().state.passes[&first].at_head, 1);
+        assert_eq!(log.snapshot().unwrap().state.passes[&first].at_head, 1);
 
-        let conflict = ledger
+        let conflict = log
             .wake_loop(
                 "claude".to_owned(),
                 "tmux:alder-leader".to_owned(),
@@ -1124,7 +1116,7 @@ mod tests {
         assert_eq!(conflict.code, "pass_open");
         assert_eq!(conflict.context["pass_id"], "hm-pass-1");
 
-        let (_, ended) = ledger
+        let (_, ended) = log
             .end_pass(
                 None,
                 PassOutcome::Ok,
@@ -1135,19 +1127,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ended, first);
-        let state = ledger.snapshot().unwrap().state;
+        let state = log.snapshot().unwrap().state;
         let wake_at = state.passes[&first].wake_at.expect("a wake time");
         assert!(wake_at > Utc::now() + TimeDelta::minutes(19));
 
         assert_eq!(
-            ledger
-                .end_pass(None, PassOutcome::Ok, None, None, false, None)
+            log.end_pass(None, PassOutcome::Ok, None, None, false, None)
                 .unwrap_err()
                 .code,
             "no_open_pass"
         );
 
-        let (_, second) = ledger
+        let (_, second) = log
             .wake_loop(
                 "codex".to_owned(),
                 "tmux:alder-leader".to_owned(),
@@ -1159,60 +1150,55 @@ mod tests {
 
     #[test]
     fn loop_controls_and_work_state_verbs_append_their_own_events() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "operator");
-        let (_, work) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "operator");
+        let (_, work) = log
             .add_work("work".to_owned(), None, 0, vec![], vec![])
             .unwrap();
 
-        ledger
-            .pause_loop(Some("release freeze".to_owned()))
-            .unwrap();
-        ledger.select_engine("codex".to_owned()).unwrap();
-        ledger.request_rotation(None).unwrap();
-        ledger.request_nudge(None).unwrap();
-        let state = ledger.snapshot().unwrap().state;
+        log.pause_loop(Some("release freeze".to_owned())).unwrap();
+        log.select_engine("codex".to_owned()).unwrap();
+        log.request_rotation(None).unwrap();
+        log.request_nudge(None).unwrap();
+        let state = log.snapshot().unwrap().state;
         assert!(state.loop_control.paused);
         assert_eq!(state.loop_control.engine.as_deref(), Some("codex"));
         assert!(state.loop_control.rotate_pending());
         assert!(state.loop_control.nudge_pending());
 
-        ledger.resume_loop().unwrap();
-        assert!(!ledger.snapshot().unwrap().state.loop_control.paused);
+        log.resume_loop().unwrap();
+        assert!(!log.snapshot().unwrap().state.loop_control.paused);
 
-        ledger
-            .set_work_state(
-                &work,
-                WorkStateChange::Block {
-                    reason: "credentials missing".to_owned(),
-                },
-            )
-            .unwrap();
+        log.set_work_state(
+            &work,
+            WorkStateChange::Block {
+                reason: "credentials missing".to_owned(),
+            },
+        )
+        .unwrap();
         assert_eq!(
-            ledger.snapshot().unwrap().state.work[&work].state,
+            log.snapshot().unwrap().state.work[&work].state,
             WorkState::Blocked
         );
-        ledger
-            .set_work_state(
-                &work,
-                WorkStateChange::Unblock {
-                    reason: "credentials installed".to_owned(),
-                },
-            )
-            .unwrap();
+        log.set_work_state(
+            &work,
+            WorkStateChange::Unblock {
+                reason: "credentials installed".to_owned(),
+            },
+        )
+        .unwrap();
         assert_eq!(
-            ledger.snapshot().unwrap().state.work[&work].state,
+            log.snapshot().unwrap().state.work[&work].state,
             WorkState::Open
         );
         assert_eq!(
-            ledger
-                .set_work_state(
-                    "hm-missing",
-                    WorkStateChange::Block {
-                        reason: "reason".to_owned(),
-                    },
-                )
-                .unwrap_err()
-                .code,
+            log.set_work_state(
+                "hm-missing",
+                WorkStateChange::Block {
+                    reason: "reason".to_owned(),
+                },
+            )
+            .unwrap_err()
+            .code,
             "not_found"
         );
     }
@@ -1251,7 +1237,7 @@ mod tests {
     /// to lose the same way: nothing appended, said so first, and named.
     #[test]
     fn every_mutation_that_loses_the_race_says_it_appended_nothing() {
-        let ledger = Ledger::new(
+        let log = ProjectLog::new(
             ConflictStore::new(ConflictBehavior::WhenArmed),
             "hm",
             "leader",
@@ -1259,8 +1245,7 @@ mod tests {
         // A fixture rich enough that every mutation gets past its own
         // preconditions and fails only on the append.
         let add = |title: &str| {
-            ledger
-                .add_work(title.to_owned(), None, 0, vec![], vec![])
+            log.add_work(title.to_owned(), None, 0, vec![], vec![])
                 .unwrap()
                 .1
         };
@@ -1268,22 +1253,21 @@ mod tests {
         let idle = add("idle");
         let asked = add("asked");
         let finished = add("finished");
-        let (_, attempt) = ledger.start(&work, BTreeMap::new()).unwrap();
-        let (_, done_attempt) = ledger.start(&finished, BTreeMap::new()).unwrap();
-        ledger
-            .finish(&finished, Some(done_attempt), false, None)
+        let (_, attempt) = log.start(&work, BTreeMap::new()).unwrap();
+        let (_, done_attempt) = log.start(&finished, BTreeMap::new()).unwrap();
+        log.finish(&finished, Some(done_attempt), false, None)
             .unwrap();
-        let (_, question) = ledger.ask(&asked, "which path?".to_owned()).unwrap();
-        let (_, handoff) = ledger
+        let (_, question) = log.ask(&asked, "which path?".to_owned()).unwrap();
+        let (_, handoff) = log
             .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
             .unwrap();
-        let settled = ledger.snapshot().unwrap();
+        let settled = log.snapshot().unwrap();
         let addition = GraphChangeDocument {
             why: Some("replan".to_owned()),
             add: vec![serde_json::from_value(json!({"title": "added"})).unwrap()],
             edit: vec![],
         };
-        let prepared = ledger
+        let prepared = log
             .allocate_change(&settled, &addition, ChangeMode::AddOnly)
             .unwrap();
 
@@ -1291,19 +1275,18 @@ mod tests {
             (
                 "work.changed",
                 Box::new(|| {
-                    ledger
-                        .add_work("raced".to_owned(), None, 0, vec![], vec![])
+                    log.add_work("raced".to_owned(), None, 0, vec![], vec![])
                         .map(|(result, _)| result)
                 }),
             ),
             (
                 "work.changed",
-                Box::new(|| ledger.commit_change(&settled, &addition, prepared.clone())),
+                Box::new(|| log.commit_change(&settled, &addition, prepared.clone())),
             ),
             (
                 "work.changed",
                 Box::new(|| {
-                    ledger.set_work_state(
+                    log.set_work_state(
                         &idle,
                         WorkStateChange::Block {
                             reason: "raced".to_owned(),
@@ -1314,54 +1297,42 @@ mod tests {
             (
                 "handoff.integrated",
                 Box::new(|| {
-                    ledger
-                        .integrate_handoff(&handoff, None, None, 0, vec![], vec![])
+                    log.integrate_handoff(&handoff, None, None, 0, vec![], vec![])
                         .map(|(result, _)| result)
                 }),
             ),
             (
                 "handoff.withdrawn",
-                Box::new(|| ledger.withdraw_handoff(&handoff, "raced".to_owned())),
+                Box::new(|| log.withdraw_handoff(&handoff, "raced".to_owned())),
             ),
             (
                 "attempt.started",
-                Box::new(|| {
-                    ledger
-                        .start(&idle, BTreeMap::new())
-                        .map(|(result, _)| result)
-                }),
+                Box::new(|| log.start(&idle, BTreeMap::new()).map(|(result, _)| result)),
             ),
             (
                 "attempt.bound",
-                Box::new(|| {
-                    ledger.bind_attempt(&attempt, "tmux:worker".to_owned(), BTreeMap::new())
-                }),
+                Box::new(|| log.bind_attempt(&attempt, "tmux:worker".to_owned(), BTreeMap::new())),
             ),
             (
                 "attempt.updated",
                 Box::new(|| {
-                    ledger.update_attempt(
-                        &attempt,
-                        BTreeMap::new(),
-                        Some("raced".to_owned()),
-                        vec![],
-                    )
+                    log.update_attempt(&attempt, BTreeMap::new(), Some("raced".to_owned()), vec![])
                 }),
             ),
             (
                 "attempt.ended",
                 Box::new(|| {
-                    ledger.end_attempt(&attempt, AttemptOutcome::Cancelled, "raced".to_owned())
+                    log.end_attempt(&attempt, AttemptOutcome::Cancelled, "raced".to_owned())
                 }),
             ),
             (
                 "work.finished",
-                Box::new(|| ledger.finish(&work, Some(attempt.clone()), false, None)),
+                Box::new(|| log.finish(&work, Some(attempt.clone()), false, None)),
             ),
             (
                 "work.dropped",
                 Box::new(|| {
-                    ledger.drop_work(
+                    log.drop_work(
                         &work,
                         Some(attempt.clone()),
                         Some(AttemptOutcome::Cancelled),
@@ -1371,53 +1342,48 @@ mod tests {
             ),
             (
                 "work.reopened",
-                Box::new(|| ledger.reopen(&finished, "raced".to_owned())),
+                Box::new(|| log.reopen(&finished, "raced".to_owned())),
             ),
             (
                 "question.asked",
                 Box::new(|| {
-                    ledger
-                        .ask(&work, "another?".to_owned())
+                    log.ask(&work, "another?".to_owned())
                         .map(|(result, _)| result)
                 }),
             ),
             (
                 "question.answered",
-                Box::new(|| ledger.answer(&question, "path A".to_owned())),
+                Box::new(|| log.answer(&question, "path A".to_owned())),
             ),
             (
                 "pass.started",
                 Box::new(|| {
-                    ledger
-                        .wake_loop(
-                            "claude".to_owned(),
-                            "tmux:alder-leader".to_owned(),
-                            vec![PassTrigger::Log],
-                        )
-                        .map(|(result, _)| result)
+                    log.wake_loop(
+                        "claude".to_owned(),
+                        "tmux:alder-leader".to_owned(),
+                        vec![PassTrigger::Log],
+                    )
+                    .map(|(result, _)| result)
                 }),
             ),
             (
                 "loop.paused",
-                Box::new(|| ledger.pause_loop(Some("raced".to_owned()))),
+                Box::new(|| log.pause_loop(Some("raced".to_owned()))),
             ),
-            ("loop.resumed", Box::new(|| ledger.resume_loop())),
+            ("loop.resumed", Box::new(|| log.resume_loop())),
             (
                 "loop.engine_selected",
-                Box::new(|| ledger.select_engine("codex".to_owned())),
+                Box::new(|| log.select_engine("codex".to_owned())),
             ),
             (
                 "loop.rotation_requested",
-                Box::new(|| ledger.request_rotation(None)),
+                Box::new(|| log.request_rotation(None)),
             ),
-            (
-                "loop.nudge_requested",
-                Box::new(|| ledger.request_nudge(None)),
-            ),
+            ("loop.nudge_requested", Box::new(|| log.request_nudge(None))),
         ];
 
         let mut covered = BTreeSet::new();
-        ledger.store().arm(true);
+        log.store().arm(true);
         for (event, mutation) in &losing {
             let error = mutation().unwrap_err();
             assert_eq!(error.code, "head_conflict", "{event}");
@@ -1435,16 +1401,15 @@ mod tests {
         // A pass has to be open for `pass end` to reach its append, and no
         // pass may be open for `loop wake` to reach its own, so this one is
         // raced after the fixture opens a pass for real.
-        ledger.store().arm(false);
-        ledger
-            .wake_loop(
-                "claude".to_owned(),
-                "tmux:alder-leader".to_owned(),
-                vec![PassTrigger::Log],
-            )
-            .unwrap();
-        ledger.store().arm(true);
-        let error = ledger
+        log.store().arm(false);
+        log.wake_loop(
+            "claude".to_owned(),
+            "tmux:alder-leader".to_owned(),
+            vec![PassTrigger::Log],
+        )
+        .unwrap();
+        log.store().arm(true);
+        let error = log
             .end_pass(None, PassOutcome::Ok, None, None, false, None)
             .unwrap_err();
         assert_eq!(error.code, "head_conflict");
@@ -1456,7 +1421,7 @@ mod tests {
         // because its submission is inert and uniquely identified. It still
         // has to fail loudly once it has exhausted that, and it still may not
         // report an append it did not make.
-        let error = ledger
+        let error = log
             .add_handoff("raced".to_owned(), "branch:raced".to_owned(), None)
             .unwrap_err();
         assert_eq!(error.code, "head_conflict");
@@ -1470,7 +1435,7 @@ mod tests {
         );
         // Losing changed nothing: only the one pass the sweep opened for real
         // is on the log, and every raced object is as the fixture left it.
-        let after = ledger.snapshot().unwrap();
+        let after = log.snapshot().unwrap();
         assert_eq!(after.head.sequence(), settled.head.sequence() + 1);
         assert_eq!(
             after.state.work[&work].state,
@@ -1489,11 +1454,11 @@ mod tests {
 
     #[test]
     fn change_allocation_rejects_both_persisted_and_batch_collisions() {
-        let ledger = Ledger::new(MemoryStore::new(), "hm", "test");
-        let (_, persisted) = ledger
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
+        let (_, persisted) = log
             .add_work("persisted".to_owned(), None, 0, vec![], vec![])
             .unwrap();
-        let snapshot = ledger.snapshot().unwrap();
+        let snapshot = log.snapshot().unwrap();
         let allocated = vec!["hm-batch".to_owned()];
 
         assert!(!work_id_available(&snapshot.state, &allocated, &persisted));
