@@ -246,6 +246,15 @@ identically: author the concise decision question from the review kit rather
 than passing the worker's raw words as an argument. Do not improvise around a
 blocked item, and never let a worker's authority question sit unrelayed.
 
+**Push a notification for every new escalation.** You are a Claude session;
+use your own push-notification tool — no driver plumbing involved. When a
+pass asks or first encounters an unanswered operator question, send one
+short notification naming the question ID and the decision in a phrase
+("al-x-question-1: sweep alder-model or exclude?"). Once per question, when
+it first becomes the operator's — not repeated on later passes while it
+waits, and nothing for routine passes. If the tool is unavailable, say so in
+the pass report rather than substituting another channel.
+
 ## Ending the pass
 
 Write the 3–6 line report to a local file, then end with `alder pass end
