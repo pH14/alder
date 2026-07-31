@@ -13,7 +13,15 @@
 //! - the daemon reads the log through the real `loop_section` projection and
 //!   the real [`LoopState`] parser, and judges with the real [`decide`],
 //!   [`resolve_engine`][decide::resolve_engine], and
-//!   [`session_action`][decide::session_action].
+//!   [`session_action`][decide::session_action];
+//! - and the safety properties are the shared sentences from
+//!   [`alder::domain::invariants`][invariants], which the crash simulator also
+//!   asserts, so the two harnesses cannot drift into meaning different things
+//!   by "correct" while both stay green.
+//!
+//! Liveness and the `sometimes` properties stay here, and that is deliberate:
+//! they are claims about reachability across a state space, and only a model
+//! checker has one.
 //!
 //! What is modeled by hand — the drift surface — is the *sequencing* of each
 //! actor: where a process can be interrupted between reading and writing, and
@@ -24,7 +32,7 @@ use std::hash::{Hash, Hasher};
 use alder::app::loop_section;
 use alder::domain::{
     Event, EventDraft, EventPayload, HandoffDefinition, PassDefinition, PassOutcome, PassTrigger,
-    ProjectState, decode_record, encode_draft,
+    ProjectState, decode_record, encode_draft, invariants,
 };
 use alder_log::{AppendDisposition, Log, LogError, MemoryLog, Record, RecordDraft};
 use alderd::config::Config;
@@ -286,15 +294,26 @@ fn replay(records: &[Record]) -> MemoryLog {
     log
 }
 
-/// Interpret a log with the real codec and the real fold. `None` marks a log
-/// no real reader could interpret, which the safety properties flag.
-fn fold(records: &[Record]) -> Option<ProjectState> {
+/// Interpret a log with the real codec and the real fold, keeping both halves.
+/// `None` marks a log no real reader could interpret, which the safety
+/// properties flag.
+///
+/// The events come back alongside the state because two of the shared
+/// predicates are claims about the history rather than about the fold, and
+/// re-decoding for them would be asking the same question twice.
+fn interpret(records: &[Record]) -> Option<(Vec<Event>, ProjectState)> {
     let events = records
         .iter()
         .map(decode_record)
         .collect::<Result<Vec<Event>, _>>()
         .ok()?;
-    ProjectState::fold(&events).ok()
+    let state = ProjectState::fold(&events).ok()?;
+    Some((events, state))
+}
+
+/// The fold alone, for the callers that only need the state.
+fn fold(records: &[Record]) -> Option<ProjectState> {
+    interpret(records).map(|(_, state)| state)
 }
 
 /// The daemon's complete read: the real status projection parsed by the real
@@ -411,14 +430,13 @@ fn daemon_handle(config: &Config) -> String {
     format!("tmux:{}", config.tmux_session)
 }
 
+/// How many passes this log blames on a crash, counted by the shared module.
+/// A log no reader can interpret blames nobody; [`log_folds_cleanly`] is the
+/// property that fires on it.
+///
+/// [`log_folds_cleanly`]: invariants::log_folds_cleanly
 fn crashed_verdicts(state: &ProtocolState) -> usize {
-    fold(&state.log).map_or(0, |project| {
-        project
-            .passes
-            .values()
-            .filter(|pass| pass.outcome == Some(PassOutcome::Crashed))
-            .count()
-    })
+    fold(&state.log).map_or(0, |project| invariants::crashed_verdicts(&project))
 }
 
 /// The recovery target: no pass is open — in particular none stranded by a
@@ -826,38 +844,50 @@ impl Model for Scenario {
     }
 
     fn properties(&self) -> Vec<Property<Self>> {
+        // The five safety properties are the shared sentences: each closure
+        // calls `alder::domain::invariants` rather than restating the
+        // predicate here, so this model and the crash simulator cannot drift
+        // into meaning different things by "correct" while both stay green.
+        // Everything below them — liveness, the ghost audit, and every
+        // `sometimes` — is a claim about reachability across a state space,
+        // which only a model checker has, and stays local on purpose.
         let mut properties = vec![
             Property::<Self>::always("every reachable log folds cleanly", |_, state| {
-                fold(&state.log).is_some()
+                invariants::log_folds_cleanly(&state.log)
             }),
             Property::<Self>::always("at most one pass is ever open", |_, state| {
-                fold(&state.log).is_some_and(|project| {
-                    project
-                        .passes
-                        .values()
-                        .filter(|pass| pass.outcome.is_none())
-                        .count()
-                        <= 1
-                })
+                fold(&state.log).is_some_and(|project| invariants::at_most_one_open_pass(&project))
             }),
             Property::<Self>::always("a crashed verdict follows a real crash", |_, state| {
-                crashed_verdicts(state) <= usize::from(state.ghosts.session_crashes)
+                // The witness the log cannot supply: the deaths this run
+                // actually injected, counted by the injector.
+                fold(&state.log).is_some_and(|project| {
+                    invariants::crashed_verdicts_follow_real_crashes(
+                        &project,
+                        usize::from(state.ghosts.session_crashes),
+                    )
+                })
             }),
             Property::<Self>::always("rotate_pending mirrors the request ledger", |_, state| {
-                fold(&state.log).is_some_and(|project| {
-                    project.loop_control.rotate_pending() == state.ghosts.rotation_pending
+                interpret(&state.log).is_some_and(|(events, project)| {
+                    invariants::rotate_pending_mirrors_the_request_ledger(&project, &events)
                 })
             }),
             Property::<Self>::always("an acknowledged handoff is never lost", |_, state| {
-                let present = state
-                    .log
-                    .iter()
-                    .filter(|record| record.id().as_str() == "phone-handoff-1")
-                    .count();
-                match state.phone.handoff {
-                    PhoneHandoff::Unsure | PhoneHandoff::Done => present == 1,
-                    PhoneHandoff::NotYet | PhoneHandoff::Armed { .. } => present <= 1,
-                }
+                // The other witness. `Done` is the shared module's literal
+                // case — the writer saw its receipt. `Unsure` is the stronger
+                // one: the model injected the lost response, so it knows the
+                // append landed even though the writer does not, and the log
+                // owes that submission just as much. Before either, the phone
+                // is entitled to nothing, and the predicate holds the log only
+                // to the no-duplicates half.
+                let landed: &[&str] = match state.phone.handoff {
+                    PhoneHandoff::Unsure | PhoneHandoff::Done => &["phone-handoff-1"],
+                    PhoneHandoff::NotYet | PhoneHandoff::Armed { .. } => &[],
+                };
+                interpret(&state.log).is_some_and(|(events, project)| {
+                    invariants::acknowledged_handoffs_are_never_lost(&project, &events, landed)
+                })
             }),
             Property::<Self>::always(
                 "every terminal state is progressing or blocked-and-named",
@@ -867,6 +897,19 @@ impl Model for Scenario {
                     !enabled.is_empty() || recovered(state)
                 },
             ),
+            // Not a protocol predicate: an audit of this model's own
+            // bookkeeping. The shared statement above compares the fold's
+            // arithmetic against a scan of the history, and no longer needs
+            // the ghost mirror to do it — but three `sometimes` properties and
+            // the daemon-ordering `always` are all derived from that mirror,
+            // so a mirror that drifted would let them report on a rotation
+            // ledger nobody has. Checking it against the fold keeps them
+            // honest, and costs one comparison.
+            Property::<Self>::always("the rotation ghost tracks the fold", |_, state| {
+                fold(&state.log).is_some_and(|project| {
+                    project.loop_control.rotate_pending() == state.ghosts.rotation_pending
+                })
+            }),
         ];
         if self.leader_rotate || self.phone_rotation {
             properties.push(Property::<Self>::sometimes(

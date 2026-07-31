@@ -27,7 +27,24 @@ new behavior with no edits here.
 | Log interpretation | `alder::domain::ProjectState::fold` on every state |
 | The daemon's read | `alder::app::loop_section` + `alderd::loop_state::LoopState::from_status` |
 | The daemon's judgment | `alderd::decide::{decide, resolve_engine, session_action, observable_session}` |
+| The safety predicates | `alder::domain::invariants` — the same five the crash simulator asserts |
 | **Modeled by hand (the drift surface)** | each actor's atomic steps: where a process can be interrupted between reading and writing, and what a crash erases |
+
+The safety predicates are shared on purpose. Two harnesses check this
+protocol from opposite directions — this model explores every interleaving of
+a small cast, the simulator tears every effect every way its footprint allows
+— and they check the same five things about a log and the state it folds to.
+Stated twice they drift invisibly, both green while meaning different things
+by "correct"; stated once in `alder::domain::invariants`, both assert the same
+sentence. Two of the five compare the log against a fact no log can hold — a
+crash that really happened, an append whose writer is owed a record — so the
+caller passes that witness in. Here the witnesses are the model's own injected
+session deaths and the phone's handoff state.
+
+Liveness, the `sometimes` properties, and one audit of the model's own ghost
+bookkeeping stay local, and that is deliberate rather than an omission: they
+are claims about reachability across a state space, and only a model checker
+has one.
 
 The one production change made for this crate: `alder::app::loop_section`
 became `pub`, so the model reads the loop through the same projection the
@@ -60,20 +77,28 @@ step (`DaemonCeilingFires`), which is the fairness assumption made honest.
 
 1. **At most one open pass** under concurrent wake attempts, with the loser
    conceding rather than ending the winner's pass. Encoded as `always`
-   invariants — every reachable log folds cleanly, and never holds two
-   unended passes — plus `sometimes` coverage that both concede paths are
-   actually reached. Checked in `concurrent_wakes_leave_at_most_one_open_pass`.
+   invariants — the shared `log_folds_cleanly` and `at_most_one_open_pass`,
+   the latter asserting both harnesses' spellings of "open" and that they
+   still agree pass by pass — plus `sometimes` coverage that both concede
+   paths are actually reached. Checked in
+   `concurrent_wakes_leave_at_most_one_open_pass`.
 2. **A pending rotation is consumed exactly once, and a crashed pass never
-   silently consumes one.** `rotate_pending` derived by the real fold must
-   mirror an independently tracked ghost in every state (exactly-once by
-   log order), and — with a single waker — a rotation the daemon consumes
-   was always performed (a fresh session) first, whatever crashed in
-   between. Checked in `crashes_never_silently_consume_a_rotation` with a
-   daemon crash and a session crash injected at every point.
+   silently consumes one.** The shared
+   `rotate_pending_mirrors_the_request_ledger` holds the fold's sequence
+   arithmetic against a straight scan of the history in log order, in every
+   state; the shared `crashed_verdicts_follow_real_crashes` holds the log's
+   crash attributions against the deaths this run actually injected; and —
+   with a single waker — a rotation the daemon consumes was always performed
+   (a fresh session) first, whatever crashed in between. Checked in
+   `crashes_never_silently_consume_a_rotation` with a daemon crash and a
+   session crash injected at every point.
 3. **CAS append loses no updates under interleaved writers.** The log stays
-   a cleanly folding total order; an acknowledged (or landed-but-lost)
-   handoff is present exactly once; a lost response retried with the
-   identical draft is absorbed as `AlreadyPresent`. Checked in
+   a cleanly folding total order, and the shared
+   `acknowledged_handoffs_are_never_lost` requires that a submission the
+   writer is owed appears in the history exactly once *and* folded into a
+   handoff the state still knows about — with every other submission held to
+   the no-duplicates half. A lost response retried with the identical draft
+   is absorbed as `AlreadyPresent`. Checked in
    `interleaved_writers_lose_no_updates`.
 4. **Liveness under fairness: from any crash state the system reaches
    progressing, or blocked-and-named.** Encoded as safety over the bounded
@@ -129,12 +154,28 @@ carries the rotation state it acted on, so a consuming wake that performed
 no rotation is detectable, or (b) `rotate_pending` stays derived but the
 daemon re-checks it between its own wake's snapshot and push.
 
-**Mutation checks.** The properties bite: reverting the driver's
-rotate-before-wake order (treating the rotation restart as a reuse) is
-caught by property 2 with a 16-step counterexample; ignoring the pinned
-head in the daemon's wake append (blind append instead of CAS) is caught
-by property 1/3 with a 10-step counterexample ending in a log the real
-fold rejects as a duplicate pass.
+**Mutation checks.** The properties bite. Two mutations of the protocol
+itself: reverting the driver's rotate-before-wake order (treating the
+rotation restart as a reuse) is caught by property 2 with a 16-step
+counterexample; ignoring the pinned head in the daemon's wake append (blind
+append instead of CAS) is caught by the shared `log_folds_cleanly` with a
+10-step counterexample ending in a log the real fold rejects as a duplicate
+pass.
+
+Three more confirm the shared predicates did not go vacuous when the
+closures started delegating to them, each mutation aimed at one sentence:
+dropping the handoff append instead of only its response is caught by
+`acknowledged_handoffs_are_never_lost`; making the fold's `rotate_pending`
+ignore the consuming wake is caught by
+`rotate_pending_mirrors_the_request_ledger`; writing a clean pass end as a
+`crashed` verdict is caught by `crashed_verdicts_follow_real_crashes` in
+every scenario, including the fault-free one.
+
+`at_most_one_open_pass` has no such mutation here, and that is a fact about
+the fold rather than a gap: every way of reaching two open passes in this
+model produces a history the real fold rejects outright, so
+`log_folds_cleanly` fires first. The predicate is exercised directly against
+those shapes in the shared module's own tests.
 
 ## Abstractions, so nobody over-reads the green
 
