@@ -79,18 +79,6 @@ fn host_tmux_effects_run_against_a_private_tmux_server() {
             socket.display()
         ),
     );
-    // The daemon wraps every engine in `caffeinate -i`. The sandbox answers
-    // with a `caffeinate` of its own, which records the argv the quoting
-    // produced and then becomes the engine, so the real one is not needed and
-    // what it was handed is checkable.
-    write_executable(
-        &bin.path().join("caffeinate"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >'{argv}.part' && mv '{argv}.part' '{argv}'\nshift\nexec \"$@\"\n",
-            argv = work.path().join("caffeinate-argv").display()
-        ),
-    );
-
     let session = format!("alderd-host-{}", std::process::id());
     let watcher = format!("client-of-{session}");
     let before = real_sessions(&real_tmux, real_socket.as_deref());
@@ -237,12 +225,8 @@ sleep 300
         "the session tmux just created is not there"
     );
 
-    // What the pane is really running: the engine, wrapped in `caffeinate -i`,
-    // one word per argument however it was spelled.
-    assert_eq!(
-        lines(&await_file(&work.join("caffeinate-argv"))),
-        vec!["-i", engine.cmd.as_str(), "a b", "it's"]
-    );
+    // What the pane is really running: the engine itself, nothing wrapped
+    // around it, one word per argument however it was spelled.
     assert_eq!(lines(&await_file(&argv)), vec!["a b", "it's"]);
 
     // Nothing is attached to a session started detached.

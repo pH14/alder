@@ -41,11 +41,17 @@ needs `.alder/driver.json`; the one-shot commands do not. `alderd` reads the
 store remote and ref from `.alder/config.json` so it watches exactly the ref
 Alder writes.
 
-Logs go to standard error. To opt into launchd supervision for this checkout,
-run `scripts/alderd-install.sh`; it renders
+The daemon runs on macOS and Linux. It needs `git`, `tmux`, and the `alder`
+binary on PATH, and nothing else platform-specific: a pane runs the engine
+directly, so keeping the host awake under a long worker is the host's business
+— a launchd or systemd unit, or the machine's own power settings.
+
+Logs go to standard error. Supervision is supplied for launchd only. To opt in
+for this checkout, run `scripts/alderd-install.sh`; it renders
 `contrib/com.alder.alderd.plist` into `~/Library/LaunchAgents/` and loads it.
 Run `scripts/alderd-uninstall.sh` to unload and remove it. Re-running install
-adopts the existing label and converges to the current checkout paths.
+adopts the existing label and converges to the current checkout paths. On Linux
+there is no equivalent yet; run the loop under a supervisor of your own.
 
 ## Dispatch
 
@@ -200,8 +206,8 @@ Firing is strictly ordered:
 1. **Reconcile the session.** Kill it if the desired engine changed, a rotation
    is pending, the pass document changed, the pass budget is spent, or the
    session is not one this daemon started. Create it with
-   `tmux new-session -d -s <session> 'caffeinate -i <cmd> <args>'` and mark the
-   next injection as a bootstrap.
+   `tmux new-session -d -s <session> '<cmd> <args>'` and mark the next
+   injection as a bootstrap.
 2. **Record intent.** `alder loop wake --engine <engine> --handle tmux:<session>
    --trigger …` returns the pass ID. If the wake is rejected with `pass_open`,
    another writer opened a pass in the last few seconds; the driver concedes

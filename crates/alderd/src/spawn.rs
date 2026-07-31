@@ -284,21 +284,25 @@ fn text(value: &Value, key: &str) -> Option<String> {
 
 /// The command the pane runs: the engine, on the goal, ending in a shell.
 ///
-/// `caffeinate -i` keeps the Mac from idle-sleeping under a worker. Every word
-/// is quoted, so the goal reaches the engine as one argument however it is
-/// spelled, and `exec bash` replaces the engine when it exits so the session —
-/// and therefore the handle — survives a one-shot run. A Codex launch starts
-/// its session-ID watcher before the engine; that watcher is independent of
-/// the worker's first tool call and returns immediately rather than waiting
-/// for Codex to boot.
+/// Every word is quoted, so the goal reaches the engine as one argument
+/// however it is spelled, and `exec bash` replaces the engine when it exits so
+/// the session — and therefore the handle — survives a one-shot run. A Codex
+/// launch starts its session-ID watcher before the engine; that watcher is
+/// independent of the worker's first tool call and returns immediately rather
+/// than waiting for Codex to boot.
+///
+/// Nothing wraps the engine to keep the host awake. This once ran under
+/// `caffeinate -i`, which exists only on darwin and so made the Linux binaries
+/// spawn a pane whose command was not found. Keeping a machine awake is the
+/// host's business — a launchd or systemd unit, or the machine's own power
+/// settings — not something to hard-code into every pane on every platform.
 pub fn pane_command(
     engine: &[String],
     goal: &str,
     session: &str,
     stamp_codex_session: bool,
 ) -> String {
-    let mut words = vec!["caffeinate".to_owned(), "-i".to_owned()];
-    words.extend(engine.iter().cloned());
+    let mut words = engine.to_vec();
     words.push(goal.to_owned());
     let quoted: Vec<_> = words
         .iter()
