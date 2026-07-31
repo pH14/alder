@@ -25,20 +25,27 @@
 //!
 //! What is modeled by hand — the drift surface — is the *sequencing* of each
 //! actor: where a process can be interrupted between reading and writing, and
-//! what a crash erases. See README.md for the bounds and the findings.
+//! what a crash erases. Even the wake's recorded content is not hand-modeled:
+//! the engine and trigger kinds come from the decision the daemon acted on and
+//! reach [`PassTrigger`] down the real CLI's own parse. See README.md for the
+//! bounds and the findings.
 
 use std::hash::{Hash, Hasher};
 
 use alder::app::loop_section;
+use alder::cli::TriggerKind;
 use alder::domain::{
     Event, EventDraft, EventPayload, HandoffDefinition, PassDefinition, PassOutcome, PassTrigger,
     ProjectState, decode_record, encode_draft, invariants,
 };
 use alder_log::{AppendDisposition, Log, LogError, MemoryLog, Record, RecordDraft};
 use alderd::config::Config;
-use alderd::decide::{self, Decision, EngineChoice, Poll, Session, SessionAction, config_for};
+use alderd::decide::{
+    self, Decision, EngineChoice, Poll, Session, SessionAction, Trigger, config_for,
+};
 use alderd::loop_state::LoopState;
 use chrono::{DateTime, TimeDelta, Utc};
+use clap::ValueEnum;
 use serde_json::json;
 use stateright::{Model, Property};
 
@@ -116,6 +123,15 @@ pub struct ProtocolState {
     /// created, killed, or crashed — a dead pane ends the tmux session, which
     /// is what `tmux has-session` reports either way.
     pub tmux: Option<u8>,
+    /// Whether the leader was actually told to run the open pass.
+    ///
+    /// A live session is not a running pass. The driver appends `pass.started`
+    /// and only then types into the terminal, so a recorded pass is not an
+    /// engine doing work until the injection lands — and a driver that died in
+    /// between leaves a session that is perfectly healthy and perfectly idle.
+    /// Without this bit the model would let the leader end a pass it was never
+    /// handed, which is the one thing that makes that window look repaired.
+    pub leader_injected: bool,
     pub ghosts: Ghosts,
 }
 
@@ -133,6 +149,7 @@ impl Hash for ProtocolState {
         self.daemon.hash(hasher);
         self.phone.hash(hasher);
         self.tmux.hash(hasher);
+        self.leader_injected.hash(hasher);
         self.ghosts.hash(hasher);
     }
 }
@@ -157,18 +174,31 @@ pub struct KnownSession {
 
 /// The daemon's position between its atomic steps. The real driver runs
 /// poll-decide-reconcile, then `alder loop wake` (whose own snapshot is
-/// fresh), then the CAS push; a crash or a rival append can land between any
-/// two of them.
+/// fresh), then the CAS push, then `tmux_send_keys`; a crash or a rival
+/// append can land between any two of them.
+///
+/// `Armed` and `Appending` carry the engine and trigger kinds the decision
+/// produced, because those are what the wake records. Recomputing them at the
+/// append would be reading a fresher decision than the driver acted on.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DaemonCtl {
     Idle,
     /// Decided `Fire` and reconciled the session; the wake call is next.
-    Armed,
+    Armed {
+        engine: String,
+        triggers: Vec<PassTrigger>,
+    },
     /// The wake's own snapshot saw no open pass; the append is in flight
     /// against the head it pinned.
     Appending {
         expected: u64,
+        engine: String,
+        triggers: Vec<PassTrigger>,
     },
+    /// The append committed and nothing has been typed into the leader's
+    /// terminal yet: LOOP.md's "Recorded pass, nothing injected" window. The
+    /// log shows an open pass and no engine is running it.
+    Recorded,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -230,6 +260,11 @@ pub struct Ghosts {
     pub handoff_conflicted: bool,
     /// An identical retried draft was absorbed as `AlreadyPresent`.
     pub already_present: bool,
+    /// A daemon crash landed between the durable wake and the injection,
+    /// stranding a recorded pass no engine was ever told to run.
+    pub pass_recorded_uninjected: bool,
+    /// A pass found open outlived its budget and was ended `timeout`.
+    pub timed_out: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -249,8 +284,15 @@ pub enum ProtocolAction {
     DaemonWakeSnapshot,
     /// Push the pinned `pass.started` through the CAS append.
     DaemonWakeAppend,
+    /// Type the pass into the leader's terminal — the driver's
+    /// `tmux_send_keys`, the effect the durable wake precedes.
+    DaemonInject,
     /// Observe the recorded session dead and end the open pass `crashed`.
     DaemonResolveCrashed,
+    /// End a pass found open that has outlived its budget. Time is not a
+    /// modeled dimension, so "the budget elapsed" is offered as an explicit
+    /// step, the same honesty `DaemonCeilingFires` uses for the poll ceiling.
+    DaemonResolveTimeout,
     /// The daemon process dies and restarts, forgetting its session memory.
     DaemonCrash,
     /// The engine finishes its pass, optionally asking for rotation.
@@ -430,6 +472,32 @@ fn daemon_handle(config: &Config) -> String {
     format!("tmux:{}", config.tmux_session)
 }
 
+/// The trigger kinds a decision produced, in the spelling the wake records.
+///
+/// The driver does not hand `alderd`'s enum to the ledger: it puts
+/// `trigger.as_str()` on `alder loop wake --trigger`, clap parses that into a
+/// [`TriggerKind`], and `alder`'s own `From` turns it into a [`PassTrigger`].
+/// Walking the same three steps here keeps the mapping out of this crate — if
+/// the two enums ever diverge, this panics instead of quietly recording a
+/// trigger kind the contract does not have.
+///
+/// The sort and dedup are the CLI's, not an embellishment: `loop wake`
+/// normalizes before it appends, so a model that skipped it would record
+/// orderings the ledger never writes.
+fn pass_triggers(triggers: &[Trigger]) -> Vec<PassTrigger> {
+    let mut kinds: Vec<PassTrigger> = triggers
+        .iter()
+        .map(|trigger| {
+            TriggerKind::from_str(trigger.as_str(), false)
+                .expect("alderd's trigger kinds are the CLI's")
+                .into()
+        })
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
+
 /// How many passes this log blames on a crash, counted by the shared module.
 /// A log no reader can interpret blames nobody; [`log_folds_cleanly`] is the
 /// property that fires on it.
@@ -455,7 +523,7 @@ impl Scenario {
     /// second, so a crash between them re-rotates instead of losing one.
     fn daemon_poll_fires(&self, state: &mut ProtocolState, poll: &Poll) -> Option<()> {
         let view = daemon_view(&state.log)?;
-        let Decision::Fire(_) = decide::decide(&self.config, &view, poll) else {
+        let Decision::Fire(triggers) = decide::decide(&self.config, &view, poll) else {
             return None;
         };
         let EngineChoice::Run(engine) = decide::resolve_engine(&self.config, &view) else {
@@ -490,12 +558,20 @@ impl Scenario {
             }
         }
         state.daemon.wakes += 1;
-        state.daemon.ctl = DaemonCtl::Armed;
+        state.daemon.ctl = DaemonCtl::Armed {
+            engine,
+            triggers: pass_triggers(&triggers),
+        };
         Some(())
     }
 
     fn daemon_wake_append(&self, state: &mut ProtocolState) -> Option<()> {
-        let DaemonCtl::Appending { expected } = state.daemon.ctl else {
+        let DaemonCtl::Appending {
+            expected,
+            ref engine,
+            ref triggers,
+        } = state.daemon.ctl
+        else {
             return None;
         };
         let prefix = fold(&state.log[..expected as usize])?;
@@ -506,9 +582,12 @@ impl Scenario {
             EventPayload::PassStarted {
                 pass: PassDefinition {
                     id: pass_id,
-                    engine: "claude".to_owned(),
+                    // What the decision resolved and asked for, not what a
+                    // default host happens to run: a Codex-configured loop
+                    // records `codex`, and a handoff-woken pass records `log`.
+                    engine: engine.clone(),
                     handle: daemon_handle(&self.config),
-                    triggers: vec![PassTrigger::Due],
+                    triggers: triggers.clone(),
                     at_head: expected,
                 },
             },
@@ -520,11 +599,55 @@ impl Scenario {
                     session.passes += 1;
                 }
                 consume_rotation(&mut state.ghosts, Consumer::Daemon);
+                // Recorded, not yet injected. Everything the driver does after
+                // this point is an effect on the world, and the log already
+                // says a pass is open.
+                state.daemon.ctl = DaemonCtl::Recorded;
             }
-            AppendOutcome::Conflicted => state.ghosts.wake_conflicted = true,
+            AppendOutcome::Conflicted => {
+                state.ghosts.wake_conflicted = true;
+                // Nothing was recorded, so there is nothing to inject; the
+                // driver concedes and reads the fold again next poll.
+                state.daemon.ctl = DaemonCtl::Idle;
+            }
             AppendOutcome::AlreadyPresent(_) => return None,
         }
+        Some(())
+    }
+
+    /// `tmux_send_keys`: the leader is now running the pass the log already
+    /// records. Send failures are out of scope — the model's effects land.
+    fn daemon_inject(state: &mut ProtocolState) -> Option<()> {
+        let DaemonCtl::Recorded = state.daemon.ctl else {
+            return None;
+        };
+        state.leader_injected = true;
         state.daemon.ctl = DaemonCtl::Idle;
+        Some(())
+    }
+
+    /// The other half of the stale-pass repair rule. `crashed` needs a tmux
+    /// handle observably gone; when the session is alive but nothing is
+    /// running in it — a driver that died between its wake and its injection —
+    /// time is the only fact left, so `timeout` is the only verdict available.
+    fn daemon_resolve_timeout(state: &mut ProtocolState) -> Option<()> {
+        let project = fold(&state.log)?;
+        let pass = project.open_pass()?;
+        let draft = typed_draft(
+            &format!("daemon-timeout-{}", pass.id),
+            DAEMON_ACTOR,
+            EventPayload::PassEnded {
+                pass_id: pass.id.clone(),
+                outcome: PassOutcome::Timeout,
+                report: None,
+                wake_at: None,
+                rotate: false,
+                why: Some("the pass outlived its budget".to_owned()),
+            },
+        );
+        state.log = append_now(&state.log, &draft);
+        state.leader_injected = false;
+        state.ghosts.timed_out = true;
         Some(())
     }
 
@@ -548,6 +671,7 @@ impl Scenario {
         if own {
             state.daemon.known = None;
         }
+        state.leader_injected = false;
         Some(())
     }
 
@@ -629,6 +753,7 @@ impl Model for Scenario {
                 handoff: PhoneHandoff::NotYet,
             },
             tmux: None,
+            leader_injected: false,
             ghosts: Ghosts::default(),
         }]
     }
@@ -656,19 +781,38 @@ impl Model for Scenario {
                         actions.push(ProtocolAction::DaemonCeilingFires);
                     }
                 }
-                if let Some(pass) = open
-                    && decide::observable_session(&pass.handle).is_some()
-                    && state.tmux.is_none()
-                {
-                    actions.push(ProtocolAction::DaemonResolveCrashed);
+                // The stale-pass repair rule, applied where LOOP.md puts it:
+                // to a pass this poll *found* open, never to one that beat
+                // this daemon's own wake. `crashed` needs an observable tmux
+                // handle that is gone; `timeout` is available whatever the
+                // handle, and is the only verdict for a pass whose session is
+                // alive and idle.
+                if let Some(pass) = open {
+                    if decide::observable_session(&pass.handle).is_some() && state.tmux.is_none() {
+                        actions.push(ProtocolAction::DaemonResolveCrashed);
+                    }
+                    actions.push(ProtocolAction::DaemonResolveTimeout);
                 }
             }
-            DaemonCtl::Armed => actions.push(ProtocolAction::DaemonWakeSnapshot),
+            DaemonCtl::Armed { .. } => actions.push(ProtocolAction::DaemonWakeSnapshot),
             DaemonCtl::Appending { .. } => actions.push(ProtocolAction::DaemonWakeAppend),
+            DaemonCtl::Recorded => actions.push(ProtocolAction::DaemonInject),
         }
-        // A crash during the CAS push itself is the ambiguous-response case;
-        // the driver resolves that era by timeout, which needs time, so the
-        // model stops the crash injection short of it.
+        // Two windows sit either side of the CAS push, and only one of them is
+        // out of scope.
+        //
+        // A crash *during* the push is the ambiguous-response case: the daemon
+        // cannot know whether its append landed, and the driver resolves that
+        // era by timeout against the pass it may or may not have opened, which
+        // needs real time to distinguish from a pass still running. The model
+        // stops the crash injection short of it.
+        //
+        // A crash *after* the push and before the injection is not ambiguous
+        // at all, and it is the window LOOP.md names first: the append landed,
+        // the log shows an open pass, and nothing was ever typed at the
+        // leader. `Recorded` is therefore crashable — that is the whole point
+        // of modelling it — and the repair is `DaemonResolveTimeout`, since
+        // the session the driver reconciled is still perfectly alive.
         if state.daemon.crashes_left > 0 && !matches!(state.daemon.ctl, DaemonCtl::Appending { .. })
         {
             actions.push(ProtocolAction::DaemonCrash);
@@ -677,6 +821,7 @@ impl Model for Scenario {
         if let Some(pass) = open
             && decide::observable_session(&pass.handle).is_some()
             && state.tmux.is_some()
+            && state.leader_injected
         {
             actions.push(ProtocolAction::LeaderEndPass { rotate: false });
             if self.leader_rotate && !project.passes.values().any(|pass| pass.rotate) {
@@ -738,6 +883,14 @@ impl Model for Scenario {
                 self.daemon_poll_fires(&mut state, &late_observation(&self.config))?;
             }
             ProtocolAction::DaemonWakeSnapshot => {
+                let DaemonCtl::Armed {
+                    ref engine,
+                    ref triggers,
+                } = state.daemon.ctl
+                else {
+                    return None;
+                };
+                let (engine, triggers) = (engine.clone(), triggers.clone());
                 let project = fold(&state.log)?;
                 if project.open_pass().is_some() {
                     state.ghosts.conceded = true;
@@ -745,22 +898,32 @@ impl Model for Scenario {
                 } else {
                     state.daemon.ctl = DaemonCtl::Appending {
                         expected: state.log.len() as u64,
+                        engine,
+                        triggers,
                     };
                 }
             }
             ProtocolAction::DaemonWakeAppend => self.daemon_wake_append(&mut state)?,
+            ProtocolAction::DaemonInject => Self::daemon_inject(&mut state)?,
             ProtocolAction::DaemonResolveCrashed => self.daemon_resolve_crashed(&mut state)?,
+            ProtocolAction::DaemonResolveTimeout => Self::daemon_resolve_timeout(&mut state)?,
             ProtocolAction::DaemonCrash => {
+                if let DaemonCtl::Recorded = state.daemon.ctl {
+                    state.ghosts.pass_recorded_uninjected = true;
+                }
                 state.daemon.ctl = DaemonCtl::Idle;
                 state.daemon.known = None;
                 state.daemon.crashes_left -= 1;
             }
             ProtocolAction::LeaderEndPass { rotate } => {
                 Self::end_pass_ok(&mut state, LEADER_ACTOR, "leader-end", rotate)?;
+                state.leader_injected = false;
             }
             ProtocolAction::LeaderCrash => {
                 state.tmux = None;
                 state.ghosts.session_crashes += 1;
+                // The session took the pass with it, injected or not.
+                state.leader_injected = false;
             }
             ProtocolAction::PhoneRotationRequest => {
                 let draft = typed_draft(
@@ -910,7 +1073,53 @@ impl Model for Scenario {
                     project.loop_control.rotate_pending() == state.ghosts.rotation_pending
                 })
             }),
+            // A wake records what the decision resolved. Hard-coding either
+            // value reads as correct for as long as every scenario happens to
+            // configure that engine, which is exactly how a literal survives.
+            Property::<Self>::always(
+                "a daemon wake records a configured engine",
+                |model, state| {
+                    fold(&state.log).is_some_and(|project| {
+                        project
+                            .passes
+                            .values()
+                            .filter(|pass| pass.handle == daemon_handle(&model.config))
+                            .all(|pass| model.config.engines.contains_key(&pass.engine))
+                    })
+                },
+            ),
         ];
+        if self.phone_handoff {
+            // The trigger kinds are the decision's too. A handoff advances the
+            // log, so the wake it provokes is a `log` wake and must say so —
+            // the contract calls the kinds informational, not optional.
+            properties.push(Property::<Self>::sometimes(
+                "a wake records the log trigger that woke it",
+                |model, state| {
+                    fold(&state.log).is_some_and(|project| {
+                        project
+                            .passes
+                            .values()
+                            .filter(|pass| pass.handle == daemon_handle(&model.config))
+                            .any(|pass| pass.triggers.contains(&PassTrigger::Log))
+                    })
+                },
+            ));
+        }
+        if self.daemon_crashes > 0 {
+            // LOOP.md's first crash window, and its repair. Both are
+            // `sometimes` because a window nobody enters proves nothing: the
+            // model has to actually strand a pass before its recovery from
+            // one means anything.
+            properties.push(Property::<Self>::sometimes(
+                "a crash strands a pass nobody was told to run",
+                |_, state| state.ghosts.pass_recorded_uninjected,
+            ));
+            properties.push(Property::<Self>::sometimes(
+                "a stranded pass is repaired by timeout",
+                |_, state| state.ghosts.timed_out,
+            ));
+        }
         if self.leader_rotate || self.phone_rotation {
             properties.push(Property::<Self>::sometimes(
                 "a rotation is performed and then consumed",

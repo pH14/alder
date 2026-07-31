@@ -61,6 +61,7 @@ dependencies = [
  "alder-log",
  "alderd",
  "chrono",
+ "clap",
  "serde_json",
  "stateright",
 ]

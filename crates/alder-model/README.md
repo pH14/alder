@@ -46,21 +46,33 @@ bookkeeping stay local, and that is deliberate rather than an omission: they
 are claims about reachability across a state space, and only a model checker
 has one.
 
-The one production change made for this crate: `alder::app::loop_section`
+Two production changes were made for this crate: `alder::app::loop_section`
 became `pub`, so the model reads the loop through the same projection the
-daemon does.
+daemon does, and `PassTrigger` gained `Hash`, so a recorded trigger list can
+live in a model state that stateright hashes.
+
+Trigger kinds reach the log the way the driver sends them, not by a mapping
+copied into this crate: `alderd`'s `Trigger::as_str` is what the driver puts
+on `alder loop wake --trigger`, so the model parses that string with the
+CLI's own `TriggerKind` and converts with `alder`'s own `From`. If the two
+enums ever diverge, this panics rather than quietly recording a trigger kind
+the contract does not have.
 
 ## The actors and their atomic steps
 
 - **The log** is the shared state: a `Vec<Record>` replayed through a real
   `MemoryLog` on every transition. Appends are the linearization points.
-- **The daemon** takes three steps per wake, mirroring `alderd`'s driver:
+- **The daemon** takes four steps per wake, mirroring `alderd`'s driver:
   poll-decide-reconcile (session restarted *before* the wake, as the driver
   comments insist), then the wake CLI's own snapshot (which concedes to an
   open pass — the `pass_open` path), then the CAS push against the pinned
-  head (which can lose the race — the `HeadConflict` path). It resolves an
-  open pass as `crashed` only when the pass's handle is an observable tmux
-  session it can see is gone.
+  head (which can lose the race — the `HeadConflict` path), then
+  `tmux_send_keys` — the injection, which is a separate step because the
+  durable wake deliberately precedes it. The engine and trigger kinds the
+  decision produced ride along from the first step to the third, because
+  those are what the wake records. It repairs a pass it *found* open by the
+  stale-pass rule: `crashed` when the pass's handle is an observable tmux
+  session it can see is gone, `timeout` otherwise.
 - **The leader** ends the open pass `ok`, optionally with `rotate: true`,
   or crashes (the tmux session dies).
 - **The phone** optionally races a wake, requests a rotation, pauses the
@@ -70,8 +82,39 @@ daemon does.
   and the leader session can die, each under a scenario budget.
 
 Time is not a modeled dimension: every event carries the same instant, and
-"the max-interval ceiling eventually elapses" is offered as an explicit
-step (`DaemonCeilingFires`), which is the fairness assumption made honest.
+the two places the protocol genuinely waits are offered as explicit steps
+rather than pretended away — "the max-interval ceiling eventually elapses"
+(`DaemonCeilingFires`) and "the pass budget eventually elapses"
+(`DaemonResolveTimeout`). That is the fairness assumption made honest. What
+it costs is that both are always available rather than only after a delay,
+so the model explores a daemon that times out a live pass; that is legal
+under the stale-pass rule, just pessimistic about when.
+
+### The window between intent and effect
+
+`LOOP.md` names two crash windows around a wake and says the first is
+repairable. The model represents it: `DaemonCtl::Recorded` is the state
+where the CAS append has committed and nothing has been typed at the leader
+yet. A daemon crash there strands a pass that the log shows open and that no
+engine was ever told to run.
+
+The bit that makes this window real is `leader_injected`. A live tmux
+session is not a running pass — the driver reconciles the session *before*
+the wake, so after a crash in this window the session is perfectly healthy
+and perfectly idle. Without that bit the leader could end a pass it was
+never handed, which is precisely what would make a broken window look
+repaired.
+
+The repair is `timeout`, and it has to be: `crashed` requires a session
+observably gone, and this one is alive. That is the stale-pass rule's "time
+is the only fact it has" clause, and it is why modelling the window at all
+required modelling the timeout verdict.
+
+A crash *during* the CAS push is the other window, and it stays out of
+scope: the daemon cannot know whether its append landed, and telling that
+era apart from a pass still running needs real time rather than a fairness
+step. The crash injection stops short of `DaemonCtl::Appending` for that
+reason and no other.
 
 ## The four properties
 
@@ -121,13 +164,20 @@ handoff, and per-scenario crash counts. The log length is bounded by
 
 | Scenario (test) | Faults and writers | Unique states |
 | --------------- | ------------------ | ------------- |
-| lone daemon | none | 9 (one linear chain) |
-| wake race | phone wake | 63 |
-| CAS writers | handoff + lost response | 223 |
-| rotation race | phone wake + phone rotation | 546 |
-| rotation under crashes | rotate + pause + 1 daemon crash + 1 session crash | 2,388 |
+| codex engine | none, one pass, Codex-configured | 7 |
+| lone daemon | none | 19 |
+| wake race | phone wake | 152 |
+| CAS writers | handoff + lost response | 659 |
+| rotation race | phone wake + phone rotation | 1,393 |
+| rotation under crashes | rotate + pause + 1 daemon crash + 1 session crash | 8,826 |
 
-Complete exploration of all five scenarios takes about a second.
+Complete exploration of all six scenarios takes about five seconds.
+
+The baseline is no longer the single linear chain it was before the
+injection step and the timeout verdict existed. It is now arm, snapshot,
+append, inject, end, twice over, with the timeout branch available at each
+of the two open passes — 19 states. Growth beyond that still means the model
+gained transitions, and still wants investigating before it is accepted.
 
 ## Findings
 
@@ -171,6 +221,26 @@ ignore the consuming wake is caught by
 `crashed` verdict is caught by `crashed_verdicts_follow_real_crashes` in
 every scenario, including the fault-free one.
 
+Three more hold the wake's recorded content and the crash window in place —
+each of these mutations restores a defect this model once had:
+
+- Hard-coding `engine: "claude"` again passes every other scenario in the
+  file and fails only `a_codex_configured_loop_records_codex`, on "a daemon
+  wake records a configured engine". A literal that matches the only engine
+  anybody configured is invisible until somebody configures another one,
+  which is why that scenario exists.
+- Hard-coding `triggers: vec![Due]` again fails "a wake records the log
+  trigger that woke it" in the CAS-writers scenario, where a handoff
+  advances the log and the wake it provokes must say `log`.
+- Removing `DaemonResolveTimeout` fails **liveness** — "every terminal state
+  is progressing or blocked-and-named" — with a 16-step counterexample: the
+  pass stranded by a crash between the wake and the injection has no repair,
+  so exploration ends with it still open. Removing the injection gate as
+  well does not restore the green; it fails "a stranded pass is repaired by
+  timeout" instead. That pair is the point of the window: before it existed
+  the model could not enter the state at all, and liveness stayed green by
+  never being asked.
+
 `at_most_one_open_pass` has no such mutation here, and that is a fact about
 the fold rather than a gap: every way of reaching two open passes in this
 model produces a history the real fold rejects outright, so
@@ -179,9 +249,14 @@ those shapes in the shared module's own tests.
 
 ## Abstractions, so nobody over-reads the green
 
-- Timeout resolution is out of scope (it needs real time); crash
-  attribution is modeled only for observable tmux handles, which is also
-  the driver's own rule. The phone always ends its own pass.
+- The timeout *verdict* is modeled; the timeout *deadline* is not. The
+  budget elapsing is a fairness step available whenever a pass is open, so
+  the model explores a daemon that times out a live pass — legal under the
+  stale-pass rule, pessimistic about when. Crash attribution is modeled only
+  for observable tmux handles, which is the driver's own rule. The phone
+  always ends its own pass.
+- The injection is assumed to land: `tmux_send_keys` failures are not
+  modeled, only the crash window before the call.
 - Injection, debounce, client-attachment, engine ambiguity, pass budgets
   per session, and the SQLite projection are out of scope.
 - All events share one timestamp and record IDs are deterministic per
