@@ -1109,6 +1109,66 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_stale_schema_drops_derived_rows_before_recreating_it() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("state.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "
+                PRAGMA user_version = 2;
+                CREATE TABLE events (
+                    seq INTEGER PRIMARY KEY,
+                    id TEXT NOT NULL UNIQUE,
+                    at TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    body_json TEXT NOT NULL
+                );
+                INSERT INTO events(seq, id, at, actor, type, body_json)
+                VALUES (1, 'old', 'now', 'test', 'old.event', '{}');
+                ",
+            )
+            .unwrap();
+        drop(connection);
+
+        let projection = Projection::new(&path);
+        let connection = projection.connection().unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let rows: u64 = connection
+            .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn opening_a_current_schema_preserves_observation_rows() {
+        let temporary = TempDir::new().unwrap();
+        let projection = Projection::new(temporary.path().join("state.db"));
+        let connection = projection.connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO observed_handles
+                 (handle, attempt_id, status, metadata, observed_at, detail)
+                 VALUES (?1, NULL, ?2, ?3, ?4, NULL)",
+                params!["tmux:worker", "present", "{}", "now"],
+            )
+            .unwrap();
+        drop(connection);
+
+        let connection = projection.connection().unwrap();
+        let rows: u64 = connection
+            .query_row("SELECT count(*) FROM observed_handles", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
     fn sync_rebuilds_only_when_the_represented_head_changes() {
         let temporary = TempDir::new().unwrap();
         let projection = Projection::new(temporary.path().join("state.db"));

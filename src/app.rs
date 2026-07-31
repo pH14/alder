@@ -597,13 +597,7 @@ fn has_actual_edit_fields(args: &WorkEditArgs) -> bool {
 fn attempt_edit(context: &Context, args: &AttemptEditArgs) -> Result<Output> {
     let metadata = parse_metadata(&args.meta)?;
     if let Some(handle) = args.handle.clone() {
-        if !args.satisfied.is_empty()
-            || !args.failed.is_empty()
-            || args.evidence.is_some()
-            || args.evidence_file.is_some()
-            || args.note.is_some()
-            || args.note_file.is_some()
-        {
+        if handle_edit_has_progress_fields(args) {
             return Err(AlderError::validation(
                 "--handle can be combined only with --meta",
             ));
@@ -643,6 +637,15 @@ fn attempt_edit(context: &Context, args: &AttemptEditArgs) -> Result<Output> {
         json!({"attempt_id": args.attempt, "change": "updated"}),
         format!("{}  updated", args.attempt),
     ))
+}
+
+fn handle_edit_has_progress_fields(args: &AttemptEditArgs) -> bool {
+    !args.satisfied.is_empty()
+        || !args.failed.is_empty()
+        || args.evidence.is_some()
+        || args.evidence_file.is_some()
+        || args.note.is_some()
+        || args.note_file.is_some()
 }
 
 /// The part of `alder status --json` every answer carries: the read envelope,
@@ -1854,7 +1857,7 @@ impl From<TriggerKind> for PassTrigger {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{Pass, PassState};
+    use crate::domain::{AttemptState, Pass, PassState};
 
     use super::*;
 
@@ -1964,6 +1967,79 @@ mod tests {
             assert!(has_actual_edit_fields(&args));
             assert!(has_single_edit_fields(&args));
         }
+    }
+
+    #[test]
+    fn handle_binding_rejects_each_kind_of_progress_update() {
+        let mut args = AttemptEditArgs {
+            attempt: "hm-1-attempt-1".to_owned(),
+            handle: Some("tmux:worker".to_owned()),
+            meta: Vec::new(),
+            satisfied: Vec::new(),
+            failed: Vec::new(),
+            evidence: None,
+            evidence_file: None,
+            note: None,
+            note_file: None,
+        };
+        assert!(!handle_edit_has_progress_fields(&args));
+
+        for update in [
+            |args: &mut AttemptEditArgs| args.satisfied.push("test".to_owned()),
+            |args: &mut AttemptEditArgs| args.failed.push("test".to_owned()),
+            |args: &mut AttemptEditArgs| args.evidence = Some("proof".to_owned()),
+            |args: &mut AttemptEditArgs| args.evidence_file = Some("proof.txt".to_owned()),
+            |args: &mut AttemptEditArgs| args.note = Some("working".to_owned()),
+            |args: &mut AttemptEditArgs| args.note_file = Some("note.txt".to_owned()),
+        ] {
+            update(&mut args);
+            assert!(handle_edit_has_progress_fields(&args));
+            args.satisfied.clear();
+            args.failed.clear();
+            args.evidence = None;
+            args.evidence_file = None;
+            args.note = None;
+            args.note_file = None;
+        }
+    }
+
+    #[test]
+    fn in_flight_section_contains_only_starting_and_active_attempts() {
+        let mut state = ProjectState::default();
+        for (id, state_value, started_seq) in [
+            ("hm-1-attempt-1", AttemptState::Starting, 2),
+            ("hm-1-attempt-2", AttemptState::Active, 3),
+            ("hm-1-attempt-3", AttemptState::Ended, 1),
+        ] {
+            state.attempts.insert(
+                id.to_owned(),
+                Attempt {
+                    id: id.to_owned(),
+                    work_id: "hm-1".to_owned(),
+                    state: state_value,
+                    outcome: None,
+                    handle: None,
+                    metadata: BTreeMap::new(),
+                    note: None,
+                    started_seq,
+                    bound_seq: None,
+                    updated_seq: started_seq,
+                    ended_seq: None,
+                    checks: BTreeMap::new(),
+                },
+            );
+        }
+
+        let section = in_flight_section(&state);
+        assert_eq!(
+            section
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|attempt| attempt["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["hm-1-attempt-1", "hm-1-attempt-2"]
+        );
     }
 
     #[test]
