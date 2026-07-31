@@ -88,12 +88,19 @@ instructions; `AGENTS.md` and the diff are the entire lens. `--title` is
 display text, not a prompt channel. There is no `-m`; pin the model with
 `-c model=`.
 
-Codex-authored branch — fresh one-shot Claude review:
+Codex-authored branch — fresh Claude review in a tmux session (operator
+ruling 2026-07-31: never `claude -p`; the tmux method is the standard
+transport, same as workers):
 
 ```sh
-claude -p --model claude-fable-5 --effort xhigh --permission-mode auto \
-  < "$scratch/review-prompt-<id>.txt"
+tmux new-session -d -s review-<id> -c <branch-worktree> \
+  claude --model claude-fable-5 --effort xhigh --permission-mode auto
+.alder/relay review-<id> "$scratch/review-prompt-<id>.txt"
 ```
+
+Collect the verdict from the session's pane/transcript, record it, then kill
+the session. Freshness still matters: a new session every review, never the
+leader's own or a subagent (both carry unlogged context or effort).
 
 The prompt file (in `$scratch`, outside the worktree) holds the brief:
 
@@ -108,9 +115,9 @@ AGENTS.md is the review lens. Report findings, or say the branch is clean.
 match the waiter (or the ChatGPT app's own long-lived process). A wedge looks
 like a slow review by clock alone: if output has not grown for ~25 minutes and
 CPU has gained only seconds, kill it, record the abandonment, end the pass.
-That silence-plus-low-CPU heuristic is for streaming Codex reviews. `claude -p`
-buffers output until exit and can sit near zero CPU while thinking; on that
-route, session-transcript growth is the useful signal instead.
+That silence-plus-low-CPU heuristic is for streaming Codex reviews. For a
+tmux-hosted Claude review, pane and session-transcript growth is the useful
+signal instead.
 In a review sandbox, a `host_tmux` test failure is environmental, not a
 finding.
 
