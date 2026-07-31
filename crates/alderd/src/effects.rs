@@ -378,32 +378,23 @@ impl SpawnHost for Host {
     }
 
     fn remove_path(&self, path: &Path) -> Result<()> {
-        let metadata = match path.symlink_metadata() {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(DriverError::new(format!(
-                    "cannot inspect `{}` before removing it: {error}",
-                    path.display()
-                )));
-            }
-        };
-        let removed = if metadata.file_type().is_dir() {
-            std::fs::remove_dir_all(path)
-        } else {
-            // `symlink_metadata` above deliberately does not follow a
-            // symlink, so this removes the residue link rather than its
-            // target outside the worktree parent.
-            std::fs::remove_file(path)
-        };
-        match removed {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(DriverError::new(format!(
-                "cannot remove unregistered worktree residue `{}`: {error}",
-                path.display()
-            ))),
-        }
+        remove_residue(
+            path,
+            || {
+                path.symlink_metadata()
+                    .map(|metadata| metadata.file_type().is_dir())
+            },
+            |is_directory| {
+                if is_directory {
+                    std::fs::remove_dir_all(path)
+                } else {
+                    // `symlink_metadata` above deliberately does not follow
+                    // a symlink, so this removes the residue link rather than
+                    // its target outside the worktree parent.
+                    std::fs::remove_file(path)
+                }
+            },
+        )
     }
 
     fn create_dir_all(&self, path: &Path) -> Result<()> {
@@ -432,6 +423,36 @@ impl SpawnHost for Host {
 
     fn log(&self, message: &str) {
         self.say(message);
+    }
+}
+
+/// Remove a worktree residue after inspecting its file kind.
+///
+/// The path can disappear in either filesystem call: another repair may win
+/// that race, which is already the desired state. Keeping those two operations
+/// injectable makes both convergence cases deterministic to test.
+fn remove_residue(
+    path: &Path,
+    inspect: impl FnOnce() -> std::io::Result<bool>,
+    remove: impl FnOnce(bool) -> std::io::Result<()>,
+) -> Result<()> {
+    let is_directory = match inspect() {
+        Ok(is_directory) => is_directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(DriverError::new(format!(
+                "cannot inspect `{}` before removing it: {error}",
+                path.display()
+            )));
+        }
+    };
+    match remove(is_directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DriverError::new(format!(
+            "cannot remove unregistered worktree residue `{}`: {error}",
+            path.display()
+        ))),
     }
 }
 
@@ -503,5 +524,33 @@ mod tests {
             .expect_err("only a missing path is safe to ignore");
 
         assert!(error.message.contains("cannot inspect"), "{error}");
+    }
+
+    #[test]
+    fn a_residue_that_disappears_during_either_filesystem_step_is_already_repaired() {
+        let path = Path::new("/projects/alder-work-al-1");
+        remove_residue(
+            path,
+            || Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            |_| panic!("nothing is removed when inspection finds nothing"),
+        )
+        .expect("a path absent before inspection is converged");
+        remove_residue(
+            path,
+            || Ok(false),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        )
+        .expect("a path removed after inspection is converged too");
+
+        let error = remove_residue(
+            path,
+            || Ok(false),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .expect_err("only NotFound is a completed repair");
+        assert!(
+            error.message.contains("cannot remove unregistered"),
+            "{error}"
+        );
     }
 }

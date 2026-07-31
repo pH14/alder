@@ -1501,6 +1501,22 @@ mod tests {
             "{:#?}",
             host.calls()
         );
+
+        let host = Fake::new();
+        undo(
+            &host,
+            &Made {
+                worktree: true,
+                session: false,
+            },
+            "alder-work-al-1",
+            Path::new("/projects/alder-work-al-1"),
+        );
+        assert!(
+            !host.called("could not remove /projects/alder-work-al-1"),
+            "a successful cleanup was reported as failed: {:#?}",
+            host.calls()
+        );
         assert_eq!(
             first_line("\n  first useful line\nsecond line\n"),
             "first useful line"
