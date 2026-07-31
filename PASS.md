@@ -39,19 +39,16 @@ sequence rather than pasting it into the event.
 For a tmux worker, record the ruling first, then call that worktree's
 `.alder/relay <session> <file>`. The helper owns literal tmux delivery and any
 Codex resume mechanics; leaders do not recreate a `send-keys`, command
-substitution, or quoted resume command. It confirms that tmux sent the ruling
-to a working engine, never by inspecting a pane's input line. For a resumed
-Codex worker, the strongest engine signal is the process table showing the
-session UUID and the delivered file's contents in that process's argv.
+substitution, or quoted resume command. It reports one tmux delivery to the
+working engine, never by inspecting a pane's input line or synchronously
+probing worker progress.
 
-A successful exit is that confirmation. A fresh `attempt.updated` is the
-worker's next meaningful milestone, not an immediate receipt: the next pass's
-normal log read observes it after delivery. Exit 75 means the helper sent once
-but could not observe a working engine; do not replay it merely because the
-engine observation is late. A crash between send and confirmation still has no
-durable receipt, so it cannot be mechanically distinguished from a pre-send
-crash. That is the delivery-receipt gap recorded on `al-q8qwhy`, not a licence
-to type the same ruling twice.
+A successful exit is that one-delivery report. A fresh `attempt.updated` is
+the worker's next meaningful milestone, not an immediate receipt: the next
+pass's normal log read observes it after delivery. Delivery is at-least-once;
+a duplicate relay is harmless. A crash around the send still has no durable
+receipt, so it cannot be mechanically distinguished from a pre-send crash.
+That is the delivery-receipt gap recorded on `al-q8qwhy`.
 
 The helper is a tmux adapter, not the delivery concept. The ruling is durable
 in the log before transport, so a future cloud worker can pull it from there
@@ -96,16 +93,15 @@ flag without its own operator ruling.
    launch-pinned model, effort, sandbox, and exact `codex-session` UUID. Do
    not hand-write a resume command or infer a session with `--last`.
 
-   A successful helper exit confirms tmux delivery to a working engine. It
-   never reads ghost text or sends a speculative bare `Enter`; unblock on that
-   result. The next pass's normal `alder show <attempt>` observes the worker's
-   later `attempt.updated` as meaningful progress. Exit 75 says the helper
-   could not observe a working engine after sending once: do not unblock on
-   that result and do not retry merely because the engine observation is late.
-   The ruling remains recoverable from the log, while the pre-send/post-send
-   crash ambiguity remains the explicitly named `al-q8qwhy` receipt gap.
+   A successful helper exit reports one tmux delivery to a working engine. It
+   never reads ghost text or synchronously probes the worker after sending;
+   unblock on that result. The next pass's normal `alder show <attempt>`
+   observes the worker's later `attempt.updated` as meaningful progress.
+   Delivery is at-least-once, so a duplicate relay is harmless. The ruling
+   remains recoverable from the log, while the pre-send/post-send crash
+   ambiguity remains the explicitly named `al-q8qwhy` receipt gap.
 
-   Only after confirmation, unblock with a repository-authored reason such as
+   Only after the helper reports delivery, unblock with a repository-authored reason such as
    `alder work unblock <work> --why "answered question relayed"`. A tmux pane
    is not a durable channel; delivery follows the durable ruling rather than
    replacing it.
@@ -151,7 +147,7 @@ flag without its own operator ruling.
    - If findings need a live worker, first record them with
      `--evidence-file`, then hand the same local file to that worker's
    `.alder/relay`. Do not inline them or reimplement delivery. Leave the item
-   in flight until the helper confirms a working engine; the next pass observes
+   in flight until the helper reports one delivery; the next pass observes
    the later `attempt.updated`. An unconfirmed send is not an invitation to
    replay it.
 6. **Drain handoffs.** Admit each coherent submitted handoff
@@ -182,7 +178,7 @@ flag without its own operator ruling.
 8. **Nudge stalls.** For each in-flight attempt with no milestone in a long
    while, use fresh observations and the attempt's durable progress rather
    than pane text. A genuine stall gets one short, leader-authored nudge
-   through `.alder/relay`; its working-engine confirmation applies. Stalled
+   through `.alder/relay`; its one-delivery report applies. Stalled
    again next pass: kill, respawn fresh (same item, same branch). Fails a
    second respawn: `alder work ask <id>` — the operator decides.
 

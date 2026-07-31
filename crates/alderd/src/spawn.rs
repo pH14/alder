@@ -807,10 +807,10 @@ fn install_relay(host: &impl SpawnHost, worktree: &Path) -> Result<()> {
 /// loaded into a tmux buffer directly (an interactive worker), or encoded
 /// before a one-shot Codex shell reconstructs them as an argv value for the
 /// already-generated `.alder/resume` script. In neither route does the helper
-/// inspect the pane's input line. It confirms that the transport sent once to
-/// a working engine. A later `attempt.updated` is a meaningful worker
-/// milestone, observed by the next pass rather than manufactured as an
-/// impossible immediate receipt.
+/// inspect the pane's input line or synchronize on worker progress. A zero
+/// exit reports one accepted delivery to the worker's engine; a later
+/// `attempt.updated` is a meaningful worker milestone for the next pass to
+/// observe.
 fn relay_script() -> &'static str {
     r##"#!/bin/sh
 # Deliver a durable ruling to this worktree's tmux worker.
@@ -899,28 +899,7 @@ fi
 # break to CR, which submits multi-line reviewer text as separate prompts.
 tmux paste-buffer -d -r -b "$buffer" -t "$pane_target"
 tmux send-keys -t "$pane_target" Enter
-
-working_engine() {
-  marker=$(tmux show-environment -t "$session_target" ALDER_ENGINE 2>/dev/null || :)
-  [ "$marker" = "ALDER_ENGINE=running" ] && return 0
-  # A resumed Codex process has replaced the holding bash. This is the
-  # observable engine signal when the original one-shot left ALDER_ENGINE
-  # marked exited; do not read the pane's input line.
-  command=$(tmux display-message -p -t "$pane_target" '#{pane_current_command}' 2>/dev/null || :)
-  [ -n "$command" ] && [ "$command" != "bash" ] && [ "$command" != "sh" ]
-}
-
-if working_engine; then
-  echo "relayed to $session; working engine observed"
-  exit 0
-fi
-
-# A milestone belongs to the worker's next meaningful progress, not to an
-# arbitrary immediate poll. The ruling was sent once but the engine was not
-# observable afterwards; do not turn that ambiguous result into a duplicate
-# input line.
-echo "relay sent once but could not observe a working engine for $attempt; do not resend this ruling" >&2
-exit 75
+echo "relayed once to $session"
 "##
 }
 
@@ -1403,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_delivers_literal_file_text_to_a_working_engine_without_waiting_for_a_milestone() {
+    fn relay_delivers_literal_file_text_without_post_send_confirmation() {
         let temporary = TempDir::new().unwrap();
         let worktree = temporary.path().join("worker");
         let alder_dir = worktree.join(".alder/bin");
@@ -1455,7 +1434,6 @@ case "$1" in
       ALDER_ENGINE) printf '%s\n' "ALDER_ENGINE=$RELAY_ENGINE" ;;
     esac
     ;;
-  display-message) printf '%s\n' 'codex' ;;
 esac
 "##,
         );
@@ -1475,7 +1453,7 @@ esac
             "relay failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("working engine observed"),);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("relayed once to alder-work-hm"),);
         assert!(
             !sentinel.exists(),
             "a reviewer's shell syntax was evaluated by the relay"
@@ -1502,15 +1480,18 @@ esac
             "relay read the pane: {calls}"
         );
         assert!(
+            !calls.contains("display-message"),
+            "relay synchronously probed the pane after sending: {calls}"
+        );
+        assert!(
             !calls.contains("must-not-run"),
             "relay put finding text in tmux argv: {calls}"
         );
         let direct_call_count = calls.lines().count();
 
         // A Codex worker has left its one-shot engine and is holding a shell.
-        // The same helper must send only a safe encoded resume command, then
-        // observe the changed pane process — it must not fall back to pasting
-        // the ruling at a shell.
+        // The same helper must send only a safe encoded resume command; it
+        // must not fall back to pasting the ruling at a shell.
         write_executable(&worktree.join(".alder/resume"), "#!/bin/sh\nexit 0\n");
         let codex = Command::new(&relay)
             .args(["alder-work-hm", finding.to_str().unwrap()])
@@ -1543,8 +1524,8 @@ esac
             "Codex relay put reviewer text in a shell command: {calls}"
         );
         assert!(
-            calls.contains("display-message -p -t alder-work-hm #{pane_current_command}"),
-            "Codex engine inspection did not target the detached session pane: {calls}"
+            !calls.contains("display-message"),
+            "Codex relay synchronously inspected the pane after sending: {calls}"
         );
     }
 

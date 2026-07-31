@@ -317,7 +317,7 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     // the terminal in raw mode, so this catches both a bad pane target and
     // tmux's default LF-to-CR conversion without trusting a tmux mock. This
     // direct invocation makes `show <attempt>` fail, so a running relay cannot
-    // borrow a fake read to invent an instant worker milestone.
+    // borrow a fake read to synchronize on worker progress after delivery.
     let tmux_before_relay = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
     assert!(
         !tmux_before_relay.contains("send-keys"),
@@ -403,9 +403,9 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         .expect("the generated resume script is readable before the relay stub replaces it");
 
     // Exercise the Codex holding-shell route against the same real tmux
-    // server. The resume stub holds a real non-shell pane process after
-    // capturing the decoded argument, which makes `display-message` prove
-    // the actual adapter target rather than a mock's invented answer.
+    // server. The resume stub captures the decoded argument and leaves the
+    // pane alive, proving the actual adapter transfers the argument without
+    // a test double inventing a post-send confirmation.
     let resumed_ruling = work.join("resumed-ruling");
     write_executable(
         &spawned.worktree.join(".alder/resume"),
@@ -419,10 +419,9 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         .current_dir(&spawned.worktree)
         .output()
         .expect("the Codex relay runs");
-    assert_eq!(
-        resumed.status.code(),
-        Some(75),
-        "a just-resumed engine must not borrow test timing\n--- stdout ---\n{}\n--- stderr ---\n{}",
+    assert!(
+        resumed.status.success(),
+        "relay should report its one delivery without waiting for the resumed engine\n--- stdout ---\n{}\n--- stderr ---\n{}",
         String::from_utf8_lossy(&resumed.stdout),
         String::from_utf8_lossy(&resumed.stderr)
     );
@@ -437,10 +436,10 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     );
     let resumed_tmux_calls = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
     assert!(
-        resumed_tmux_calls.lines().any(
-            |call| call == format!("display-message -p -t {session} #{{pane_current_command}}")
-        ),
-        "the Codex engine probe did not target the real session pane: {resumed_tmux_calls}"
+        !resumed_tmux_calls
+            .lines()
+            .any(|call| call.starts_with("display-message")),
+        "the relay synchronously inspected the resumed pane: {resumed_tmux_calls}"
     );
 
     // The worktree is real, on its own branch, carrying alder and nothing that
@@ -515,8 +514,7 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         ".alder/relay <session> <file>",
         "load-buffer",
         "paste-buffer",
-        "working engine observed",
-        "pane_current_command",
+        "relayed once to",
     ] {
         assert!(
             relay_script.contains(part),

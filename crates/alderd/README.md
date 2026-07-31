@@ -65,12 +65,11 @@ Three rules make that ordering worth having:
   one-shot `codex exec` leaves a live session behind: the handle stays
   observable. Spawn writes `<worktree>/.alder/relay <session> <file>` for
   literal delivery of a ruling already recorded in the log. The adapter reads
-  the leader-local file, confirms a working engine after delivery, and never
-  treats pane input as an acknowledgement. The worker's fresh
-  `attempt.updated` is observed on the next normal pass, not demanded in the
-  same instant. Exit 75 means the engine was not observable after one send,
-  not a timeout or a prompt to replay the ruling; milestones are not expected
-  on every poll.
+  the leader-local file, reports one delivery to a working engine, and never
+  treats pane input as an acknowledgement or synchronizes on worker progress.
+  The worker's fresh `attempt.updated` is observed on the next normal pass,
+  not demanded in the same instant. Delivery is at-least-once, so a duplicate
+  relay is harmless; milestones are not expected on every poll.
   For a Codex holding shell it uses the private `<worktree>/.alder/resume` script;
   leaders never type that command themselves. It exists because `codex exec
   resume` inherits *nothing* from the session it resumes: no model, effort, or
