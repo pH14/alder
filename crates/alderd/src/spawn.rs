@@ -845,7 +845,7 @@ resume="$here/resume"
 cd "$here/.."
 
 session_target="=$session"
-pane_target="$session"
+pane_target="$session_target:"
 attempt_line=$(tmux show-environment -t "$session_target" ALDER_ATTEMPT 2>/dev/null || :)
 case "$attempt_line" in
   ALDER_ATTEMPT=*) attempt=${attempt_line#ALDER_ATTEMPT=} ;;
@@ -861,15 +861,18 @@ cleanup() {
 }
 trap cleanup 0 1 2 15
 
+if [ ! -x "$alder" ]; then
+  echo "relay cannot find this worktree's alder binary" >&2
+  exit 69
+fi
+snapshot=$("$alder" show "$attempt" --json)
+attempt_engine=$(printf '%s\n' "$snapshot" | sed -n 's/.*"engine":"\([^"]*\)".*/\1/p')
+
 engine=$(tmux show-environment -t "$session_target" ALDER_ENGINE 2>/dev/null || :)
-if [ "$engine" != "ALDER_ENGINE=running" ]; then
-  # A one-shot Codex worker is sitting at a shell. Encode the source file so
-  # the text somebody else wrote never becomes shell syntax in that shell.
-  if [ ! -x "$alder" ]; then
-    echo "relay cannot find this worktree's alder binary" >&2
-    exit 69
-  fi
-  snapshot=$("$alder" show "$attempt" --json)
+case "$attempt_engine" in
+  gpt-5.6-luna|gpt-5.6-terra|gpt-5.6-sol)
+  # Codex delivery is always encoded, including while its one-shot worker is
+  # still running, so the text somebody else wrote never becomes shell syntax.
   codex_session=$(printf '%s\n' "$snapshot" | sed -n 's/.*"codex-session":"\([^"]*\)".*/\1/p')
   case "$codex_session" in
     ''|*[!0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-]*)
@@ -890,11 +893,21 @@ if [ "$engine" != "ALDER_ENGINE=running" ]; then
   esac
   command="ruling=\$(printf %s $encoded | base64 -d 2>/dev/null || printf %s $encoded | base64 -D); .alder/resume $codex_session \"\$ruling\""
   tmux set-buffer -b "$buffer" -- "$command"
-else
+  ;;
+  claude-sonnet-5|claude-opus-5|claude-fable-5)
+  if [ "$engine" != "ALDER_ENGINE=running" ]; then
+    echo "relay cannot deliver to exited interactive engine for $session; spawn a fresh worker" >&2
+    exit 69
+  fi
   # tmux reads the local file itself into a server buffer; no command
   # substitution can trim a newline or make its contents shell syntax.
   tmux load-buffer -b "$buffer" -- "$file"
-fi
+  ;;
+  *)
+  echo "relay cannot identify the worker engine for Alder attempt $attempt" >&2
+  exit 69
+  ;;
+esac
 # `-r` preserves LF as input bytes.  Without it tmux changes every line
 # break to CR, which submits multi-line reviewer text as separate prompts.
 tmux paste-buffer -d -r -b "$buffer" -t "$pane_target"
@@ -1408,14 +1421,11 @@ mod tests {
             r##"#!/bin/sh
 case "$1 $2" in
   "show hm-attempt-1")
-    if [ "$RELAY_ALDER_MUST_NOT_RUN" = "1" ]; then
-      exit 64
-    fi
-    if [ "$RELAY_ENGINE" = "exited" ]; then
-      metadata='{"codex-session":"019fb2ef-d507-7201-bc36-79d6d5b82336"}'
-    else
-      metadata='{}'
-    fi
+    case "$RELAY_ATTEMPT_ENGINE" in
+      gpt-*) metadata='{"engine":"gpt-5.6-terra","codex-session":"019fb2ef-d507-7201-bc36-79d6d5b82336"}' ;;
+      claude-*) metadata='{"engine":"claude-opus-5"}' ;;
+      *) metadata='{}' ;;
+    esac
     printf '{"current":{"updated_seq":3,"metadata":%s},"history":[]}' "$metadata"
     ;;
   *) exit 64 ;;
@@ -1445,7 +1455,7 @@ esac
             .env("PATH", &relay_path)
             .env("RELAY_TMUX_CALLS", &tmux_calls)
             .env("RELAY_ENGINE", "running")
-            .env("RELAY_ALDER_MUST_NOT_RUN", "1")
+            .env("RELAY_ATTEMPT_ENGINE", "claude-opus-5")
             .output()
             .unwrap();
         assert!(
@@ -1468,11 +1478,14 @@ esac
             "relay did not give tmux the source file: {calls}"
         );
         assert!(
-            calls.contains("paste-buffer -d -r -b alder-relay-"),
-            "{calls}"
+            calls.lines().any(|call| {
+                call.starts_with("paste-buffer -d -r -b alder-relay-")
+                    && call.ends_with("-t =alder-work-hm:")
+            }),
+            "relay did not use the exact session pane: {calls}"
         );
         assert!(
-            calls.contains("send-keys -t alder-work-hm Enter"),
+            calls.contains("send-keys -t =alder-work-hm: Enter"),
             "{calls}"
         );
         assert!(
@@ -1489,15 +1502,16 @@ esac
         );
         let direct_call_count = calls.lines().count();
 
-        // A Codex worker has left its one-shot engine and is holding a shell.
-        // The same helper must send only a safe encoded resume command; it
-        // must not fall back to pasting the ruling at a shell.
+        // A Codex worker receives the safe encoded resume command even while
+        // its one-shot engine is still running; it must not receive raw ruling
+        // bytes at either the engine or its eventual holding shell.
         write_executable(&worktree.join(".alder/resume"), "#!/bin/sh\nexit 0\n");
         let codex = Command::new(&relay)
             .args(["alder-work-hm", finding.to_str().unwrap()])
             .env("PATH", &relay_path)
             .env("RELAY_TMUX_CALLS", &tmux_calls)
-            .env("RELAY_ENGINE", "exited")
+            .env("RELAY_ENGINE", "running")
+            .env("RELAY_ATTEMPT_ENGINE", "gpt-5.6-terra")
             .output()
             .unwrap();
         assert!(
@@ -1526,6 +1540,34 @@ esac
         assert!(
             !calls.contains("display-message"),
             "Codex relay synchronously inspected the pane after sending: {calls}"
+        );
+
+        let codex_call_count = calls.lines().count();
+        let exited_claude = Command::new(&relay)
+            .args(["alder-work-hm", finding.to_str().unwrap()])
+            .env("PATH", &relay_path)
+            .env("RELAY_TMUX_CALLS", &tmux_calls)
+            .env("RELAY_ENGINE", "exited")
+            .env("RELAY_ATTEMPT_ENGINE", "claude-opus-5")
+            .output()
+            .unwrap();
+        assert_eq!(exited_claude.status.code(), Some(69));
+        assert!(
+            String::from_utf8_lossy(&exited_claude.stderr)
+                .contains("exited interactive engine for alder-work-hm; spawn a fresh worker"),
+            "exited interactive engine was misdiagnosed: {}",
+            String::from_utf8_lossy(&exited_claude.stderr)
+        );
+        let calls = fs::read_to_string(&tmux_calls).unwrap();
+        assert!(
+            !calls
+                .lines()
+                .skip(codex_call_count)
+                .any(|call| call.starts_with("set-buffer")
+                    || call.starts_with("load-buffer")
+                    || call.starts_with("paste-buffer")
+                    || call.starts_with("send-keys")),
+            "exited interactive engine received a ruling: {calls}"
         );
     }
 

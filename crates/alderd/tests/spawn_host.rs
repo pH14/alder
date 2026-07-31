@@ -97,8 +97,11 @@ case "$1 $2" in
   "show {WORK}")
     printf '%s' '{{"current":{{"id":"{WORK}","title":"Sandbox item","spec":"docs/S.md","checks":[{{"key":"k","description":"the check reaches the worker"}}]}}}}' ;;
   "show {WORK}-attempt-1")
-    [ "$RELAY_DIRECT_NO_SHOW" != "1" ] || exit 64
-    printf '%s' '{{"current":{{"updated_seq":3,"metadata":{{"codex-session":"019fb2ef-d507-7201-bc36-79d6d5b82336"}}}},"history":[]}}' ;;
+    case "${{RELAY_ATTEMPT_ENGINE:-gpt}}" in
+      claude) metadata='{{"engine":"claude-opus-5"}}' ;;
+      *) metadata='{{"engine":"gpt-5.6-luna","codex-session":"019fb2ef-d507-7201-bc36-79d6d5b82336"}}' ;;
+    esac
+    printf '{{"current":{{"updated_seq":3,"metadata":%s}},"history":[]}}' "$metadata" ;;
   "status --section")
     if [ -f '{bound}' ]; then
       printf '%s' '{{"in_flight":[{{"id":"{WORK}-attempt-1","work_id":"{WORK}","handle":"tmux:alder-work-{WORK}"}}]}}'
@@ -316,8 +319,9 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     // Run the generated helper against this test's live pane. The stub reads
     // the terminal in raw mode, so this catches both a bad pane target and
     // tmux's default LF-to-CR conversion without trusting a tmux mock. This
-    // direct invocation makes `show <attempt>` fail, so a running relay cannot
-    // borrow a fake read to synchronize on worker progress after delivery.
+    // This direct case selects the interactive variety from the authoritative
+    // attempt metadata. The helper reads it before delivery only; it does not
+    // sample the worker again after it sends.
     let tmux_before_relay = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
     assert!(
         !tmux_before_relay.contains("send-keys"),
@@ -330,10 +334,12 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     let ruling_file = work.join("review-finding.txt");
     fs::write(&ruling_file, ruling).expect("the local relay input is written");
     let relay = spawned.worktree.join(".alder/relay");
+    let generated_resume = fs::read_to_string(spawned.worktree.join(".alder/resume"))
+        .expect("the generated resume script is readable before the relay stub replaces it");
     let delivered = Command::new(&relay)
         .args([&session, ruling_file.to_str().expect("the path is UTF-8")])
         .current_dir(&spawned.worktree)
-        .env("RELAY_DIRECT_NO_SHOW", "1")
+        .env("RELAY_ATTEMPT_ENGINE", "claude")
         .output()
         .expect("the relay runs");
     assert!(
@@ -359,15 +365,62 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     assert!(
         relay_tmux_calls.lines().any(
             |call| call.starts_with("paste-buffer -d -r -b alder-relay-")
-                && call.ends_with(&format!("-t {session}"))
+                && call.ends_with(&format!("-t ={session}:"))
         ),
         "relay did not paste raw bytes into the session pane: {relay_tmux_calls}"
     );
     assert!(
         relay_tmux_calls
             .lines()
-            .any(|call| call == format!("send-keys -t {session} Enter")),
+            .any(|call| call == format!("send-keys -t ={session}: Enter")),
         "relay did not submit once to the session pane: {relay_tmux_calls}"
+    );
+
+    // A Codex attempt takes the encoded-resume route even while its one-shot
+    // process is still running and cannot read its terminal. Once that process
+    // ends, the holding shell receives only the generated command, never the
+    // reviewer's raw ruling.
+    let resumed_ruling = work.join("resumed-ruling");
+    write_executable(
+        &spawned.worktree.join(".alder/resume"),
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$2\" >'{}'\nexec tmux wait-for relay-resume-hold\n",
+            resumed_ruling.display()
+        ),
+    );
+    let running_codex = Command::new(&relay)
+        .args([&session, ruling_file.to_str().expect("the path is UTF-8")])
+        .current_dir(&spawned.worktree)
+        .env("RELAY_ATTEMPT_ENGINE", "gpt")
+        .output()
+        .expect("the running-Codex relay runs");
+    assert!(
+        running_codex.status.success(),
+        "relay should report one encoded delivery while Codex is still running\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&running_codex.stdout),
+        String::from_utf8_lossy(&running_codex.stderr)
+    );
+    assert!(
+        !resumed_ruling.exists(),
+        "the running engine read the queued resume command before it exited"
+    );
+    let running_codex_tmux_calls =
+        fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
+    assert!(
+        running_codex_tmux_calls
+            .lines()
+            .any(|call| call.starts_with("set-buffer -b alder-relay-")),
+        "running Codex did not receive an encoded resume command: {running_codex_tmux_calls}"
+    );
+    assert!(
+        !running_codex_tmux_calls.contains(ruling),
+        "running Codex received the reviewer's raw ruling in tmux argv: {running_codex_tmux_calls}"
+    );
+    assert!(
+        !running_codex_tmux_calls
+            .lines()
+            .any(|call| call.starts_with("display-message")),
+        "the relay synchronously inspected the running Codex pane: {running_codex_tmux_calls}"
     );
 
     // Simulate a worktree cut before the helper existed. Adopting its exited
@@ -386,6 +439,15 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         session_exists(&session),
         "the session died with the engine; the pane does not end `; exec bash`"
     );
+    await_true(
+        || resumed_ruling.is_file(),
+        "the holding shell executes the queued resume command",
+    );
+    assert_eq!(
+        fs::read_to_string(&resumed_ruling).expect("the resumed ruling is readable"),
+        ruling,
+        "the running-Codex route changed the local ruling bytes"
+    );
     let adopted = spawn::spawn(
         &host,
         WORK,
@@ -398,48 +460,6 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     assert!(
         relay.is_file(),
         "adopting an older worktree did not backfill its delivery helper"
-    );
-    let generated_resume = fs::read_to_string(spawned.worktree.join(".alder/resume"))
-        .expect("the generated resume script is readable before the relay stub replaces it");
-
-    // Exercise the Codex holding-shell route against the same real tmux
-    // server. The resume stub captures the decoded argument and leaves the
-    // pane alive, proving the actual adapter transfers the argument without
-    // a test double inventing a post-send confirmation.
-    let resumed_ruling = work.join("resumed-ruling");
-    write_executable(
-        &spawned.worktree.join(".alder/resume"),
-        &format!(
-            "#!/bin/sh\nprintf '%s' \"$2\" >'{}'\nexec tmux wait-for relay-resume-hold\n",
-            resumed_ruling.display()
-        ),
-    );
-    let resumed = Command::new(&relay)
-        .args([&session, ruling_file.to_str().expect("the path is UTF-8")])
-        .current_dir(&spawned.worktree)
-        .output()
-        .expect("the Codex relay runs");
-    assert!(
-        resumed.status.success(),
-        "relay should report its one delivery without waiting for the resumed engine\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&resumed.stdout),
-        String::from_utf8_lossy(&resumed.stderr)
-    );
-    await_true(
-        || resumed_ruling.is_file(),
-        "the holding shell executes the generated resume command",
-    );
-    assert_eq!(
-        fs::read_to_string(&resumed_ruling).expect("the resumed ruling is readable"),
-        ruling,
-        "the Codex route changed the local ruling bytes"
-    );
-    let resumed_tmux_calls = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
-    assert!(
-        !resumed_tmux_calls
-            .lines()
-            .any(|call| call.starts_with("display-message")),
-        "the relay synchronously inspected the resumed pane: {resumed_tmux_calls}"
     );
 
     // The worktree is real, on its own branch, carrying alder and nothing that
