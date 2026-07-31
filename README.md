@@ -131,9 +131,8 @@ history
   #7  "question.answered"  "2026-07-31T19:16:00.236487Z"
 ```
 
-The repository is a two-crate workspace: the `alder` CLI, and
-[crates/alder-log](crates/alder-log), a reusable Git-backed append-only
-record log with no knowledge of Alder's domain.
+The repository is a four-crate workspace: the `alder` CLI, the `alderd` daemon,
+[crates/alder-log](crates/alder-log), and [crates/alder-model](crates/alder-model).
 
 Design docs live in [docs/v0](docs/v0): purpose and boundaries, the state
 model, the CLI contract, the driving loop and its daemon, implementation
