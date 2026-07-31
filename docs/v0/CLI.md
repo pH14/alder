@@ -576,6 +576,16 @@ is the state every check starts in and is not a result a caller records.
 Attempt edits record meaningful milestones. They are not expected on every
 poll. An edit to an ended attempt is rejected.
 
+`--evidence-file <path>` is the file-valued form of `--evidence`, and
+`--note-file <path>` is the file-valued form of `--note`. Each reads a local
+file when the command runs and stores its text in the ordinary `attempt.updated`
+event; the path is never stored. The inline and file forms for the same field
+are mutually exclusive. This lets a caller record externally written prose
+without making it a shell argument, while keeping the log self-contained for
+later readers, repairs, and workers on another machine. Evidence is still
+prose plus pointers: a bulky artifact belongs behind a ref, SHA, or event
+sequence rather than in an evidence file.
+
 When several checks need different evidence, repeat the command.
 
 ### `alder attempt end <attempt>`

@@ -63,19 +63,23 @@ Three rules make that ordering worth having:
   can read as a key name. There is no sleep on the path.
 - **The pane outlives the engine.** The command ends `; exec bash`, so a
   one-shot `codex exec` leaves a live session behind: the handle stays
-  observable, and a ruling can be relayed into the shell afterwards. For a
-  codex rung the spawn also writes `<worktree>/.alder/resume`, which is how
-  that relay is typed — `.alder/resume <session-id> "<the ruling>"`. It
-  exists because `codex exec resume` inherits *nothing* from the session it
-  resumes: no model, no effort, no sandbox. Resumed by hand, a luna worker
-  quietly continues at another model, with no network access and no writable
-  git dir, and can neither commit nor reach the log. The script repeats the
-  launch exactly, because the same table writes both. A session ID is
-  mandatory: `--last` can select a later consult in the same worktree. Before
-  starting Codex, spawn also starts a local sidecar that snapshots the Codex
-  rollouts and stamps the first new one for this worktree onto the attempt.
-  If that append is unavailable, the sidecar leaves its UUID for the tmux
-  observer and `alder reconcile` names the repair as
+  observable. Spawn writes `<worktree>/.alder/relay <session> <file>` for
+  literal delivery of a ruling already recorded in the log. The adapter reads
+  the leader-local file, reports one delivery to a working engine, and never
+  treats pane input as an acknowledgement or synchronizes on worker progress.
+  The worker's fresh `attempt.updated` is observed on the next normal pass,
+  not demanded in the same instant. Delivery is at-least-once, so a duplicate
+  relay is harmless; milestones are not expected on every poll.
+  For a Codex holding shell it uses the private `<worktree>/.alder/resume` script;
+  leaders never type that command themselves. It exists because `codex exec
+  resume` inherits *nothing* from the session it resumes: no model, effort, or
+  sandbox. The generated script repeats the launch exactly, and requires the
+  exact session ID rather than unsafe `--last`. The strongest resumed-engine
+  signal is its process-table argv, carrying both that UUID and the ruling
+  text. Before starting Codex, spawn also starts a local sidecar that snapshots
+  the Codex rollouts and stamps the first new one for this worktree onto the
+  attempt. If that append is unavailable, the sidecar leaves its UUID for the
+  tmux observer and `alder reconcile` names the repair as
   `codex_session_unstamped`.
 - **Crash residue is adoptive.** Re-running spawn after any completed effect
   converges on the same attempt. An existing worktree is accepted only after
@@ -259,9 +263,9 @@ things, in this order:
 
 1. the worker **commits** on its branch from inside the sandbox;
 2. it **appends** to the log from inside the sandbox (`alder attempt edit`);
-3. it asks something (`alder work ask`), the answer is relayed back with
-   `.alder/resume <codex-session> "<the ruling>"`, and the same session
-   continues rather than a new one starting;
+3. it asks something (`alder work ask`), the recorded answer is relayed back
+   with `.alder/relay <session> <file>`, and the same session continues rather
+   than a new one starting;
 4. it leaves a `ready for review` note;
 5. the leader reviews the branch, runs the gates on it, and merges.
 
@@ -275,7 +279,8 @@ because each had a way to fail silently:
   over ssh, which works from inside the sandbox, and fails to resolve DNS
   without it.
 - `codex exec resume` inherits no model, effort or sandbox, which is why the
-  relay is `.alder/resume` and not a hand-typed line.
+  relay owns its generated `.alder/resume` implementation rather than exposing
+  a hand-typed line.
 - a fresh worktree codex has never seen needs no trust prompt: `codex exec`
   with `approval_policy=never` runs and commits straight away.
 

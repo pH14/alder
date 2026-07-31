@@ -75,7 +75,7 @@ The reviewer reads `AGENTS.md` as the lens.
 Claude-authored branch — Codex review:
 
 ```sh
-codex review --base main --title "$(cat "$scratch/review-title-<id>.txt")" \
+codex review --base main --title "Cross-review work/<id>" \
   -c model=gpt-5.6-sol -c model_reasoning_effort=xhigh \
   -c approval_policy=never -c sandbox_mode=workspace-write
 ```
@@ -91,7 +91,7 @@ Codex-authored branch — fresh one-shot Claude review:
 
 ```sh
 claude -p --model claude-fable-5 --effort xhigh --permission-mode auto \
-  "$(cat "$scratch/review-prompt-<id>.txt")"
+  < "$scratch/review-prompt-<id>.txt"
 ```
 
 The prompt file (in `$scratch`, outside the worktree) holds the brief:
@@ -107,6 +107,9 @@ AGENTS.md is the review lens. Report findings, or say the branch is clean.
 match the waiter (or the ChatGPT app's own long-lived process). A wedge looks
 like a slow review by clock alone: if output has not grown for ~25 minutes and
 CPU has gained only seconds, kill it, record the abandonment, end the pass.
+That silence-plus-low-CPU heuristic is for streaming Codex reviews. `claude -p`
+buffers output until exit and can sit near zero CPU while thinking; on that
+route, session-transcript growth is the useful signal instead.
 In a review sandbox, a `host_tmux` test failure is environmental, not a
 finding.
 
@@ -117,11 +120,14 @@ worktree and pass the file — never inline it into a shell command. Record
 before relaying; an unrecorded review disappears at rotation.
 
 ```sh
+git rev-parse work/<id> > "$scratch/reviewed-sha-<id>.txt"
+git merge-base main work/<id> > "$scratch/reviewed-base-<id>.txt"
+
 alder attempt edit <attempt> --failed cross-review \
-  --evidence "$(cat "$scratch/cross-review-<id>.txt")" \
+  --evidence-file "$scratch/cross-review-<id>.txt" \
   --meta reviewed-by=gpt-5.6-sol \
-  --meta reviewed-sha="$(git rev-parse work/<id>)" \
-  --meta reviewed-base="$(git merge-base main work/<id>)" \
+  --meta reviewed-sha="$(cat "$scratch/reviewed-sha-<id>.txt")" \
+  --meta reviewed-base="$(cat "$scratch/reviewed-base-<id>.txt")" \
   --meta reviewed-effort=xhigh
 ```
 
@@ -129,7 +135,11 @@ A clean round is the same command with `--satisfied` and one-line evidence.
 Evidence names the reviewer engine, both endpoints, the effort, the verdict,
 and the findings themselves — one line each with severity, `file:line`, and
 the claim — plus the transcript pointer (Codex rollout UUID or Claude session
-ID). A count is not a finding.
+ID). A count is not a finding. `--evidence-file` reads the local review file now
+and carries its contents in the event. `--meta` has no file-valued form, so it
+remains a named quoting surface: write any nonliteral value to a local file and
+pass it as `"$(cat "$file")"`. Inside double quotes that becomes one argv
+value; its contents are not parsed again as shell syntax.
 
 **Feedback:** if the author session is alive, relay the findings. If it is
 gone, spawn a fresh worker whose brief names the exact source attempt ID and
@@ -143,6 +153,7 @@ Declare the check at admission (`work add --check cross-review:"reviewed by
 the other vendor's ladder; the leader records this one, not the worker"`) —
 checks cannot change while an attempt is active. Items admitted before the
 rule have no check to write to: review anyway and park the verdict in
-metadata (`cross-review=<verdict>`, `cross-review-findings=<file contents>`,
-plus the four `reviewed-*` keys); finish them on the checks they carry. That
+metadata (`cross-review=<verdict>`,
+`cross-review-findings="$(cat "$scratch/cross-review-<id>.txt")"`, plus the
+four `reviewed-*` keys); finish them on the checks they carry. That
 set only shrinks.

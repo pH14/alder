@@ -22,28 +22,50 @@ manual. These are project process, not alder-the-product, so they live under
 `.agent/skills/`, never at the repository root; its committed `.claude/skills`
 symlink lets Claude discover them while Codex reads the path directly.
 
-## Text you did not write never goes inside a command
+## Durable text and delivery
 
-A question's answer, a ruling, a work title, a spec, a check description, a
-reviewer's findings, a worker's note, the titles a pass report has to name —
-every one of those is text somebody else wrote, and Alder validates none of it
-beyond non-empty. So it may contain backticks, `$(…)`, quotes, or newlines, and
-a shell that meets it inside an argument expands it: your shell runs what the
-text says, and the durable record ends up reading as something nobody wrote.
+Text somebody else wrote never goes inside a shell command. A reviewer finding,
+worker note, or ruling may contain backticks, `$(…)`, quotes, or newlines; it is
+data, not shell syntax.
 
-**Write it to a file outside the worktree, and pass it as
-`"$(cat "$scratch/<name>.txt")"`.** A command substitution's content is not
-re-scanned, so nothing in the file can expand or execute. Outside the worktree,
-because a file inside one can be committed onto the branch under review. Write
-the file with a quoted heredoc (`<<'EOF'`) or by redirecting a command's output
-— an unquoted heredoc expands its body and is the same hole again.
+For long attempt evidence and notes, keep the text in a local file outside the
+worktree and use `alder attempt edit --evidence-file <file>` or `--note-file
+<file>`. Alder reads that file now and appends its **contents** to the event.
+The path is local input, never a durable reference: a later reader, repair, or
+worker must get the text from the log, not from this machine. Evidence remains
+short prose plus pointers; put a bulky artifact behind a ref, SHA, or event
+sequence rather than pasting it into the event.
 
-This is not a rule about `--evidence`. It is a rule about every command below,
-including the ones that reach a worker: `send-keys` takes a shell argument like
-anything else, and a relay that expands the findings it delivers has undone the
-care taken in recording them. Fixed strings *this document* authors are not
-somebody else's text and may appear inline. Every template below is written in
-that form; where one cannot be, it says why.
+For a tmux worker, record the ruling first, then call that worktree's
+`.alder/relay <session> <file>`. The helper owns literal tmux delivery and any
+Codex resume mechanics; leaders do not recreate a `send-keys`, command
+substitution, or quoted resume command. It reports one tmux delivery to the
+working engine, never by inspecting a pane's input line or synchronously
+probing worker progress.
+
+A successful exit is that one-delivery report. A fresh `attempt.updated` is
+the worker's next meaningful milestone, not an immediate receipt: the next
+pass's normal log read observes it after delivery. Delivery is at-least-once;
+a duplicate relay is harmless. A crash around the send still has no durable
+receipt, so it cannot be mechanically distinguished from a pre-send crash.
+That is the delivery-receipt gap recorded on `al-q8qwhy`.
+
+The helper is a tmux adapter, not the delivery concept. The ruling is durable
+in the log before transport, so a future cloud worker can pull it from there
+without a new event or a shared filesystem.
+
+The ratified surface is deliberately narrow. These text-bearing surfaces still
+lack a file-valued form: `--meta KEY=VALUE` (including reviewed endpoints and
+legacy findings), `question answer`, `work ask`, `work edit --spec/--why`,
+`pass end --report`, and `work add/edit --check` descriptions. External review
+clients' title/prompt arguments are likewise outside this adapter unless they
+accept stdin. **The quoting rule is not fully retired for those named argv
+surfaces:** write the value to a local file and pass it as `"$(cat "$file")"`.
+Inside double quotes the substitution becomes one argv value; its contents are
+not parsed again as shell syntax. This is the explicitly limited legacy
+protocol, not authority to add a flag or improvise a new transport. Prefer the
+ratified file flags whenever they exist. Do not add `--meta-file` or another
+flag without its own operator ruling.
 
 ## The pass
 
@@ -63,81 +85,38 @@ that form; where one cannot be, it says why.
 3. **Triage questions.** For every *unanswered* question, decide which of
    four kinds it is before you decide anything else. See "Triage" below.
 4. **Relay answers.** For each answered question whose work has an active
-   attempt: read the answer (`alder show <question>`), write the ruling to
-   `$scratch/ruling-<id>.txt`, send it into the worker's session, then
-   `alder work unblock <work> --why "$(cat "$scratch/ruling-<id>.txt")"`.
-   How the answer is sent depends on what is holding the pane, which the
-   attempt's `engine` metadata names:
-   - **A claude worker** is an interactive session waiting on a prompt:
-     `tmux send-keys -t alder-work-<id> -l -- "$(cat "$scratch/ruling-<id>.txt")"`
-     then `tmux send-keys -t alder-work-<id> Enter`.
-   - **A codex worker** ran one shot and left a shell in its worktree, so
-     the answer is a *command* typed at that shell — the same two sends, with
-     `.alder/resume <codex-session-uuid> "$(cat "<abs>/ruling-<id>.txt")"` as
-     the literal text. Single-quote that whole string in your own shell
-     (`send-keys -l -- '.alder/resume … "$(cat …)"'`): the text crosses **two**
-     shells, and the file must be read by the second one, not by the first.
-     The path has to be absolute, because that shell sits in the worktree.
-     That script is written into the worktree at spawn and repeats the
-     model, effort and sandbox the worker was launched with, because
-     `codex exec resume` inherits none of them; do not hand-write the
-     `codex exec resume` line. The UUID is the attempt's `codex-session`
-     metadata. It is required: `.alder/resume` refuses a ruling without the
-     UUID, because guessing with the newest session in the directory can
-     resume a consult instead of the worker. Reconcile reports
-     `codex_session_unstamped` with the exact repair if the launcher-side
-     stamp could not reach the ledger.
+   attempt: read the answer (`alder show <question>`), place the ruling in a
+   local file outside the worktree, and call
+   `<worker-worktree>/.alder/relay alder-work-<id> <file>`. The answer is
+   already durable in the log; the helper only transports it. It handles both
+   an interactive Claude prompt and a Codex holding shell, including the
+   launch-pinned model, effort, sandbox, and exact `codex-session` UUID. Do
+   not hand-write a resume command or infer a session with `--last`.
 
-   **Then confirm it landed**, because a pane is not a durable channel and the
-   log records the ruling as relayed either way. That is reason enough on its
-   own — and it is the only reason to trust here. A pass once reported that
-   `send-keys -l` had left a message unsent and that every send needs a verified
-   second `Enter` (al-pass-87). Treat that as **unverified**: it is equally
-   consistent with the ghost-text misreading described below, and "a second
-   `Enter` finally landed it" is exactly what submitting a ghost suggestion
-   looks like. Do not repeat it as established. Capture the pane
-   (`tmux capture-pane -pt alder-work-<id> | tail`) and read it for the two
-   signals that mean something:
+   A successful helper exit reports one tmux delivery to a working engine. It
+   never reads ghost text or synchronously probes the worker after sending;
+   unblock on that result. The next pass's normal `alder show <attempt>`
+   observes the worker's later `attempt.updated` as meaningful progress.
+   Delivery is at-least-once, so a duplicate relay is harmless. The ruling
+   remains recoverable from the log, while the pre-send/post-send crash
+   ambiguity remains the explicitly named `al-q8qwhy` receipt gap.
 
-   - **the engine is working** — a claude pane shows a running turn as a
-     spinner line with an elapsed timer and a token count
-     (`✢ Whisking… (1m 39s · ↓ 6.2k tokens)` — the word varies, the shape does
-     not); a codex worker's shell shows the relayed `.alder/resume` command
-     running above a busy prompt;
-   - **the worker moves** — a fresh `attempt.updated` on that attempt is the
-     only *durable* evidence of delivery, and it is what you actually want.
-
-   **Do not read the input line, and never treat text sitting there as an
-   unsent message.** On an idle Claude Code worker that line is never empty: the
-   TUI puts a *suggested* next prompt there as ghost text. Measured on two live
-   panes, neither of which any leader had typed into; it survives `C-a C-k`, a
-   typed character plus `BSpace`, and `Escape`, because it is not buffer
-   content. A leader that keys on emptiness reads every delivered message as
-   undelivered.
-
-   **And do not send a bare `Enter` to a claude pane** on that basis: if the
-   ghost suggestion is what is showing, `Enter` submits it as a real prompt and
-   spends a worker turn on an instruction nobody wrote. A bare `Enter` is only
-   safe at a plain shell prompt — a codex worker's pane — where an empty line
-   does nothing. When you cannot tell, do nothing this pass: check for a fresh
-   `attempt.updated` next pass, and only if there is still none, and the pane is
-   still idle, re-send the **whole** message, text and `Enter` together.
-
-   Do this before `work unblock`, so the log's "relayed" and the worker's
-   reality agree. A tmux pane is not a durable channel — the same lesson as
-   recording a review before relaying it, and the reason the delivery marker
-   under [the cross-review manual](.agent/skills/cross-review/SKILL.md) is
-   real work rather than a nicety.
+   Only after the helper reports delivery, unblock with a repository-authored reason such as
+   `alder work unblock <work> --why "answered question relayed"`. A tmux pane
+   is not a durable channel; delivery follows the durable ruling rather than
+   replacing it.
 
    A worker with no live session gets a fresh spawn instead — and a fresh
    spawn is launched on the *item*, not on the Q&A, which is why an answer
-   that amounts to a ruling has to be folded into the item to survive.
-   When an answer amounts to a spec ruling, fold it into the item with
-   `alder work edit --spec --why "$(cat "$scratch/ruling-<id>.txt")"` so it
-   outlives the Q&A and survives a respawn. A ruling that needs a whole new *check* cannot be folded
-   into a running item — checks cannot change while an attempt is active — so
-   it waits for the attempt to end and lands with the respawn, or it stays in
-   the spec.
+   that amounts to a ruling has to be folded into the item to survive. When an
+   answer amounts to a spec ruling, the question remains the canonical raw
+   ruling; identify its question ID in a concise requirement folded into the
+   item with `alder work edit --spec "$(cat "$spec_file")" --why
+   "$(cat "$why_file")"`. Do not replace the ruling with a paraphrase. These
+   two inline-only arguments are a named remaining quoting surface. A
+   ruling that needs a whole new *check* cannot be folded into a
+   running item — checks cannot change while an attempt is active — so it waits
+   for the attempt to end and lands with the respawn, or it stays in the spec.
 5. **Review finished workers.** A worker is finished when its attempt says
    "ready for review" and every check it owns is satisfied. At most ONE full
    review-and-merge per pass:
@@ -165,10 +144,12 @@ that form; where one cannot be, it says why.
      pass, `alder work finish <id> --attempt <attempt>`, kill the session
      (`tmux kill-session -t alder-work-<id>`), remove the worktree
      (`git worktree remove ../alder-work-<id>`) and delete the branch.
-   - Not good: relay the findings from the file you recorded them in, never
-     inline — findings are the reviewer's text, so the quoting rule applies to
-     delivering them exactly as it did to recording them (same send-keys
-     pattern) and leave it in flight.
+   - If findings need a live worker, first record them with
+     `--evidence-file`, then hand the same local file to that worker's
+   `.alder/relay`. Do not inline them or reimplement delivery. Leave the item
+   in flight until the helper reports one delivery; the next pass observes
+   the later `attempt.updated`. An unconfirmed send is not an invitation to
+   replay it.
 6. **Drain handoffs.** Admit each coherent submitted handoff
    (`alder work add --handoff <id>` with real priority/checks). Workers
    cannot admit work; you are the only gate.
@@ -195,10 +176,11 @@ that form; where one cannot be, it says why.
      automatically; `alderd limit <provider> --minutes <n>` is how a limit
      gets recorded when a spawn or a worker dies on one.
 8. **Nudge stalls.** For each in-flight attempt with no milestone in a long
-   while, look before poking: `tmux capture-pane -pt alder-work-<id> | tail`.
-   Genuinely stalled: nudge once through send-keys, quoted the same way. Stalled again next pass:
-   kill, respawn fresh (same item, same branch). Fails a second respawn:
-   `alder work ask <id>` — the operator decides.
+   while, use fresh observations and the attempt's durable progress rather
+   than pane text. A genuine stall gets one short, leader-authored nudge
+   through `.alder/relay`; its one-delivery report applies. Stalled
+   again next pass: kill, respawn fresh (same item, same branch). Fails a
+   second respawn: `alder work ask <id>` — the operator decides.
 
 ## Cross-review
 
@@ -216,9 +198,8 @@ at most two up-tier consults. So sort each unanswered question by what it is
 actually asking, not by how hard it looks.
 
 - **An authority question** — options plus a recommendation, which is how
-  workers are told to ask. Ratify or overrule it, with
-  `alder question answer <question> "$(cat "$scratch/ruling-<id>.txt")"`.
-  Ratification is
+  workers are told to ask. Ratify or overrule it with a freshly authored
+  decision; do not make the worker's text an argv value. Ratification is
   administration, not adjudication: it does not require outranking the
   asker's model tier, and a recommendation from a stronger model is still
   only a recommendation. The rule is **if you cannot defend a veto from
@@ -255,22 +236,22 @@ review kit: the artifact and revision it is about (branch@sha, file, or
 event seq), the one command that shows it (`git diff main...work/<id>`,
 `alder show <id>`), and where the evidence lives. A question the operator
 cannot review from its own text plus one command is not finished being
-asked. A question the worker raised and a
-question you raise yourself escalate identically: `alder work ask <id>
-"$(cat "$scratch/ask-<id>.txt")"` — a worker's own words are text you did not
-write. Do not improvise around a blocked item, and never let a
-worker's question sit unrelayed.
+asked. A question the worker raised and a question you raise yourself escalate
+identically: author the concise decision question from the review kit rather
+than passing the worker's raw words as an argument. Do not improvise around a
+blocked item, and never let a worker's authority question sit unrelayed.
 
 ## Ending the pass
 
-Always end with:
-
-    alder pass end --outcome ok \
-      --report "$(cat "$scratch/pass-report.txt")" --wake <duration>
+Write the 3–6 line report to a local file, then end with `alder pass end
+--outcome ok --report "$(cat "$report_file")" --wake <duration>`. The report
+is authored here, not copied from a worker or reviewer. `--report` is one of
+the named inline-only surfaces above: the double-quoted substitution makes the
+file text one data argument rather than shell syntax.
 
 The report is 3-6 lines: what you saw, what you did, what is blocked and why.
-It goes through a file like everything else, because naming an item means
-quoting its title.
+Name items in your own short human label rather than copying their titles into
+shell arguments.
 
 Pick `--wake` honestly: ~10m with workers in flight, 30m–1h when only waiting
 on a human answer, longer when the frontier is empty and no one is working.

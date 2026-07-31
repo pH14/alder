@@ -601,7 +601,9 @@ fn attempt_edit(context: &Context, args: &AttemptEditArgs) -> Result<Output> {
         if !args.satisfied.is_empty()
             || !args.failed.is_empty()
             || args.evidence.is_some()
+            || args.evidence_file.is_some()
             || args.note.is_some()
+            || args.note_file.is_some()
         {
             return Err(AlderError::validation(
                 "--handle can be combined only with --meta",
@@ -617,16 +619,25 @@ fn attempt_edit(context: &Context, args: &AttemptEditArgs) -> Result<Output> {
             format!("{}  bound {}", args.attempt, handle),
         ));
     }
-    let checks = parse_check_results(&args.satisfied, &args.failed, args.evidence.as_deref())?;
-    if metadata.is_empty() && checks.is_empty() && args.note.is_none() {
+    let checks = parse_check_results(
+        &args.satisfied,
+        &args.failed,
+        args.evidence.as_deref(),
+        args.evidence_file.as_deref(),
+    )?;
+    let note = read_text_file(
+        args.note.as_deref(),
+        args.note_file.as_deref(),
+        "--note-file",
+    )?;
+    if metadata.is_empty() && checks.is_empty() && note.is_none() {
         return Err(AlderError::validation(
             "attempt edit requires a handle, metadata, note, or check result",
         ));
     }
-    let result =
-        context
-            .ledger
-            .update_attempt(&args.attempt, metadata, args.note.clone(), checks)?;
+    let result = context
+        .ledger
+        .update_attempt(&args.attempt, metadata, note, checks)?;
     Ok(mutation_output(
         "alder.attempt.edit.v0",
         &result,
@@ -1590,6 +1601,7 @@ fn parse_check_results(
     satisfied: &[String],
     failed: &[String],
     evidence: Option<&str>,
+    evidence_file: Option<&str>,
 ) -> Result<Vec<CheckUpdate>> {
     if satisfied.is_empty() && failed.is_empty() {
         if evidence.is_some() {
@@ -1597,11 +1609,23 @@ fn parse_check_results(
                 "--evidence is accepted only with --satisfied or --failed",
             ));
         }
+        if evidence_file.is_some() {
+            return Err(AlderError::validation(
+                "--evidence-file is accepted only with --satisfied or --failed",
+            ));
+        }
         return Ok(Vec::new());
     }
-    let evidence = evidence
+    let evidence_flag = if evidence_file.is_some() {
+        "--evidence-file"
+    } else {
+        "--evidence"
+    };
+    let evidence = read_text_file(evidence, evidence_file, "--evidence-file")?
         .filter(|evidence| !evidence.trim().is_empty())
-        .ok_or_else(|| AlderError::validation("--satisfied and --failed require --evidence"))?;
+        .ok_or_else(|| {
+            AlderError::validation(format!("--satisfied and --failed require {evidence_flag}"))
+        })?;
     let mut seen = BTreeSet::new();
     let mut updates = Vec::new();
     for (keys, status) in [
@@ -1625,6 +1649,33 @@ fn parse_check_results(
         }
     }
     Ok(updates)
+}
+
+/// File-valued flags use a file only as local input. The durable event gets
+/// the text itself, so replay, readers, and repairs never need that path or a
+/// shared filesystem.
+fn read_text_file(
+    inline: Option<&str>,
+    source: Option<&str>,
+    flag: &str,
+) -> Result<Option<String>> {
+    match (inline, source) {
+        (Some(text), None) => Ok(Some(text.to_owned())),
+        (None, Some(path)) => fs::read_to_string(path).map(Some).map_err(|error| {
+            AlderError::with_context(
+                "input_unavailable",
+                format!("cannot read {flag} `{path}`: {error}"),
+                json!({"path": path}),
+            )
+        }),
+        (None, None) => Ok(None),
+        // Clap rejects this before the application is reached. Keeping the
+        // branch explicit makes the locality boundary hold if this API is
+        // ever constructed directly in a test or another front end.
+        (Some(_), Some(_)) => Err(AlderError::validation(format!(
+            "{flag} cannot be combined with its inline form"
+        ))),
+    }
 }
 
 /// Parse a wake delay such as `270s`, `20m`, `1h`, or `2d`. The stored value is
@@ -1862,26 +1913,41 @@ mod tests {
     #[test]
     fn check_results_name_their_verdict_and_require_evidence() {
         let none: Vec<String> = Vec::new();
-        assert!(parse_check_results(&none, &none, None).unwrap().is_empty());
-        assert!(parse_check_results(&none, &none, Some("proof")).is_err());
-        assert!(parse_check_results(&["test".to_owned()], &none, None).is_err());
-        assert!(parse_check_results(&["test".to_owned()], &none, Some(" ")).is_err());
-        assert!(parse_check_results(&[" ".to_owned()], &none, Some("proof")).is_err());
         assert!(
-            parse_check_results(&["test".to_owned()], &["test".to_owned()], Some("proof")).is_err()
+            parse_check_results(&none, &none, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_check_results(&none, &none, Some("proof"), None).is_err());
+        assert!(parse_check_results(&["test".to_owned()], &none, None, None).is_err());
+        assert!(parse_check_results(&["test".to_owned()], &none, Some(" "), None).is_err());
+        assert!(parse_check_results(&[" ".to_owned()], &none, Some("proof"), None).is_err());
+        assert!(
+            parse_check_results(
+                &["test".to_owned()],
+                &["test".to_owned()],
+                Some("proof"),
+                None
+            )
+            .is_err()
         );
         assert!(
             parse_check_results(
                 &["test".to_owned(), "test".to_owned()],
                 &none,
-                Some("proof")
+                Some("proof"),
+                None
             )
             .is_err()
         );
 
-        let updates =
-            parse_check_results(&["tests".to_owned()], &["review".to_owned()], Some("CI 42"))
-                .unwrap();
+        let updates = parse_check_results(
+            &["tests".to_owned()],
+            &["review".to_owned()],
+            Some("CI 42"),
+            None,
+        )
+        .unwrap();
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0].key, "tests");
         assert_eq!(updates[0].status, CheckStatus::Satisfied);

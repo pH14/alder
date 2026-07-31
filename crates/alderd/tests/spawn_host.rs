@@ -67,8 +67,9 @@ fn spawn_runs_against_a_private_tmux_server_and_a_throwaway_repo() {
     let bin = temp_dir("alderd-spawn-bin");
     let work = temp_dir("alderd-spawn-work");
 
-    // Every tmux call the spawn makes lands on the sandbox server, and every
-    // one is logged: "injects nothing via send-keys" is checked, not claimed.
+    // Every tmux call the spawn and its delivery helper make lands on the
+    // sandbox server, and every one is logged. The child checks spawn itself
+    // injects nothing, then runs relay against this real server.
     write_executable(
         &bin.path().join("tmux"),
         &format!(
@@ -95,6 +96,12 @@ printf '%s\n' "$*" >>'{log}'
 case "$1 $2" in
   "show {WORK}")
     printf '%s' '{{"current":{{"id":"{WORK}","title":"Sandbox item","spec":"docs/S.md","checks":[{{"key":"k","description":"the check reaches the worker"}}]}}}}' ;;
+  "show {WORK}-attempt-1")
+    case "${{RELAY_ATTEMPT_ENGINE:-gpt}}" in
+      claude) metadata='{{"engine":"claude-opus-5"}}' ;;
+      *) metadata='{{"engine":"gpt-5.6-luna","codex-session":"019fb2ef-d507-7201-bc36-79d6d5b82336"}}' ;;
+    esac
+    printf '{{"current":{{"updated_seq":3,"metadata":%s}},"history":[]}}' "$metadata" ;;
   "status --section")
     if [ -f '{bound}' ]; then
       printf '%s' '{{"in_flight":[{{"id":"{WORK}-attempt-1","work_id":"{WORK}","handle":"tmux:alder-work-{WORK}"}}]}}'
@@ -107,8 +114,13 @@ case "$1 $2" in
     : >'{started}'
     printf '%s' '{{"attempt_id":"{WORK}-attempt-1"}}' ;;
   "attempt edit")
-    : >'{bound}'
+    case " $* " in
+      *" --handle "*) : >'{bound}' ;;
+      *) : >'{relay_updated}' ;;
+    esac
     printf '%s' '{{"ok":true}}' ;;
+  "debug log")
+    printf '%s' '{{"event":{{"type":"attempt.updated"}}}}' ;;
   "attempt end")
     rm -f '{started}' '{bound}'
     printf '%s' '{{"ok":true}}' ;;
@@ -120,6 +132,7 @@ esac
             log = work.path().join("alder-calls.log").display(),
             started = work.path().join("attempt-started").display(),
             bound = work.path().join("attempt-bound").display(),
+            relay_updated = work.path().join("relay-updated").display(),
         ),
     );
 
@@ -218,17 +231,25 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "-qm", "sandbox"]);
 
-    // The engine stub records the argv it was handed, then stays live until
-    // the test releases it. That makes both sides of the repair distinction
-    // observable without timing guesses.
+    // The engine stub records the argv it was handed, then reads one relayed
+    // multi-line ruling in raw mode. This makes the real tmux bytes—not a
+    // mocked tmux call—the delivery contract. It stays live until the test
+    // releases it, which keeps the repair distinction observable too.
     let argv = work.join("engine-argv");
     let argc = work.join("engine-argc");
+    let relay_ready = work.join("engine-ready-for-relay");
+    let relay_received = work.join("engine-relay-bytes");
+    let ruling = "ruling line one\nruling line two";
+    let relay_byte_count = ruling.len() + 1; // tmux sends one final Enter.
     let stub = write_executable(
         &work.join("engine.sh"),
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$#\" >'{argc}'\nprintf '%s\\n' \"$@\" >'{argv}.part' && mv '{argv}.part' '{argv}'\nwhile [ ! -f '{release}' ]; do sleep 0.05; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$#\" >'{argc}'\nprintf '%s\\n' \"$@\" >'{argv}.part' && mv '{argv}.part' '{argv}'\nstty -icanon -echo min 1 time 0\n: >'{ready}'\ndd bs=1 count={count} of='{received}.part' 2>/dev/null && mv '{received}.part' '{received}'\n.alder/bin/alder attempt edit \"$ALDER_ATTEMPT\" --note 'ruling received'\nstty sane\nwhile [ ! -f '{release}' ]; do sleep 0.05; done\n",
             argc = argc.display(),
             argv = argv.display(),
+            ready = relay_ready.display(),
+            count = relay_byte_count,
+            received = relay_received.display(),
             release = work.join("release-engine").display(),
         ),
     );
@@ -295,6 +316,118 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     .expect_err("a second live worker is refused");
     assert!(refused.message.contains("already running"), "{refused}");
 
+    // Run the generated helper against this test's live pane. The stub reads
+    // the terminal in raw mode, so this catches both a bad pane target and
+    // tmux's default LF-to-CR conversion without trusting a tmux mock. This
+    // This direct case selects the interactive variety from the authoritative
+    // attempt metadata. The helper reads it before delivery only; it does not
+    // sample the worker again after it sends.
+    let tmux_before_relay = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
+    assert!(
+        !tmux_before_relay.contains("send-keys"),
+        "spawn typed into the pane: {tmux_before_relay}"
+    );
+    await_true(
+        || relay_ready.is_file(),
+        "the engine is reading its pane for a relay",
+    );
+    let ruling_file = work.join("review-finding.txt");
+    fs::write(&ruling_file, ruling).expect("the local relay input is written");
+    let relay = spawned.worktree.join(".alder/relay");
+    let generated_resume = fs::read_to_string(spawned.worktree.join(".alder/resume"))
+        .expect("the generated resume script is readable before the relay stub replaces it");
+    let delivered = Command::new(&relay)
+        .args([&session, ruling_file.to_str().expect("the path is UTF-8")])
+        .current_dir(&spawned.worktree)
+        .env("RELAY_ATTEMPT_ENGINE", "claude")
+        .output()
+        .expect("the relay runs");
+    assert!(
+        delivered.status.success(),
+        "relay failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&delivered.stdout),
+        String::from_utf8_lossy(&delivered.stderr)
+    );
+    await_true(
+        || relay_received.is_file(),
+        "the live pane receives the relayed ruling",
+    );
+    await_true(
+        || work.join("relay-updated").is_file(),
+        "the worker records a later meaningful relay milestone",
+    );
+    assert_eq!(
+        fs::read(&relay_received).expect("the received ruling is readable"),
+        format!("{ruling}\n").as_bytes(),
+        "relay must preserve embedded LF and add exactly one submitting Enter"
+    );
+    let relay_tmux_calls = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
+    assert!(
+        relay_tmux_calls.lines().any(
+            |call| call.starts_with("paste-buffer -d -r -b alder-relay-")
+                && call.ends_with(&format!("-t ={session}:"))
+        ),
+        "relay did not paste raw bytes into the session pane: {relay_tmux_calls}"
+    );
+    assert!(
+        relay_tmux_calls
+            .lines()
+            .any(|call| call == format!("send-keys -t ={session}: Enter")),
+        "relay did not submit once to the session pane: {relay_tmux_calls}"
+    );
+
+    // A Codex attempt takes the encoded-resume route even while its one-shot
+    // process is still running and cannot read its terminal. Once that process
+    // ends, the holding shell receives only the generated command, never the
+    // reviewer's raw ruling.
+    let resumed_ruling = work.join("resumed-ruling");
+    write_executable(
+        &spawned.worktree.join(".alder/resume"),
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$2\" >'{}'\nexec tmux wait-for relay-resume-hold\n",
+            resumed_ruling.display()
+        ),
+    );
+    let running_codex = Command::new(&relay)
+        .args([&session, ruling_file.to_str().expect("the path is UTF-8")])
+        .current_dir(&spawned.worktree)
+        .env("RELAY_ATTEMPT_ENGINE", "gpt")
+        .output()
+        .expect("the running-Codex relay runs");
+    assert!(
+        running_codex.status.success(),
+        "relay should report one encoded delivery while Codex is still running\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&running_codex.stdout),
+        String::from_utf8_lossy(&running_codex.stderr)
+    );
+    assert!(
+        !resumed_ruling.exists(),
+        "the running engine read the queued resume command before it exited"
+    );
+    let running_codex_tmux_calls =
+        fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
+    assert!(
+        running_codex_tmux_calls
+            .lines()
+            .any(|call| call.starts_with("set-buffer -b alder-relay-")),
+        "running Codex did not receive an encoded resume command: {running_codex_tmux_calls}"
+    );
+    assert!(
+        !running_codex_tmux_calls.contains(ruling),
+        "running Codex received the reviewer's raw ruling in tmux argv: {running_codex_tmux_calls}"
+    );
+    assert!(
+        !running_codex_tmux_calls
+            .lines()
+            .any(|call| call.starts_with("display-message")),
+        "the relay synchronously inspected the running Codex pane: {running_codex_tmux_calls}"
+    );
+
+    // Simulate a worktree cut before the helper existed. Adopting its exited
+    // pane must backfill the adapter instead of sending a leader back to a
+    // hand-written tmux command.
+    fs::remove_file(&relay).expect("the first-generation helper is removed");
+
     // Once the engine exits, its pane remains and is adopted without another
     // attempt, worktree, or session.
     fs::write(work.join("release-engine"), "go").expect("the engine is released");
@@ -306,6 +439,15 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         session_exists(&session),
         "the session died with the engine; the pane does not end `; exec bash`"
     );
+    await_true(
+        || resumed_ruling.is_file(),
+        "the holding shell executes the queued resume command",
+    );
+    assert_eq!(
+        fs::read_to_string(&resumed_ruling).expect("the resumed ruling is readable"),
+        ruling,
+        "the running-Codex route changed the local ruling bytes"
+    );
     let adopted = spawn::spawn(
         &host,
         WORK,
@@ -315,6 +457,10 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     .expect("the exited pane is adopted");
     assert_eq!(adopted.attempt_id, "wv-1-attempt-1");
     assert!(adopted.adopted);
+    assert!(
+        relay.is_file(),
+        "adopting an older worktree did not backfill its delivery helper"
+    );
 
     // The worktree is real, on its own branch, carrying alder and nothing that
     // would let a worker dispatch.
@@ -350,7 +496,7 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
             != 0,
         "the resume script is not executable"
     );
-    let script = fs::read_to_string(&resume).expect("the resume script is readable");
+    let script = &generated_resume;
     for part in [
         "codex exec resume",
         "-m",
@@ -365,11 +511,46 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         );
     }
     let checked = Command::new("sh")
-        .args(["-n"])
-        .arg(&resume)
+        .args(["-n", "-c"])
+        .arg(&generated_resume)
         .status()
         .expect("sh runs");
     assert!(checked.success(), "the resume script is not valid sh");
+
+    let relay = worktree.join(".alder/relay");
+    assert!(relay.is_file(), "a worker has no delivery adapter");
+    assert!(
+        relay
+            .metadata()
+            .expect("the relay script is statable")
+            .permissions()
+            .mode()
+            & 0o111
+            != 0,
+        "the relay script is not executable"
+    );
+    let relay_script = fs::read_to_string(&relay).expect("the relay script is readable");
+    for part in [
+        ".alder/relay <session> <file>",
+        "load-buffer",
+        "paste-buffer",
+        "relayed once to",
+    ] {
+        assert!(
+            relay_script.contains(part),
+            "the relay script omits {part}: {relay_script}"
+        );
+    }
+    assert!(
+        !relay_script.contains("capture-pane"),
+        "the relay reads the pane input line: {relay_script}"
+    );
+    let relay_checked = Command::new("sh")
+        .args(["-n"])
+        .arg(&relay)
+        .status()
+        .expect("sh runs");
+    assert!(relay_checked.success(), "the relay script is not valid sh");
     assert_eq!(
         run(
             &root,
@@ -380,8 +561,8 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         format!("work/{WORK}")
     );
 
-    // What alderd asked the log for, in order, and what it typed at a
-    // terminal, which is nothing.
+    // What alderd asked the log for, in order. Spawn itself never typed at a
+    // terminal; the relay above is a separately requested transport.
     let alder_calls = fs::read_to_string(work.join("alder-calls.log")).unwrap_or_default();
     let asked: Vec<_> = alder_calls.lines().collect();
     assert!(asked[0].starts_with(&format!("show {WORK}")), "{asked:?}");
@@ -410,10 +591,6 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         "a successful spawn ended its own attempt: {asked:?}"
     );
     let tmux_calls = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
-    assert!(
-        !tmux_calls.contains("send-keys"),
-        "the spawn typed into the pane: {tmux_calls}"
-    );
     assert!(
         tmux_calls.contains("; exec bash"),
         "the pane command does not end in a shell: {tmux_calls}"
