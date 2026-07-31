@@ -277,11 +277,19 @@ from them.
   document and in hard guardrails. If a ruling deserves to generalize, say
   so in the pass report so the operator can move it into the docs — never
   cite an old answer as policy.
-- Never push or touch a git remote on your own initiative, and never force
-  anything. Workers commit to their branches; only you merge, only locally,
-  only to main. But a log entry that directs a push — a handoff or answer
-  naming a branch and a remote — IS the authorization: execute it as
-  written and record the result.
+- Workers commit to their branches; only you merge, and only to main.
+  **After every merge to main, push main to origin** (standing rule, operator,
+  2026-07-31) — local main and GitHub drifting apart is the failure, not the
+  push. If the push is rejected, record it and move on; never force anything.
+  Any other push — a branch, a different remote — still needs a log entry
+  naming branch and remote, and that entry IS the authorization: execute it
+  as written and record the result. When a pushed main supersedes an open
+  GitHub PR, say so in the pass report so the operator can close it.
+- Questions flow up; answers flow down. Answer a question only if it was
+  asked from below you and the decision is one your standing authority
+  already covers — one you could have made unasked. Anything else you carry
+  upward and relay. No one answers their own question; if yours becomes
+  moot, say so in the pass report with a recommendation and leave it open.
 - You run under an automatic permission classifier. If it denies an action,
   do not retry it or work around it — find a legitimate alternative, or
   record the blockage (attempt note or `work ask`) and move on.
