@@ -538,17 +538,14 @@ impl Log for GitLog {
                 through: through.sequence(),
             });
         }
-        let records = match through.revision() {
-            Some(revision) => {
-                self.verify_authoritative_revision(revision)?;
-                self.records_at_revision(revision)?
-            }
-            None if through.is_empty() => Arc::new(Vec::new()),
-            None => {
-                return Err(LogError::InvalidHead {
-                    message: "a non-empty Git head requires a revision".to_owned(),
-                });
-            }
+        let records = if through.is_empty() {
+            Arc::new(Vec::new())
+        } else {
+            let revision = through.revision().ok_or_else(|| LogError::InvalidHead {
+                message: "a non-empty Git head requires a revision".to_owned(),
+            })?;
+            self.verify_authoritative_revision(revision)?;
+            self.records_at_revision(revision)?
         };
         if records.len() as u64 != through.sequence() {
             return Err(LogError::InvalidHead {
@@ -849,5 +846,63 @@ mod tests {
         assert!(is_object_id(&"b".repeat(64)));
         assert!(!is_object_id("refs/heads/log"));
         assert!(!is_object_id(&"g".repeat(40)));
+    }
+
+    #[test]
+    fn authoritative_revisions_are_memoized_after_verification() {
+        let log = GitLog::new("/repository", "origin", "refs/heads/log");
+        let revision = "a".repeat(40);
+        assert!(!log.remembers_authoritative(&revision));
+        log.remember_authoritative(&revision);
+        assert!(log.remembers_authoritative(&revision));
+    }
+
+    #[test]
+    fn a_cache_entry_must_match_this_log_exactly() {
+        let directory = TemporaryDirectory::new().unwrap();
+        let log =
+            GitLog::new("/repository", "origin", "refs/heads/log").with_cache(directory.path());
+        let revision = "a".repeat(40);
+        let records = vec![record("one", 1)];
+        log.cache_records(&revision, &records);
+        assert_eq!(log.cached_records(&revision), Some(records));
+    }
+
+    #[test]
+    fn event_paths_need_both_the_events_directory_and_json_extension() {
+        assert!(is_event_path("events/00000000000000000001-one.json"));
+        assert!(!is_event_path("events/00000000000000000001-one.txt"));
+        assert!(!is_event_path("notes/00000000000000000001-one.json"));
+    }
+
+    #[test]
+    fn store_digest_is_the_fnv1a_digest_of_the_separated_names() {
+        fn fnv1a(bytes: &[u8]) -> u64 {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325, |digest, byte| {
+                (digest ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+        }
+
+        assert_eq!(
+            store_digest("origin", "refs/heads/log"),
+            fnv1a(b"origin\0refs/heads/log")
+        );
+    }
+
+    #[test]
+    fn bounded_preserves_short_diagnostics_and_marks_only_truncation() {
+        assert_eq!(bounded(b"diagnostic"), "diagnostic");
+        assert_eq!(bounded(&vec![b'x'; 4095]), "x".repeat(4095));
+        assert_eq!(bounded(&vec![b'x'; 4096]), "x".repeat(4096));
+        assert_eq!(bounded(&vec![b'x'; 4097]), format!("{}…", "x".repeat(4096)));
+    }
+
+    #[test]
+    fn temporary_index_directory_is_removed_when_its_guard_drops() {
+        let temporary = TemporaryDirectory::new().unwrap();
+        let path = temporary.path().to_owned();
+        assert!(path.is_dir());
+        drop(temporary);
+        assert!(!path.exists());
     }
 }
