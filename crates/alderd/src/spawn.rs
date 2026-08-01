@@ -11,7 +11,11 @@
 //! its final argument. Nothing is typed into the pane, so nothing waits for
 //! the engine to boot, nothing can be read as a key name, and a goal
 //! containing quotes or semicolons is just a string. There is no sleep
-//! anywhere on this path.
+//! anywhere on this path. Two tests below hold that, and both are titled for
+//! it: one counts the questions a dispatch puts to the world, the other reads
+//! the source for a duration or a clock it could wait on. Neither times
+//! anything — what elapses here is process creation, so on a busy machine a
+//! clock reports the machine rather than the code.
 //!
 //! **The pane outlives the engine.** The command ends `; exec bash`, so a
 //! one-shot engine that finishes its turn leaves a live session behind. The
