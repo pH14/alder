@@ -1564,15 +1564,20 @@ mod tests {
         assert!(!host.called("send-keys"));
     }
 
-    /// Nothing on the dispatch path waits — the run half.
+    /// A dispatch asks the world a fixed set of questions and never asks again.
     ///
     /// A wait is an observation made again in the hope of a different answer,
-    /// so the two are the same claim seen from either end. Every question this
-    /// path puts to the world goes through the host, which makes the fake's log
-    /// the whole of what it asked: a fixed set of questions, each asked a fixed
-    /// number of times. A loop that waited for the engine to come up — sleeping
-    /// between looks or spinning — would appear here as another observation,
-    /// and would appear whatever else the machine happened to be doing.
+    /// so the two are the same claim seen from either end. What a leader can
+    /// observe about whether a dispatch waited is exactly which questions went
+    /// out and how many times, and every question this path puts to the world
+    /// goes through the host — so the log below is that observation, not a note
+    /// about a double's internals. A loop that waited for the engine to come up
+    /// — sleeping between looks or spinning — would appear here as another
+    /// observation, and would appear whatever else the machine was doing.
+    ///
+    /// This is the dispatch's half. `Host` runs no code here, so what the real
+    /// commands do once they leave is checked where they really run, in
+    /// `tests/spawn_host.rs`.
     #[test]
     fn the_dispatch_asks_the_world_a_fixed_set_of_questions_and_never_asks_again() {
         let host = Fake::new();
@@ -1625,56 +1630,46 @@ mod tests {
         );
     }
 
-    /// Nothing on the dispatch path waits — the half a run cannot show.
+    /// This module itself cannot wait in process, whatever it is asked to do.
     ///
-    /// The counts above say this run did not wait. They cannot say the next
-    /// edit will not, and elapsed time cannot say it either: this path's cost
-    /// is process creation — `alder`, `git`, `tmux` — so on a loaded machine
-    /// its wall clock reports the machine rather than the code. What no load
-    /// can make untrue is the source. Waiting needs a duration or a clock to
-    /// wait on, and neither this module's dispatch half nor the two `Host`
-    /// blocks its effects run through names one, or names the thread
+    /// The counts above are about the questions that reach the world. A
+    /// `thread::sleep` here reaches nothing and so shows in no ledger, and
+    /// elapsed time cannot show it either: this path's cost is process
+    /// creation — `alder`, `git`, `tmux` — so on a loaded machine a clock
+    /// reports the machine rather than the code. What no load can make untrue
+    /// is the source. Waiting in process needs a duration or a clock to wait
+    /// on, and this module's dispatch half names neither, nor the thread
     /// facilities that would wait on one.
+    ///
+    /// Only this module, and deliberately. A bounded timeout on a command that
+    /// can hang is a limit rather than a wait, and AGENTS.md says so; but it is
+    /// a limit on a *command*, and nothing here runs one. Every command goes
+    /// out through `effects::Host`, which is where such a timeout would belong
+    /// and where this test would be wrong to forbid it. What the host does is
+    /// checked where the host actually runs, in `tests/spawn_host.rs`.
     #[test]
-    fn no_code_on_the_dispatch_path_can_name_a_clock_or_a_sleep() {
-        let effects = include_str!("effects.rs");
-        // `effects.rs` does sleep, once and legitimately: the driving loop's
-        // own pause between passes, in `impl Effects for Host`. A dispatch
-        // reaches none of that — it reaches these two blocks.
-        for (whose, region) in [
-            (
-                "spawn's own half of spawn.rs",
-                before_the_tests(include_str!("spawn.rs")),
-            ),
-            (
-                "Host's shared shell-outs",
-                impl_block(effects, "\nimpl Host {"),
-            ),
-            (
-                "Host as a SpawnHost",
-                impl_block(effects, "\nimpl SpawnHost for Host {"),
-            ),
+    fn this_modules_dispatch_half_can_name_no_clock_and_no_sleep() {
+        let code = without_comments(before_the_tests(include_str!("spawn.rs")));
+        for waiting in [
+            "Duration",
+            "Instant",
+            "SystemTime",
+            "thread",
+            "sleep",
+            "park",
+            "yield_now",
+            "spin_loop",
+            "recv_timeout",
+            "elapsed",
         ] {
-            let code = without_comments(region);
-            for waiting in [
-                "Duration",
-                "Instant",
-                "SystemTime",
-                "thread",
-                "sleep",
-                "park",
-                "yield_now",
-                "spin_loop",
-                "recv_timeout",
-                "elapsed",
-            ] {
-                assert!(
-                    !code.contains(waiting),
-                    "{whose} names `{waiting}`. Nothing on the dispatch path may \
-                     wait for an engine, and code that cannot name a duration or \
-                     a clock cannot wait on one."
-                );
-            }
+            assert!(
+                !code.contains(waiting),
+                "spawn's own half of spawn.rs names `{waiting}`. Nothing here may \
+                 wait for an engine, and code that cannot name a duration or a \
+                 clock cannot wait on one in process. If this is a bounded timeout \
+                 on a command that can hang, it belongs on the command, in \
+                 `effects::Host`, not here."
+            );
         }
     }
 
@@ -1695,19 +1690,6 @@ mod tests {
         source
             .split_once("\n#[cfg(test)]\n")
             .expect("a module under test keeps its tests at the end")
-            .0
-    }
-
-    /// One `impl` block, from its opening line to the `}` in the first column
-    /// that closes it.
-    fn impl_block<'a>(source: &'a str, opening: &str) -> &'a str {
-        let block = source
-            .split_once(opening)
-            .unwrap_or_else(|| panic!("`{}` is gone", opening.trim()))
-            .1;
-        block
-            .split_once("\n}\n")
-            .unwrap_or_else(|| panic!("`{}` is never closed", opening.trim()))
             .0
     }
 
