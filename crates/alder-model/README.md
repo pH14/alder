@@ -173,6 +173,16 @@ handoff, and per-scenario crash counts. The log length is bounded by
 
 Complete exploration of all six scenarios takes about five seconds.
 
+Each test asserts its own number exactly, so this table and the suite are one
+claim rather than two: a count that moves fails a test, and the number here is
+meant to be changed in the same commit that explains why. That assertion is
+load-bearing rather than decorative. A property catches a model that *reaches*
+a bad state; nothing but the size of the space catches a model that quietly
+stopped reaching a good one, or started reaching states its budgets say it
+cannot — a fairness step offered one pass too late, a fault injected past its
+budget, a counter that stopped counting so two eras hash alike. Each of those
+leaves every property green and the space a different size.
+
 The baseline is no longer the single linear chain it was before the
 injection step and the timeout verdict existed. It is now arm, snapshot,
 append, inject, end, twice over, with the timeout branch available at each
@@ -246,6 +256,42 @@ the fold rather than a gap: every way of reaching two open passes in this
 model produces a history the real fold rejects outright, so
 `log_folds_cleanly` fires first. The predicate is exercised directly against
 those shapes in the shared module's own tests.
+
+**Mutating the checker itself.** This crate is in the workspace mutation
+sweep with no exclusion, which asks a sharper question than "do the properties
+bite": *who checks the checker?* A checker has two failure modes an ordinary
+suite does not, and both stay green under exploration, because a check that is
+never made has no counterexample to find.
+
+- **A question nobody asks.** The flags decide which properties a scenario
+  registers, and an unregistered `sometimes` cannot fail — a gate that stops
+  registering one makes the run go green *faster*. So
+  `each_scenario_registers_exactly_the_properties_its_flags_ask_for` pins the
+  set, in order, for all six scenarios.
+- **A question that answers itself.** A `sometimes` property claims the model
+  can *reach* something, and one that already holds in the initial state
+  claims nothing: it is witnessed by the empty log, and it stays witnessed
+  however the protocol breaks. `crashed_verdicts(state) >= 0` and
+  `crashes_left <= daemon_crashes` are both true before the model moves, and
+  both read as coverage. So
+  `no_sometimes_property_is_witnessed_before_the_model_moves` evaluates every
+  registered `sometimes` against the initial state and requires it false.
+
+The state counts above close the third gap: the model's own sequencing —
+budgets, guards, and the monotone counters that keep two eras from hashing
+alike — is checked by the size of the space, not by any property. The two
+helpers a property reads *through* rather than states, `recovered` and
+`crashed_verdicts`, are the one thing neither mechanism reaches, since a wrong
+answer there makes its property vacuous rather than false; they are pinned by
+unit tests in `lib.rs` beside them.
+
+One equivalent mutant was removed by clearer code rather than by a test.
+`late_observation` used to step to one second *past* the max-interval ceiling;
+`max_interval_elapsed` asks `now >= ended_at + ceiling`, so every instant at
+or past the boundary explores exactly the same space and the margin's
+arithmetic was a claim no scenario could refute. The step now lands on the
+boundary itself, which is also the more useful spelling: it makes the counts a
+check on the daemon's own definition of "elapsed".
 
 ## Abstractions, so nobody over-reads the green
 
