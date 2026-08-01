@@ -217,6 +217,12 @@ sleep 300
             .expect("has-session answers on an empty server"),
         "the sandbox server already holds `{session}`"
     );
+    assert!(
+        alderd::spawn::SpawnHost::tmux_session(&host, &session)
+            .expect("a missing session is observable")
+            .is_none(),
+        "a missing session is not a session with unknown identity"
+    );
     host.tmux_new_session(&session, &engine)
         .expect("the session is created");
     assert!(
@@ -228,6 +234,14 @@ sleep 300
     // What the pane is really running: the engine itself, nothing wrapped
     // around it, one word per argument however it was spelled.
     assert_eq!(lines(&await_file(&argv)), vec!["a b", "it's"]);
+    let observed = alderd::spawn::SpawnHost::tmux_session(&host, &session)
+        .expect("the dispatch host observes its own session")
+        .expect("the session exists");
+    assert_eq!(observed.attempt_id, None);
+    assert!(
+        observed.engine_live,
+        "an unmarked pane running the engine is not its holding shell"
+    );
 
     // Nothing is attached to a session started detached.
     assert!(
@@ -300,8 +314,7 @@ sleep 300
             .expect("has-session answers")
     );
 
-    host.tmux_kill_session(&session)
-        .expect("the session is killed");
+    alderd::spawn::SpawnHost::tmux_kill_session(&host, &session).expect("the session is killed");
     await_true(
         || {
             !host
@@ -309,6 +322,12 @@ sleep 300
                 .expect("has-session answers")
         },
         "the session goes away",
+    );
+    assert!(
+        alderd::spawn::SpawnHost::tmux_session(&host, &session)
+            .expect("the removed session is observable")
+            .is_none(),
+        "the spawn host agrees that the session is gone"
     );
 
     fs::write(work.join("done"), "ok").expect("the marker is written");

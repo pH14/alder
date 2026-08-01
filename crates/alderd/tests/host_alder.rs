@@ -11,6 +11,7 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -21,6 +22,8 @@ use alderd::{
 use chrono::Utc;
 use serde_json::json;
 use tempfile::TempDir;
+
+const LOG_CHILD: &str = "host_logs_reach_stderr_child";
 
 /// Write an executable stub and return its path.
 fn stub(directory: &Path, name: &str, body: &str) -> PathBuf {
@@ -181,6 +184,36 @@ fn notify_hands_the_message_to_the_configured_command() {
         &config(&alder, Some("/no/such/notifier")),
     );
     broken.notify("still nobody");
+}
+
+#[test]
+fn both_host_logging_seams_write_their_messages_to_stderr() {
+    let output = Command::new(std::env::current_exe().expect("the test binary has a path"))
+        .args(["--exact", LOG_CHILD, "--ignored", "--nocapture"])
+        .output()
+        .expect("the logging child runs");
+
+    assert!(
+        output.status.success(),
+        "the logging child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("alderd: effects log message"), "{stderr}");
+    assert!(stderr.contains("alderd: spawn log message"), "{stderr}");
+}
+
+/// This half runs in a child so its process-wide stderr is the parent test's
+/// observable output. `Host::say` is intentionally a host effect, not a
+/// formatting helper, and both traits must preserve it.
+#[test]
+#[ignore = "runs under both_host_logging_seams_write_their_messages_to_stderr"]
+fn host_logs_reach_stderr_child() {
+    let root = TempDir::new().expect("a project root");
+    let host = Host::new(root.path().to_path_buf(), &config(Path::new("alder"), None));
+
+    Effects::log(&host, "effects log message");
+    alderd::spawn::SpawnHost::log(&host, "spawn log message");
 }
 
 #[test]
