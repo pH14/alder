@@ -9,6 +9,28 @@ use alder_model::Scenario;
 use alderd::decide::config_for;
 use stateright::{Checker, Expectation, Model};
 
+/// The correct scenarios generate 7, 19, 185, 892, 1,804, and 11,845 total
+/// states (including repeats). Stop at the first count beyond that measured
+/// maximum so a mutation that makes the graph unbounded gets a verdict.
+const EXPLORATION_STATE_LIMIT: usize = 11_846;
+
+/// Explore at most the known finite graph, rejecting a capped run before its
+/// properties or counts can be mistaken for results from a complete search.
+fn explore(scenario: Scenario, name: &str) -> impl Checker<Scenario> {
+    let checker = scenario
+        .checker()
+        .target_state_count(EXPLORATION_STATE_LIMIT)
+        .spawn_bfs()
+        .join();
+    let generated = checker.state_count();
+    assert!(
+        generated < EXPLORATION_STATE_LIMIT,
+        "{name} reached the {EXPLORATION_STATE_LIMIT}-state exploration limit; \
+         model checking stopped before its work queue drained"
+    );
+    checker
+}
+
 /// Explore the complete state space and assert every property: `always`
 /// properties must have no counterexample, `sometimes` properties must have
 /// an example.
@@ -22,7 +44,7 @@ use stateright::{Checker, Expectation, Model};
 /// here is README.md's table; the two are the same claim, and a change to
 /// either wants the other changed with it, deliberately.
 fn check(scenario: Scenario, name: &str, states: usize) {
-    let checker = scenario.checker().spawn_bfs().join();
+    let checker = explore(scenario, name);
     checker.assert_properties();
     let explored = checker.unique_state_count();
     eprintln!("{name}: {explored} unique states");
@@ -159,7 +181,7 @@ fn interleaved_writers_lose_no_updates() {
 /// still holds throughout.
 #[test]
 fn a_racing_wake_can_swallow_a_rotation() {
-    let checker = rotation_race().checker().spawn_bfs().join();
+    let checker = explore(rotation_race(), "rotation race");
     checker.assert_properties();
     let trace = checker
         .discovery("a racing wake consumes a rotation nobody performed")
