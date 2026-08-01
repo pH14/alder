@@ -377,12 +377,20 @@ fn observation() -> Poll {
     }
 }
 
-/// The same observation, made after the configured ceiling has elapsed. Time
+/// The same observation, made once the configured ceiling has elapsed. Time
 /// is not a modeled dimension, but "the max interval eventually passes" is a
 /// fairness fact, so the model offers it as an explicit step.
+///
+/// The instant is the ceiling itself rather than a moment past it, and that is
+/// deliberate: `max_interval_elapsed` asks `now >= ended_at + ceiling`, so the
+/// boundary is the earliest instant that fires, and stepping to exactly there
+/// makes the explored space a check on the daemon's own spelling of "elapsed"
+/// instead of on a safety margin this crate chose. A margin also cannot be
+/// checked — anything at or past the boundary explores the same space, so a
+/// margin's arithmetic is a claim no scenario can refute.
 fn late_observation(config: &Config) -> Poll {
     Poll {
-        now: epoch() + TimeDelta::seconds(config.max_interval_seconds as i64 + 1),
+        now: epoch() + TimeDelta::seconds(config.max_interval_seconds as i64),
         ..observation()
     }
 }
@@ -1177,5 +1185,127 @@ impl Model for Scenario {
             ));
         }
         properties
+    }
+}
+
+/// The two helpers a property *reads through* rather than states.
+///
+/// Everything else in this crate is checked by exploring it: a scenario's
+/// property set, its `sometimes` witnesses, and the exact size of the space it
+/// reaches (`tests/properties.rs`). These two are the exception, because both
+/// are consulted by exactly one property and a wrong answer makes that property
+/// vacuous rather than false — `recovered` saying yes too readily leaves
+/// liveness green over a stranded pass, and a `crashed_verdicts` that answers
+/// without reading the log leaves its `sometimes` witnessed by the empty log.
+/// A vacuous property has no counterexample to find, so exploration cannot
+/// notice; the sentences have to be pinned directly.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A state carrying just this log. Neither helper reads any other field,
+    /// and the process state a log implies is not what is under test.
+    fn state_of(log: Vec<Record>) -> ProtocolState {
+        let mut state = Scenario::new()
+            .init_states()
+            .pop()
+            .expect("one initial state");
+        state.log = log;
+        state
+    }
+
+    fn started(id: &str, at_head: u64) -> RecordDraft {
+        typed_draft(
+            &format!("wake-{id}"),
+            DAEMON_ACTOR,
+            EventPayload::PassStarted {
+                pass: PassDefinition {
+                    id: id.to_owned(),
+                    engine: "claude".to_owned(),
+                    handle: daemon_handle(&Scenario::new().config),
+                    triggers: vec![PassTrigger::Manual],
+                    at_head,
+                },
+            },
+        )
+    }
+
+    fn ended(id: &str, outcome: PassOutcome) -> RecordDraft {
+        typed_draft(
+            &format!("end-{id}"),
+            LEADER_ACTOR,
+            EventPayload::PassEnded {
+                pass_id: id.to_owned(),
+                outcome,
+                report: None,
+                wake_at: None,
+                rotate: false,
+                why: None,
+            },
+        )
+    }
+
+    fn paused(why: Option<&str>) -> RecordDraft {
+        typed_draft(
+            "pause-1",
+            PHONE_ACTOR,
+            EventPayload::LoopPaused {
+                why: why.map(str::to_owned),
+            },
+        )
+    }
+
+    /// An empty log is the initial state, and it is recovered: nothing is open
+    /// and nothing is blocked.
+    #[test]
+    fn an_empty_log_is_recovered() {
+        assert!(recovered(&state_of(Vec::new())));
+    }
+
+    /// The first half of the recovery target. A pass still open is the state
+    /// liveness exists to rule out of a terminal state, so it must not read as
+    /// recovered — whatever else is true of the log.
+    #[test]
+    fn an_open_pass_is_not_recovered() {
+        let open = append_now(&[], &started("hm-pass-1", 0));
+        assert!(!recovered(&state_of(open.clone())));
+        let ended = append_now(&open, &ended("hm-pass-1", PassOutcome::Ok));
+        assert!(recovered(&state_of(ended)));
+    }
+
+    /// The target is "no pass is open", not "nothing went wrong": a crash the
+    /// log has attributed is recovered, which is the whole point of insisting
+    /// that a stranded pass be ended somehow.
+    #[test]
+    fn a_crashed_pass_is_recovered_once_it_is_attributed() {
+        let log = append_now(&[], &started("hm-pass-1", 0));
+        let log = append_now(&log, &ended("hm-pass-1", PassOutcome::Crashed));
+        assert!(recovered(&state_of(log)));
+    }
+
+    /// The second half. A paused loop is a legitimate resting place only when
+    /// it says why; a pause with no reason is the loop stopping silently, which
+    /// is exactly what the property refuses to call recovered.
+    #[test]
+    fn a_pause_is_recovered_only_when_it_states_a_reason() {
+        assert!(!recovered(&state_of(append_now(&[], &paused(None)))));
+        assert!(recovered(&state_of(append_now(
+            &[],
+            &paused(Some("maintenance window")),
+        ))));
+    }
+
+    /// The count comes from the log's own verdicts, so a log with no crash in
+    /// it must answer zero.
+    #[test]
+    fn crashed_verdicts_counts_the_verdicts_in_the_log() {
+        assert_eq!(crashed_verdicts(&state_of(Vec::new())), 0);
+        let clean = append_now(&[], &started("hm-pass-1", 0));
+        let clean = append_now(&clean, &ended("hm-pass-1", PassOutcome::Ok));
+        assert_eq!(crashed_verdicts(&state_of(clean.clone())), 0);
+        let at_head = clean.len() as u64;
+        let crashed = append_now(&clean, &started("hm-pass-2", at_head));
+        let crashed = append_now(&crashed, &ended("hm-pass-2", PassOutcome::Crashed));
+        assert_eq!(crashed_verdicts(&state_of(crashed)), 1);
     }
 }
