@@ -249,7 +249,6 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     );
 
     let host = Host::for_command(root.clone(), "alder".to_owned());
-    let started = Instant::now();
     let spawned = spawn::spawn(
         &host,
         WORK,
@@ -257,18 +256,20 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         Some(&stub.display().to_string()),
     )
     .expect("the spawn succeeds");
-    let elapsed = started.elapsed();
 
     assert_eq!(spawned.session, session);
     assert_eq!(spawned.branch, format!("work/{WORK}"));
     assert_eq!(spawned.worktree, work.join(format!("alder-work-{WORK}")));
     assert!(!spawned.adopted);
 
-    // Nothing on this path sleeps or waits for an engine to boot.
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "the spawn took {elapsed:?}: something on the path is waiting"
-    );
+    // That nothing on this path sleeps or waits for an engine to boot is not
+    // asserted here. It used to be, as an upper bound on this spawn's elapsed
+    // time — but what elapses here is process creation, `alder` and `git` and
+    // `tmux`, so on a loaded machine the bound reported the machine and this
+    // test failed for reasons no branch had caused. The invariant is kept in
+    // `spawn.rs`, where the fake host makes it two things load cannot touch:
+    // the dispatch observes the world a fixed number of times, and no code on
+    // the path can even name a duration or a clock to wait on.
 
     // The goal arrives as exactly one argument, and it is the whole brief.
     let goal = await_file(&argv);

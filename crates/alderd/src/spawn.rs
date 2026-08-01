@@ -1245,6 +1245,9 @@ mod tests {
         }
 
         fn tmux_session(&self, session: &str) -> Result<Option<ObservedSession>> {
+            self.calls
+                .borrow_mut()
+                .push(format!("tmux observe {session}"));
             Ok(self.sessions.borrow().get(session).cloned())
         }
 
@@ -1283,10 +1286,16 @@ mod tests {
         }
 
         fn path_exists(&self, path: &Path) -> bool {
+            self.calls
+                .borrow_mut()
+                .push(format!("exists {}", path.display()));
             self.worktrees.borrow().contains_key(path) || self.strays.borrow().contains(path)
         }
 
         fn canonical_path(&self, path: &Path) -> Result<PathBuf> {
+            self.calls
+                .borrow_mut()
+                .push(format!("resolve {}", path.display()));
             Ok(self
                 .canonical_paths
                 .borrow()
@@ -1549,6 +1558,163 @@ mod tests {
         }
         // Nothing is typed at the session, and nothing waits for it to boot.
         assert!(!host.called("send-keys"));
+    }
+
+    /// Nothing on the dispatch path waits — the run half.
+    ///
+    /// A wait is an observation made again in the hope of a different answer,
+    /// so the two are the same claim seen from either end. Every question this
+    /// path puts to the world goes through the host, which makes the fake's log
+    /// the whole of what it asked: a fixed set of questions, each asked a fixed
+    /// number of times. A loop that waited for the engine to come up — sleeping
+    /// between looks or spinning — would appear here as another observation,
+    /// and would appear whatever else the machine happened to be doing.
+    #[test]
+    fn the_dispatch_asks_the_world_a_fixed_set_of_questions_and_never_asks_again() {
+        let host = Fake::new();
+        spawn(&host, "al-1", tier("luna").unwrap(), None).unwrap();
+        let calls = host.calls();
+
+        let asked = |question: &str| {
+            calls
+                .iter()
+                .filter(|call| call.starts_with(question))
+                .count()
+        };
+        for (question, times) in [
+            // The brief, and whether an attempt is already open.
+            ("alder show al-1", 1),
+            ("alder status --section in_flight", 1),
+            // The session is looked at once, before the decision that uses it.
+            // Nothing looks a second time to see whether an engine came up.
+            ("tmux observe alder-work-al-1", 1),
+            // Two different questions about one path — is there residue to
+            // sweep, and is the worktree already cut — not one asked twice.
+            ("exists /projects/alder-work-al-1", 2),
+            ("git rev-parse --verify", 1),
+            ("git rev-parse --path-format", 1),
+        ] {
+            assert_eq!(
+                asked(question),
+                times,
+                "`{question}` is no longer asked exactly {times} time(s), and \
+                 an observation repeated is a wait: {calls:#?}"
+            );
+        }
+
+        // The same claim over the whole log, so that a wait built on some other
+        // observation is caught too. Effects that change the world are left out
+        // deliberately: writing one more file into a worktree is not a wait,
+        // and should not have to edit a test about waiting.
+        let observations: Vec<&String> = calls
+            .iter()
+            .filter(|call| {
+                OBSERVING_EFFECTS
+                    .iter()
+                    .any(|prefix| call.starts_with(prefix))
+            })
+            .collect();
+        assert_eq!(
+            observations.len(),
+            7,
+            "the dispatch observes the world a different number of times: {observations:#?}"
+        );
+    }
+
+    /// Nothing on the dispatch path waits — the half a run cannot show.
+    ///
+    /// The counts above say this run did not wait. They cannot say the next
+    /// edit will not, and elapsed time cannot say it either: this path's cost
+    /// is process creation — `alder`, `git`, `tmux` — so on a loaded machine
+    /// its wall clock reports the machine rather than the code. What no load
+    /// can make untrue is the source. Waiting needs a duration or a clock to
+    /// wait on, and neither this module's dispatch half nor the two `Host`
+    /// blocks its effects run through names one, or names the thread
+    /// facilities that would wait on one.
+    #[test]
+    fn no_code_on_the_dispatch_path_can_name_a_clock_or_a_sleep() {
+        let effects = include_str!("effects.rs");
+        // `effects.rs` does sleep, once and legitimately: the driving loop's
+        // own pause between passes, in `impl Effects for Host`. A dispatch
+        // reaches none of that — it reaches these two blocks.
+        for (whose, region) in [
+            (
+                "spawn's own half of spawn.rs",
+                before_the_tests(include_str!("spawn.rs")),
+            ),
+            (
+                "Host's shared shell-outs",
+                impl_block(effects, "\nimpl Host {"),
+            ),
+            (
+                "Host as a SpawnHost",
+                impl_block(effects, "\nimpl SpawnHost for Host {"),
+            ),
+        ] {
+            let code = without_comments(region);
+            for waiting in [
+                "Duration",
+                "Instant",
+                "SystemTime",
+                "thread",
+                "sleep",
+                "park",
+                "yield_now",
+                "spin_loop",
+                "recv_timeout",
+                "elapsed",
+            ] {
+                assert!(
+                    !code.contains(waiting),
+                    "{whose} names `{waiting}`. Nothing on the dispatch path may \
+                     wait for an engine, and code that cannot name a duration or \
+                     a clock cannot wait on one."
+                );
+            }
+        }
+    }
+
+    /// The host effects a dispatch only reads the world with. A wait has to
+    /// repeat one of these; the ones that change the world it has no use for.
+    const OBSERVING_EFFECTS: [&str; 7] = [
+        "alder show",
+        "alder status",
+        "tmux observe",
+        "exists ",
+        "resolve ",
+        "git rev-parse",
+        "git worktree list",
+    ];
+
+    /// Everything in a module ahead of its own tests.
+    fn before_the_tests(source: &str) -> &str {
+        source
+            .split_once("\n#[cfg(test)]\n")
+            .expect("a module under test keeps its tests at the end")
+            .0
+    }
+
+    /// One `impl` block, from its opening line to the `}` in the first column
+    /// that closes it.
+    fn impl_block<'a>(source: &'a str, opening: &str) -> &'a str {
+        let block = source
+            .split_once(opening)
+            .unwrap_or_else(|| panic!("`{}` is gone", opening.trim()))
+            .1;
+        block
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("`{}` is never closed", opening.trim()))
+            .0
+    }
+
+    /// Source with its whole-line comments dropped, so that prose about
+    /// waiting is not mistaken for code that waits.
+    fn without_comments(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
