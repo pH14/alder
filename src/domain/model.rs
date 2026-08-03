@@ -40,9 +40,9 @@ impl EventDraft {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "body")]
 pub enum EventPayload {
-    // Kept solely to decode events written before handoffs were removed. The
-    // fold deliberately ignores them, so they remain visible as history but
-    // cannot create or change current state.
+    // Kept solely to decode events written before handoffs were removed.
+    // Submission and withdrawal are inert history; integration still creates
+    // its embedded work because later historical events can refer to it.
     #[serde(rename = "handoff.submitted")]
     LegacyHandoffSubmitted { handoff: LegacyHandoffDefinition },
     #[serde(rename = "handoff.integrated")]

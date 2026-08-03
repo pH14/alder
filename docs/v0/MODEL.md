@@ -92,8 +92,9 @@ user-facing concept.
 
 Historical logs may contain `handoff.submitted`, `handoff.integrated`, and
 `handoff.withdrawn`. The decoder retains those wire forms so history remains
-readable, but the fold treats each as inert history: none creates or changes
-live state.
+readable. Submission and withdrawal are inert history. Integration still adds
+its embedded work record, because later historical events and dependency edges
+can refer to work created that way; it creates no handoff-scoped live state.
 
 ## Identifiers
 

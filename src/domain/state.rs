@@ -66,8 +66,11 @@ impl ProjectState {
         let seq = event.seq;
         match &event.payload {
             EventPayload::LegacyHandoffSubmitted { .. }
-            | EventPayload::LegacyHandoffIntegrated { .. }
             | EventPayload::LegacyHandoffWithdrawn { .. } => {}
+            EventPayload::LegacyHandoffIntegrated { work, .. } => {
+                self.add_work(work, seq)?;
+                self.validate_graph()?;
+            }
             EventPayload::WorkChanged { operations, .. } => {
                 if operations.is_empty() {
                     return Err(AlderError::validation(
@@ -1126,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_handoff_events_are_inert_history() {
+    fn legacy_handoff_submission_and_withdrawal_are_inert_history() {
         let mut state = ProjectState::default();
         state
             .apply(&event(
@@ -1141,21 +1144,9 @@ mod tests {
                 },
             ))
             .unwrap();
-        let integration = EventPayload::LegacyHandoffIntegrated {
-            handoff_id: "hm-handoff-one".to_owned(),
-            work: WorkDefinition {
-                id: "hm-work".to_owned(),
-                title: "work".to_owned(),
-                spec: None,
-                priority: 0,
-                requires: Vec::new(),
-                checks: Vec::new(),
-            },
-        };
-        state.apply(&event(2, integration.clone())).unwrap();
         state
             .apply(&event(
-                3,
+                2,
                 EventPayload::LegacyHandoffWithdrawn {
                     handoff_id: "hm-handoff-one".to_owned(),
                     why: "superseded".to_owned(),
