@@ -9,12 +9,13 @@ use alder_log::{AppendReceipt, Log, LogError};
 
 use super::{
     AttemptDefinition, AttemptOutcome, CheckUpdate, Event, EventDraft, EventPayload,
-    GraphChangeDocument, HandoffDefinition, Head, PassDefinition, PassOutcome, PassTrigger,
-    PreparedChange, ProjectState, QuestionDefinition, WorkDefinition, WorkOperation, WorkState,
-    WorkStateChange,
+    GraphChangeDocument, HandoffDefinition, Head, ObservationDefinition, ObservationKey,
+    PassDefinition, PassOutcome, PassTrigger, PreparedChange, ProjectState, QuestionDefinition,
+    WorkDefinition, WorkOperation, WorkState, WorkStateChange, validate_observation_key,
 };
 
 const ID_ALLOCATION_ATTEMPTS: usize = 16;
+const OBSERVATION_APPEND_ATTEMPTS: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -28,6 +29,14 @@ pub struct Snapshot {
 pub struct AppendResult {
     pub head: Head,
     pub event: Event,
+}
+
+/// The result of recording one observation level. A repeated report is a
+/// successful no-op, not an append receipt.
+#[derive(Debug, Clone)]
+pub enum ObservationAppend {
+    Appended(Box<AppendResult>),
+    Unchanged { head: Head },
 }
 
 pub struct ProjectLog<S> {
@@ -82,6 +91,79 @@ impl<S: Log> ProjectLog<S> {
         payload: EventPayload,
     ) -> Result<AppendResult> {
         self.append_payload_at(snapshot, Utc::now(), payload)
+    }
+
+    /// Record a current level only when the folded picture would change.
+    ///
+    /// Observers are deliberately dumb and may report the same level forever.
+    /// The append layer rereads after a racing writer, so two identical reports
+    /// settle as one event instead of making scripts remember prior output.
+    pub fn report_observation(
+        &self,
+        key: ObservationKey,
+        level: String,
+    ) -> Result<ObservationAppend> {
+        self.append_observation(key, Some(level))
+    }
+
+    /// Remove a current key when an observer has established that the subject
+    /// or field no longer exists. Retiring an already absent key is quiet for
+    /// the same level-triggered reason as a repeated report.
+    pub fn retire_observation(&self, key: ObservationKey) -> Result<ObservationAppend> {
+        self.append_observation(key, None)
+    }
+
+    fn append_observation(
+        &self,
+        key: ObservationKey,
+        level: Option<String>,
+    ) -> Result<ObservationAppend> {
+        validate_observation_key(&key)?;
+        if let Some(level) = level.as_deref()
+            && level.trim().is_empty()
+        {
+            return Err(AlderError::validation("observation level cannot be empty"));
+        }
+        for _ in 0..OBSERVATION_APPEND_ATTEMPTS {
+            let snapshot = self.snapshot()?;
+            let current = snapshot.state.observations.get(&key);
+            let payload = match (current, level.as_deref()) {
+                (Some(observation), Some(level)) if observation.level == level => {
+                    return Ok(ObservationAppend::Unchanged {
+                        head: snapshot.head,
+                    });
+                }
+                (None, None) => {
+                    return Ok(ObservationAppend::Unchanged {
+                        head: snapshot.head,
+                    });
+                }
+                (_, Some(level)) => EventPayload::ObservationReported {
+                    observation: ObservationDefinition {
+                        key: key.clone(),
+                        level: level.to_owned(),
+                    },
+                },
+                (Some(_), None) => EventPayload::ObservationRetired { key: key.clone() },
+            };
+            match self.append_payload(&snapshot, payload) {
+                Ok(result) => return Ok(ObservationAppend::Appended(Box::new(result))),
+                Err(error) if error.code == "head_conflict" => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let event = if level.is_some() {
+            "observation.reported"
+        } else {
+            "observation.retired"
+        };
+        Err(AlderError::with_context(
+            "head_conflict",
+            format!(
+                "nothing was appended: `{event}` could not settle after repeated concurrent appends"
+            ),
+            json!({"appended": false, "event": event, "key": key}),
+        ))
     }
 
     fn append_payload_at(
@@ -1209,7 +1291,9 @@ mod tests {
     /// Every event a mutation can append, so the sweep below can prove it
     /// reached all of them. `EventPayload::type_name` is the compiler-checked
     /// list; this is the copy the sweep is measured against.
-    const EVERY_EVENT: [&str; 20] = [
+    const EVERY_EVENT: [&str; 22] = [
+        "observation.reported",
+        "observation.retired",
         "handoff.submitted",
         "handoff.integrated",
         "handoff.withdrawn",
@@ -1261,6 +1345,13 @@ mod tests {
         let (_, handoff) = log
             .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
             .unwrap();
+        let observation = ObservationKey {
+            observer: "tmux".to_owned(),
+            subject: "worker".to_owned(),
+            field: "liveness".to_owned(),
+        };
+        log.report_observation(observation.clone(), "present".to_owned())
+            .unwrap();
         let settled = log.snapshot().unwrap();
         let addition = GraphChangeDocument {
             why: Some("replan".to_owned()),
@@ -1272,6 +1363,30 @@ mod tests {
             .unwrap();
 
         let losing: Vec<(&str, Mutation<'_>)> = vec![
+            (
+                "observation.reported",
+                Box::new(|| {
+                    log.report_observation(observation.clone(), "absent".to_owned())
+                        .map(|result| match result {
+                            ObservationAppend::Appended(result) => *result,
+                            ObservationAppend::Unchanged { .. } => {
+                                panic!("a changed observation report was unexpectedly quiet")
+                            }
+                        })
+                }),
+            ),
+            (
+                "observation.retired",
+                Box::new(|| {
+                    log.retire_observation(observation.clone())
+                        .map(|result| match result {
+                            ObservationAppend::Appended(result) => *result,
+                            ObservationAppend::Unchanged { .. } => {
+                                panic!("a current observation retirement was unexpectedly quiet")
+                            }
+                        })
+                }),
+            ),
             (
                 "work.changed",
                 Box::new(|| {

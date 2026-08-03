@@ -21,7 +21,7 @@ manifest:
   "observers": [
     {
       "observer": "nimbus",
-      "list": "nimbus ls --json | jq '[.boxes[] | {value: .name, attempt_id: .labels.alder_attempt, metadata: {state: .state, estimated_cost: .estimated_cost}}]'"
+      "list": "nimbus ls --json | jq '[.boxes[] | {subject: .name, field: \"liveness\", level: .state}]'"
     }
   ]
 }
@@ -29,7 +29,8 @@ manifest:
 
 `schema` selects the manifest format. `prefix` supplies the repository object
 prefix. `store` locates the shared log. `observers` contains executable trusted
-observation commands and may change without producing a durable event.
+observation commands and may change without producing a durable event. Their
+output becomes durable only when Alder applies it through `refresh`.
 
 The prefix becomes immutable when the first work item or handoff is appended.
 Every later operation verifies the configured prefix against the log. A
@@ -65,6 +66,8 @@ host environment own those workflow policies.
 
 The initial event types are:
 
+- `observation.reported`
+- `observation.retired`
 - `handoff.submitted`
 - `handoff.integrated`
 - `handoff.withdrawn`
@@ -451,7 +454,8 @@ fresh observation.
 
 V0 has no observer plugin system or provider-specific Rust adapter. The
 manifest's `observers` array supplies at most one `list` command for each
-observer name, which becomes the handle kind.
+observer name. The name is the first component of every observation key and
+may also coincide with a handle kind.
 
 The command defines its own scope through its arguments, environment, and
 native tool configuration. If several scopes contribute to one kind, the
@@ -462,14 +466,17 @@ On success, standard output contains exactly one JSON array. Each entry has:
 
 | Field | Meaning |
 | --- | --- |
-| `value` | Opaque portion of the handle; Alder prefixes `<observer>:` |
-| `attempt_id` | Optional attempt ID stamped on the external object |
-| `metadata` | Optional open-ended JSON reported by the command |
+| `subject` | The observed thing, opaque to Alder |
+| `field` | A stable lower-case field name, such as `liveness` or `ci` |
+| `level` | The current value for that key, such as `present` or `passing` |
 
-Alder supplies status and observation time. Entries returned by a valid
-snapshot are `present`; commands do not emit statuses. Duplicate values,
-conflicting attempt IDs, surrounding prose, or any other schema violation
-invalidate the complete result.
+The configured observer name plus `(subject, field)` is the complete key.
+Duplicate keys, surrounding prose, or any other schema violation invalidates
+the complete result. A successful array is complete for its observer: omitted
+previous keys are retired. The old handle-inventory array is accepted during
+the migration and maps each returned value to `liveness=present` plus an
+`attempt-id` level when it carries one; new scripts must emit level reports
+directly.
 
 Observation configuration is executable trusted configuration. Alder does not
 interpolate event data or handle values into `list`. Launching remains the
@@ -650,27 +657,25 @@ Every ordinary read and mutation must first establish the current shared-log
 head from the configured remote, even when a local branch, remote-tracking
 ref, or SQLite projection appears current. Failure returns
 `store_unavailable`; local state is not silently treated as current.
-Observation-command failure is narrower and produces `unknown` only for that
-observation kind.
+Observation-command failure is narrower: it affects only that observer run
+and does not append a replacement level.
 
-## Observed state
+## Observations
 
-External observations are local SQLite rows, not durable events. They form an
-inventory rather than merely annotating the attempts Alder already knows:
+Observations are durable beliefs about the external world. Their folded
+snapshot has one entry per `(observer, subject, field)` key:
 
 | Field | Meaning |
 | --- | --- |
-| `handle` | Observed external handle |
-| `attempt_id` | Optional attempt ID found on the external object |
-| `status` | `present`, `absent`, or `unknown` |
-| `metadata` | Open-ended JSON reported by the observation command |
-| `observed_at` | Freshness stamp |
-| `detail` | Observation-command diagnostic text |
+| `observer` | Configured script name that owns the key |
+| `subject` | Opaque observed thing |
+| `field` | Stable aspect of that subject |
+| `level` | The newest reported value |
+| `reported_seq` | Sequence of the winning report |
 
-The inventory includes unbound objects. A Nimbus command, for example, may
-report every provisioned box whether or not a work attempt currently uses it.
-This is how leaked or unexpectedly expensive environment state becomes
-visible without turning Alder into the allocator.
+`observation.reported` replaces a key's level and `observation.retired`
+removes it when the key no longer exists. A same-level report appends nothing:
+this is a belief log, not a sensor trace.
 
 For each configured kind, Alder runs `list` through a fixed shell wrapper with
 pipefail enabled. One execution may run for 20 seconds. A failed execution,
@@ -678,35 +683,26 @@ timeout, malformed JSON, or invalid result set is retried up to three times
 after the initial execution, for at most four executions. The first valid
 complete snapshot wins.
 
-Failed standard output is discarded. After all executions fail, handles of
-that kind are `unknown`; Alder retains bounded final-execution diagnostics and
-never infers absence. A timeout terminates the complete shell pipeline, not
-only its parent shell.
+Failed standard output is discarded. After all executions fail, Alder retains
+bounded final-execution diagnostics but appends no replacement belief. A
+timeout terminates the complete shell pipeline, not only its parent shell.
 
-After a valid snapshot:
+After a valid snapshot, each returned level is applied through the observation
+append path and every omitted prior key for that observer is retired.
 
-- every returned value is `present`;
-- a durable bound handle of that kind which is omitted is `absent`;
-- the current unbound inventory for that kind is replaced by the returned
-  unbound values.
-
-`unknown` is not `absent`. An unreachable command or provider must not trigger
-automatic cancellation.
-
-`alder refresh` performs the read-only sweep. `alder reconcile` normally
-refreshes first, then compares the inventory with durable attempts:
+`alder refresh` performs this scheduled ingestion. `alder reconcile` normally
+refreshes first, then compares liveness observations with durable attempts:
 
 - active attempt with its handle present: healthy;
-- active attempt with its handle confirmed absent: possible lost attempt;
-- unbound starting attempt with a discovered matching attempt ID: bindable;
-- live handle stamped with an ended or unknown attempt: orphan or collision;
-- any object observed through an unavailable provider: unknown.
+- active attempt whose handle is omitted from a fresh complete snapshot:
+  possible lost attempt;
+- unbound starting attempt: launch or end it through an ordinary repair;
+- failed observer command: no new liveness belief and no destructive action.
 
 Reconciliation turns these comparisons into findings and suggested ordinary
-commands. It never appends an event or acts on a provider. A caller that
-accepts a repair invokes the suggested mutation separately. Provider-reported
-existence, lifecycle, and cost remain observations; the provider remains
-authoritative.
+commands. It never acts on a provider. A caller that accepts a repair invokes
+the suggested mutation separately. Provider-reported existence, lifecycle, and
+cost remain observations; the provider remains authoritative.
 
 ## Projection lifecycle
 
@@ -718,14 +714,9 @@ one SQLite transaction; the represented head is committed in the same
 transaction.
 
 V0 has no incremental projection update path. A successful append does not
-write SQLite, so the next command observes the mismatch and rebuilds. Local
-observation tables are not derived from the durable log and survive this
-rebuild.
-
-Local observation storage also retains the latest `refresh` execution summary
-for each configured kind: execution count, duration, success or failure,
-bounded stderr, validation error, and snapshot time. This powers
-`alder debug observations`; it is not durable history.
+write SQLite, so the next command observes the mismatch and rebuilds. The
+observation snapshot is part of that durable fold. Diagnostic `--run` output
+is transient and never becomes an observation source.
 
 ## Required projections
 
@@ -741,7 +732,6 @@ The initial SQLite projection exposes:
 - `in_flight`
 - `blocked`
 - `downstream`
-- `observed_handles`
 - `passes`
 - `pass_open`
 - `loop_control`

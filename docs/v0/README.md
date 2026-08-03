@@ -38,9 +38,10 @@ is to a pass. These are namespaced separately from the six core structures
 because they describe how the project is being driven rather than what the
 project owes. [LOOP.md](LOOP.md) defines them.
 
-Events are stored in Git. Current state is a deterministic fold of those
-events into a local SQLite database. Observations from external systems are
-refreshed into separate, local tables and never outrank a fresh observation.
+Events are stored in Git. Current state, including observations from external
+systems, is a deterministic fold of those events into a local SQLite database.
+Observer execution diagnostics remain local; an observer's reported level is
+durable only when it changes the folded picture.
 
 The primary user is an agent driving a project. A repository skill may call
 that agent the leader, but Alder stores no leader, generation, lease, or
@@ -232,19 +233,17 @@ provenance such as engine, host, model, or toolchain. Alder stores and displays
 that metadata but never makes core state transitions depend on its keys.
 
 Observation commands are small shell pipelines over tools already present in
-the environment. Each command owns one handle kind and prints a normalized
-JSON array representing a complete current snapshot. It may also discover
-unbound handles, such as boxes reported by Nimbus. `alder refresh` stores this
-inventory locally; `alder reconcile` compares it with durable attempts and
-proposes repairs. Observation is read-only and remains separate from action.
-`reconcile` never appends; a caller performs any repair through the ordinary
-mutating command it suggests.
+the environment. Each command owns one observer name and prints a normalized
+JSON array of current levels keyed by subject and field. `alder refresh`
+appends only changed levels and retires omitted keys, so the shared log is the
+current observation picture. `alder reconcile` compares that picture with
+durable attempts and proposes repairs; it never acts on a provider.
 
 Alder runs each command with fixed pipefail semantics, a 20-second timeout per
 execution, and up to three retries after the initial execution. Only an
-exit-zero, valid, complete result can establish presence or absence. Exhausted
-failures, timeouts, malformed JSON, and invalid result sets make that kind
-unknown.
+exit-zero, valid, complete result can report a current level. Exhausted
+failures, timeouts, malformed JSON, and invalid result sets append no new
+belief.
 
 Finite capacity is initially enforced by the repository's allocator or the
 external platform. The cloud provider remains authoritative for what exists
@@ -331,14 +330,14 @@ transaction. V0 performs no incremental projection updates, and a successful
 append deliberately leaves the projection out of date for the next command to
 rebuild.
 
-External observation tables are local input rather than a fold of the durable
-log. `refresh` updates them independently, and rebuilding the durable
-projection preserves them.
+The observation snapshot is a fold of durable `observation.*` events. A
+successful `refresh` appends only levels that change that picture; an unchanged
+run leaves both the log and SQLite projection untouched.
 
 An ordinary read or mutation must establish the current shared-log head. If it
 cannot, Alder returns `store_unavailable`; it never silently presents the
-local projection as current. An unavailable observation command instead makes
-only that observation kind `unknown`.
+local projection as current. An unavailable observation command instead
+appends no replacement belief.
 
 ## Non-goals for v0
 

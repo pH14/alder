@@ -7,18 +7,60 @@ use crate::error::{AlderError, Result};
 
 use super::{
     Attempt, AttemptCheck, AttemptOutcome, AttemptState, CheckStatus, Event, EventPayload, Handoff,
-    HandoffState, LoopControl, Pass, PassState, Question, QuestionAnswer, Work, WorkOperation,
-    WorkState, WorkStateChange,
+    HandoffState, LoopControl, Observation, ObservationKey, Pass, PassState, Question,
+    QuestionAnswer, Work, WorkOperation, WorkState, WorkStateChange,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectState {
+    #[serde(with = "observation_map")]
+    pub observations: BTreeMap<ObservationKey, Observation>,
     pub handoffs: BTreeMap<String, Handoff>,
     pub work: BTreeMap<String, Work>,
     pub attempts: BTreeMap<String, Attempt>,
     pub questions: BTreeMap<String, Question>,
     pub passes: BTreeMap<String, Pass>,
     pub loop_control: LoopControl,
+}
+
+mod observation_map {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+
+    use super::{Observation, ObservationKey};
+
+    pub fn serialize<S>(
+        observations: &BTreeMap<ObservationKey, Observation>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        observations
+            .values()
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<BTreeMap<ObservationKey, Observation>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let observations = Vec::<Observation>::deserialize(deserializer)?;
+        let mut folded = BTreeMap::new();
+        for observation in observations {
+            if folded
+                .insert(observation.key.clone(), observation)
+                .is_some()
+            {
+                return Err(D::Error::custom("duplicate observation key"));
+            }
+        }
+        Ok(folded)
+    }
 }
 
 impl ProjectState {
@@ -66,6 +108,32 @@ impl ProjectState {
     fn apply_in_place(&mut self, event: &Event) -> Result<()> {
         let seq = event.seq;
         match &event.payload {
+            EventPayload::ObservationReported { observation } => {
+                validate_observation_key(&observation.key)?;
+                require_text("observation level", &observation.level)?;
+                self.observations.insert(
+                    observation.key.clone(),
+                    Observation {
+                        key: observation.key.clone(),
+                        level: observation.level.clone(),
+                        reported_seq: seq,
+                    },
+                );
+            }
+            EventPayload::ObservationRetired { key } => {
+                validate_observation_key(key)?;
+                if self.observations.remove(key).is_none() {
+                    return Err(AlderError::with_context(
+                        "not_found",
+                        "observation key is not current",
+                        json!({
+                            "observer": key.observer,
+                            "subject": key.subject,
+                            "field": key.field,
+                        }),
+                    ));
+                }
+            }
             EventPayload::HandoffSubmitted { handoff } => {
                 if self.handoffs.contains_key(&handoff.id) {
                     return Err(AlderError::validation(format!(
@@ -997,6 +1065,28 @@ fn require_text(field: &str, value: &str) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+pub fn validate_observation_key(key: &ObservationKey) -> Result<()> {
+    if !valid_name(&key.observer) {
+        return Err(AlderError::validation(format!(
+            "observation observer `{}` is not a valid name",
+            key.observer
+        )));
+    }
+    if !valid_name(&key.field) {
+        return Err(AlderError::validation(format!(
+            "observation field `{}` is not a valid name",
+            key.field
+        )));
+    }
+    require_text("observation subject", &key.subject)?;
+    if key.subject.contains('\0') {
+        return Err(AlderError::validation(
+            "observation subject cannot contain a NUL character",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_check(check: &super::CheckDefinition) -> Result<()> {
@@ -2321,5 +2411,30 @@ mod tests {
             error.context["cycle"],
             json!(["hm-a", "hm-c", "hm-b", "hm-a"])
         );
+    }
+
+    #[test]
+    fn observation_picture_serializes_as_an_ordered_list_not_a_synthetic_key() {
+        let mut state = ProjectState::default();
+        state
+            .apply(&event(
+                1,
+                EventPayload::ObservationReported {
+                    observation: super::super::ObservationDefinition {
+                        key: ObservationKey {
+                            observer: "github".to_owned(),
+                            subject: "owner/repo#171".to_owned(),
+                            field: "ci".to_owned(),
+                        },
+                        level: "passing".to_owned(),
+                    },
+                },
+            ))
+            .unwrap();
+
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(value["observations"][0]["level"], "passing");
+        let round_trip: ProjectState = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip.observations, state.observations);
     }
 }

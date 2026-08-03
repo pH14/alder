@@ -143,20 +143,21 @@ override flag.
 
 An active worker disappears without producing an event.
 
-A fresh observation must report `absent`; Alder must surface the attempt as
-needing reconciliation. Ending it as `lost` returns its work to open. To leave
-the work blocked, block the work first and then end the attempt.
+A fresh complete observation must retire its `liveness` key. Reconciliation of
+that fresh snapshot must surface the attempt as needing repair. Ending it as
+`lost` returns its work to open. To leave the work blocked, block the work
+first and then end the attempt.
 
-Status must expose the relevant progress and observation times, but Alder must
-not derive a `stale` state or require a configured inactivity threshold. The
+Status must expose the relevant progress and folded levels, but Alder must not
+derive a `stale` state or require a configured inactivity threshold. The
 driving agent decides whether elapsed time indicates a problem.
 
 ### A12. Observation outage
 
 Make an observation command or code host unreachable.
 
-The observation must be `unknown`, not `absent`. Reconciliation must not
-suggest a destructive repair based on the outage alone.
+The failed command must append no level and retire no key. Reconciliation must
+not suggest a destructive repair based on the outage alone.
 
 ### A13. External completion
 
@@ -247,11 +248,11 @@ freshness, rather than reconstructing a narrative from its context window.
 Configure a `nimbus` observation command that reports several provisioned
 boxes, including one not associated with an Alder attempt.
 
-`refresh` must retain the read-only inventory locally. `reconcile` must surface
-the unbound box and its provider-reported cost metadata without creating work,
-an attempt, or an accounting event.
+`refresh` must fold the reported levels into the shared snapshot without
+creating work, an attempt, or an accounting event. Provider-specific cost can
+be a level under a distinct field.
 
-If Nimbus is unreachable, its objects become unknown rather than absent.
+If Nimbus is unreachable, it appends no replacement level and retires no key.
 
 ### A20. Handle variety
 
@@ -276,36 +277,40 @@ first handle records `attempt.bound`; there is no public `bind` command.
 Record a handle on an attempt, then remove its observation command.
 
 The log must still replay, and the attempt and handle must remain visible.
-Status must say that no fresh observation is available rather than treating
-the handle as invalid, absent, or ended.
+Previously reported levels remain in the folded snapshot. Removing a command
+must not rewrite a key as invalid, absent, or ended.
 
 ### A22. Observation execution and refresh
 
 Change the external environment after a refresh.
 
-- `refresh` must update local observations without appending;
+- `refresh` must append only observation levels that change the folded
+  snapshot; an unchanged repeat appends nothing;
 - ordinary `reconcile` must refresh before comparing;
-- `reconcile --no-refresh` must use the existing inventory and show its age;
-- `reconcile` must never append an event or act on a provider;
+- `reconcile --no-refresh` must use the existing folded snapshot;
+- `reconcile` may append only the observation changes caused by its refresh
+  and must never act on a provider;
 - a caller that accepts a suggested repair must invoke its ordinary mutating
   command separately.
 
 Exercise one configured `list` command for each result:
 
 - an exit-zero valid array is treated as one complete snapshot;
-- returned values are present and an omitted durable handle of that kind is
-  absent;
+- each returned `(subject, field, level)` is applied as one current level and
+  an omitted prior key of that observer is retired;
 - pipeline failure must be visible even when its final command would
   otherwise exit successfully;
-- a nonzero exit, timeout, malformed JSON, duplicate value, or conflicting
-  attempt ID must invalidate the complete result;
+- a nonzero exit, timeout, malformed JSON, or duplicate key must invalidate
+  the complete result;
 - each failure receives three retries after the initial execution, with a
   20-second timeout for each execution;
 - failed standard output must be discarded, and four failed executions must
-  make the kind unknown without inferring absence;
+  append no belief and retire no key;
 - a timeout must terminate the complete command pipeline.
 
-The first valid retry result must replace the current snapshot exactly once.
+The first valid retry result must update every changed reported key and retire
+every prior key omitted from that observer's complete snapshot. A second
+identical refresh appends nothing.
 An observation command may not receive event or handle values through shell
 interpolation.
 
@@ -318,7 +323,10 @@ updating SQLite, and then run a query.
   table from the complete ordered log;
 - the rebuilt tables and represented head must commit in one SQLite
   transaction;
-- local observation tables must survive the rebuild;
+- the folded observation snapshot must rebuild from the log exactly with the
+  other durable tables;
+- local execution diagnostics may survive the rebuild but cannot supply
+  current observation state;
 - no incremental projection update path is required.
 
 Log inspection, database rebuild and verification, raw read-only queries, and
@@ -330,12 +338,14 @@ observation diagnostics must exist only under:
 - `alder debug observations`
 
 There must be no generic append command and no top-level `log`, `db`, or
-`query` or `observations` namespace competing with the ordinary workflow.
+`query` namespace competing with the ordinary workflow. `observations` is the
+named global snapshot query, and `observation report|retire` are its two
+noun-first mutations.
 
 `alder debug observations` must expose configured and unconfigured kinds plus
-the latest execution summary. Its `<kind> --run` form must show executions,
-validation, normalized output, and bounded stderr without updating observation
-tables.
+their folded keys. Its `<kind> --run` form must show executions, validation,
+normalized output, and bounded stderr without appending observation
+events.
 
 ### A24. Asynchronous handoff
 
@@ -436,7 +446,7 @@ configuration does not append a domain event.
 
 If the shared Git head cannot be read, an ordinary read or mutation fails with
 `store_unavailable`; Alder does not present cached SQLite data as current. A
-failed observation command instead makes only that observer kind `unknown`.
+failed observation command instead appends no replacement level.
 
 ### A28. Crashed pass
 
@@ -531,19 +541,17 @@ Resolving an unknown push outcome by event ID must not duplicate the pass end.
 
 ### A34. Refresh change detection
 
-Configure an observation command whose metadata moves on every execution — a
-cost ticker, an uptime — while its handles, presence, and attempt bindings stay
-the same.
+Configure an observation command that repeats one level, then changes it and
+finally omits the key.
 
-- the first refresh into an empty inventory must report `"changed": true`;
-- every later refresh must report `false`, however much metadata moved;
-- losing a handle, gaining one, or a handle presenting a different attempt ID
-  must each report `true` once and `false` on the next unchanged refresh;
-- an observation outage must report `true` when it turns a kind unknown, and
-  `false` while it stays unknown.
+- the first refresh into an empty snapshot must report `"changed": true`;
+- every later identical refresh must report `false` and append no event;
+- a changed level and a retired key must each report `true` once and `false`
+  on the next unchanged refresh;
+- an observation outage must append no event and leave `changed` false.
 
-A false positive here wakes an agent for nothing, so the metadata exclusion is
-a requirement rather than an optimization.
+A false positive here wakes an agent for nothing, so append-layer newness is a
+requirement rather than an optimization.
 
 ## Paper replay gate
 

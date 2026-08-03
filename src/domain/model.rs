@@ -40,6 +40,10 @@ impl EventDraft {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "body")]
 pub enum EventPayload {
+    #[serde(rename = "observation.reported")]
+    ObservationReported { observation: ObservationDefinition },
+    #[serde(rename = "observation.retired")]
+    ObservationRetired { key: ObservationKey },
     #[serde(rename = "handoff.submitted")]
     HandoffSubmitted { handoff: HandoffDefinition },
     #[serde(rename = "handoff.integrated")]
@@ -123,6 +127,8 @@ impl EventPayload {
     /// sweeps every mutation for how it reports losing a compare-and-append.
     pub fn type_name(&self) -> &'static str {
         match self {
+            Self::ObservationReported { .. } => "observation.reported",
+            Self::ObservationRetired { .. } => "observation.retired",
             Self::HandoffSubmitted { .. } => "handoff.submitted",
             Self::HandoffIntegrated { .. } => "handoff.integrated",
             Self::HandoffWithdrawn { .. } => "handoff.withdrawn",
@@ -148,6 +154,9 @@ impl EventPayload {
 
     pub fn references(&self, id: &str) -> bool {
         match self {
+            // Observations have a composite key rather than an Alder object
+            // ID, so their current picture is served by `observations`.
+            Self::ObservationReported { .. } | Self::ObservationRetired { .. } => false,
             Self::HandoffSubmitted { handoff } => handoff.id == id,
             Self::HandoffIntegrated { handoff_id, work } => handoff_id == id || work.id == id,
             Self::HandoffWithdrawn { handoff_id, .. } => handoff_id == id,
@@ -185,6 +194,33 @@ impl EventPayload {
             | Self::LoopNudgeRequested { .. } => false,
         }
     }
+}
+
+/// A key in the observation application. Its three parts are deliberately
+/// explicit in every event and snapshot; no caller has to parse a synthetic
+/// string to learn who reported what about which subject.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ObservationKey {
+    pub observer: String,
+    pub subject: String,
+    pub field: String,
+}
+
+/// The level supplied by an observer before the fold assigns its sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationDefinition {
+    #[serde(flatten)]
+    pub key: ObservationKey,
+    pub level: String,
+}
+
+/// One current belief in the folded observation picture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Observation {
+    #[serde(flatten)]
+    pub key: ObservationKey,
+    pub level: String,
+    pub reported_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
