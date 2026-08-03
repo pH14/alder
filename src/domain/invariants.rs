@@ -35,8 +35,6 @@
 //! checker has the state space. They stay there. A predicate that is true of a
 //! single state is the only shape this module has.
 
-use std::collections::BTreeSet;
-
 use alder_log::Record;
 
 use super::{Event, EventPayload, PassOutcome, PassState, ProjectState, decode_record};
@@ -133,49 +131,6 @@ pub fn rotate_pending_mirrors_the_request_log(state: &ProjectState, events: &[Ev
     state.loop_control.rotate_pending() == rotation_is_pending(events)
 }
 
-/// An acknowledged handoff is never lost.
-///
-/// `acknowledged` names the submissions whose writer saw a receipt — the fact
-/// no log can supply, since a writer that lost its response cannot be
-/// distinguished from one whose append never landed by reading the log alone.
-/// Each of those must appear in the history exactly once and must have folded
-/// into a handoff the state still knows about. Withdrawn or integrated counts
-/// as kept: those are things someone did to the handoff, not the log dropping
-/// it.
-///
-/// Every other submission is held to the weaker half the same property implies.
-/// A writer that retries an identical draft after a lost response is answered
-/// `AlreadyPresent` rather than appended a second time, so no submission at all
-/// — acknowledged or still in doubt — may appear twice.
-pub fn acknowledged_handoffs_are_never_lost(
-    state: &ProjectState,
-    events: &[Event],
-    acknowledged: &[&str],
-) -> bool {
-    let submissions: Vec<(&str, &str)> = events
-        .iter()
-        .filter_map(|event| match &event.payload {
-            EventPayload::HandoffSubmitted { handoff } => {
-                Some((event.id.as_str(), handoff.id.as_str()))
-            }
-            _ => None,
-        })
-        .collect();
-    let mut seen = BTreeSet::new();
-    if !submissions
-        .iter()
-        .all(|(event_id, _)| seen.insert(*event_id))
-    {
-        return false;
-    }
-    acknowledged.iter().all(|acknowledged| {
-        submissions
-            .iter()
-            .find(|(event_id, _)| event_id == acknowledged)
-            .is_some_and(|(_, handoff_id)| state.handoffs.contains_key(*handoff_id))
-    })
-}
-
 /// Whether a rotation is outstanding, read straight off the history.
 ///
 /// A request is a `loop.rotation_requested`, or a `pass.ended` that asked for
@@ -200,9 +155,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::domain::{
-        EventDraft, HandoffDefinition, Pass, PassDefinition, PassTrigger, encode_draft,
-    };
+    use crate::domain::{EventDraft, Pass, PassDefinition, PassTrigger, encode_draft};
 
     const SCHEMA: &str = "alder.event.v0";
 
@@ -272,20 +225,6 @@ mod tests {
                 wake_at: None,
                 rotate,
                 why: None,
-            },
-        )
-    }
-
-    fn submission(id: &str, handoff_id: &str) -> EventDraft {
-        draft(
-            id,
-            EventPayload::HandoffSubmitted {
-                handoff: HandoffDefinition {
-                    id: handoff_id.to_owned(),
-                    title: "a handoff".to_owned(),
-                    artifact_ref: "branch:somewhere".to_owned(),
-                    note: None,
-                },
             },
         )
     }
@@ -479,68 +418,5 @@ mod tests {
         // history still holds it, so the two derivations must part company.
         state.loop_control.rotate_requested_seq = None;
         assert!(!rotate_pending_mirrors_the_request_log(&state, &history));
-    }
-
-    #[test]
-    fn an_acknowledged_submission_present_once_survives() {
-        let (history, state) = folded(vec![submission("submit-1", "al-handoff-one")]);
-        assert!(acknowledged_handoffs_are_never_lost(
-            &state,
-            &history,
-            &["submit-1"]
-        ));
-    }
-
-    #[test]
-    fn an_acknowledged_submission_that_left_the_history_is_lost() {
-        let (history, state) = folded(vec![wake("wake-1", "al-pass-1")]);
-        assert!(!acknowledged_handoffs_are_never_lost(
-            &state,
-            &history,
-            &["submit-1"]
-        ));
-    }
-
-    #[test]
-    fn a_submission_nobody_acknowledged_may_simply_be_absent() {
-        let (history, state) = folded(vec![wake("wake-1", "al-pass-1")]);
-        assert!(acknowledged_handoffs_are_never_lost(&state, &history, &[]));
-    }
-
-    #[test]
-    fn a_submission_appended_twice_is_a_lost_update() {
-        // A real store answers the retried draft `AlreadyPresent`, so this
-        // history is forged — which is the point: the predicate has to fail on
-        // the shape a store that stopped being idempotent would produce.
-        let (history, state) = folded(vec![submission("submit-1", "al-handoff-one")]);
-        let mut duplicated = history.clone();
-        duplicated.push(Event {
-            seq: 2,
-            ..history[0].clone()
-        });
-        assert!(acknowledged_handoffs_are_never_lost(
-            &state,
-            &history,
-            &["submit-1"]
-        ));
-        assert!(!acknowledged_handoffs_are_never_lost(
-            &state,
-            &duplicated,
-            &["submit-1"]
-        ));
-    }
-
-    #[test]
-    fn a_submission_the_fold_never_took_is_lost_even_when_the_record_is_there() {
-        // The record is in the history and the writer was told so, but no
-        // handoff came out of the fold. Counting records alone would call that
-        // kept; it is not.
-        let history = events(vec![submission("submit-1", "al-handoff-one")]);
-        let empty = ProjectState::default();
-        assert!(!acknowledged_handoffs_are_never_lost(
-            &empty,
-            &history,
-            &["submit-1"]
-        ));
     }
 }

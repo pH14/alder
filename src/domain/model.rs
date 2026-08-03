@@ -40,15 +40,18 @@ impl EventDraft {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "body")]
 pub enum EventPayload {
+    // Kept solely to decode events written before handoffs were removed. The
+    // fold deliberately ignores them, so they remain visible as history but
+    // cannot create or change current state.
     #[serde(rename = "handoff.submitted")]
-    HandoffSubmitted { handoff: HandoffDefinition },
+    LegacyHandoffSubmitted { handoff: LegacyHandoffDefinition },
     #[serde(rename = "handoff.integrated")]
-    HandoffIntegrated {
+    LegacyHandoffIntegrated {
         handoff_id: String,
         work: WorkDefinition,
     },
     #[serde(rename = "handoff.withdrawn")]
-    HandoffWithdrawn { handoff_id: String, why: String },
+    LegacyHandoffWithdrawn { handoff_id: String, why: String },
     #[serde(rename = "work.changed")]
     WorkChanged {
         why: Option<String>,
@@ -123,9 +126,9 @@ impl EventPayload {
     /// sweeps every mutation for how it reports losing a compare-and-append.
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::HandoffSubmitted { .. } => "handoff.submitted",
-            Self::HandoffIntegrated { .. } => "handoff.integrated",
-            Self::HandoffWithdrawn { .. } => "handoff.withdrawn",
+            Self::LegacyHandoffSubmitted { .. } => "handoff.submitted",
+            Self::LegacyHandoffIntegrated { .. } => "handoff.integrated",
+            Self::LegacyHandoffWithdrawn { .. } => "handoff.withdrawn",
             Self::WorkChanged { .. } => "work.changed",
             Self::WorkFinished { .. } => "work.finished",
             Self::WorkDropped { .. } => "work.dropped",
@@ -148,9 +151,9 @@ impl EventPayload {
 
     pub fn references(&self, id: &str) -> bool {
         match self {
-            Self::HandoffSubmitted { handoff } => handoff.id == id,
-            Self::HandoffIntegrated { handoff_id, work } => handoff_id == id || work.id == id,
-            Self::HandoffWithdrawn { handoff_id, .. } => handoff_id == id,
+            Self::LegacyHandoffSubmitted { handoff } => handoff.id == id,
+            Self::LegacyHandoffIntegrated { handoff_id, work } => handoff_id == id || work.id == id,
+            Self::LegacyHandoffWithdrawn { handoff_id, .. } => handoff_id == id,
             Self::WorkChanged { operations, .. } => operations.iter().any(|operation| {
                 operation.id() == id
                     || operation
@@ -188,34 +191,12 @@ impl EventPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HandoffDefinition {
+pub struct LegacyHandoffDefinition {
     pub id: String,
     pub title: String,
     #[serde(rename = "ref")]
     pub artifact_ref: String,
     pub note: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HandoffState {
-    Submitted,
-    Integrated,
-    Withdrawn,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Handoff {
-    pub id: String,
-    pub title: String,
-    #[serde(rename = "ref")]
-    pub artifact_ref: String,
-    pub note: Option<String>,
-    pub state: HandoffState,
-    pub submitted_seq: u64,
-    pub work_id: Option<String>,
-    pub integrated_seq: Option<u64>,
-    pub withdrawn_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -615,8 +596,8 @@ mod tests {
     fn payload_names_and_references_cover_every_variant() {
         let cases = vec![
             (
-                EventPayload::HandoffSubmitted {
-                    handoff: HandoffDefinition {
+                EventPayload::LegacyHandoffSubmitted {
+                    handoff: LegacyHandoffDefinition {
                         id: "handoff".to_owned(),
                         title: "handoff".to_owned(),
                         artifact_ref: "ref".to_owned(),
@@ -627,7 +608,7 @@ mod tests {
                 vec!["handoff"],
             ),
             (
-                EventPayload::HandoffIntegrated {
+                EventPayload::LegacyHandoffIntegrated {
                     handoff_id: "handoff".to_owned(),
                     work: work("work", Vec::new()),
                 },
@@ -635,7 +616,7 @@ mod tests {
                 vec!["handoff", "work"],
             ),
             (
-                EventPayload::HandoffWithdrawn {
+                EventPayload::LegacyHandoffWithdrawn {
                     handoff_id: "handoff".to_owned(),
                     why: "reason".to_owned(),
                 },

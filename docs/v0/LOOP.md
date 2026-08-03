@@ -232,8 +232,8 @@ pass; it does not stop passes. `loop pause` stops passes.
 ## Nudging
 
 A nudge is the operator's "wake it now". The last pass may have picked a long
-wake honestly and then the world changed — an answer landed, a handoff is
-waiting — and `loop nudge` asks the driver to run the next pass ahead of that
+wake honestly and then the world changed — an answer landed or a new work item
+was filed — and `loop nudge` asks the driver to run the next pass ahead of that
 schedule. The driver reports a pending nudge as the `manual` trigger and lets
 it override both of its deferrals, the debounce and the attached-client hold,
 the way the `maxIntervalSeconds` ceiling does: a nudge is the human overriding
@@ -308,8 +308,8 @@ driver repeats those kinds in the message it injects.
 
 **Trigger kinds are informational. They are never scope limiters.**
 
-A pass woken by `observations` runs its complete sync — status, handoffs,
-reconcile, questions, selection — exactly like a pass woken by `due`. The
+A pass woken by `observations` runs its complete sync — status, reconcile,
+questions, selection — exactly like a pass woken by `due`. The
 driver cannot know what else changed while it was not looking, and the whole
 point of a durable log is that the leader does not have to be told; it
 reads.

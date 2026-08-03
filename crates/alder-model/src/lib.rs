@@ -35,8 +35,8 @@ use std::hash::{Hash, Hasher};
 use alder::app::loop_section;
 use alder::cli::TriggerKind;
 use alder::domain::{
-    Event, EventDraft, EventPayload, HandoffDefinition, PassDefinition, PassOutcome, PassTrigger,
-    ProjectState, decode_record, encode_draft, invariants,
+    Event, EventDraft, EventPayload, PassDefinition, PassOutcome, PassTrigger, ProjectState,
+    decode_record, encode_draft, invariants,
 };
 use alder_log::{AppendDisposition, Log, LogError, MemoryLog, Record, RecordDraft};
 use alderd::config::Config;
@@ -75,9 +75,6 @@ pub struct Scenario {
     pub phone_rotation: bool,
     /// The second writer may pause the loop with a stated reason.
     pub phone_pause: bool,
-    /// The second writer may submit one handoff, including a lost-response
-    /// retry of the identical draft.
-    pub phone_handoff: bool,
     /// A pass may end with `rotate: true` (budget: once).
     pub leader_rotate: bool,
     /// How many daemon process crashes may be injected.
@@ -95,7 +92,6 @@ impl Scenario {
             phone_wake: false,
             phone_rotation: false,
             phone_pause: false,
-            phone_handoff: false,
             leader_rotate: false,
             daemon_crashes: 0,
             session_crashes: 0,
@@ -204,7 +200,6 @@ pub enum DaemonCtl {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Phone {
     pub wake: PhoneWake,
-    pub handoff: PhoneHandoff,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -216,20 +211,6 @@ pub enum PhoneWake {
     },
     /// The one attempt was spent, appended or conceded.
     Spent,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum PhoneHandoff {
-    NotYet,
-    /// The submission pinned this head; a conflict re-arms at the new head,
-    /// which is the real retry loop.
-    Armed {
-        expected: u64,
-    },
-    /// The append landed but the response was lost; the writer must retry
-    /// the identical draft and be answered `AlreadyPresent`.
-    Unsure,
-    Done,
 }
 
 /// Verification bookkeeping that is not part of any process's state. Latches
@@ -256,10 +237,6 @@ pub struct Ghosts {
     pub conceded: bool,
     /// A `pass.started` append lost the CAS race.
     pub wake_conflicted: bool,
-    /// A handoff append lost the CAS race and re-armed.
-    pub handoff_conflicted: bool,
-    /// An identical retried draft was absorbed as `AlreadyPresent`.
-    pub already_present: bool,
     /// A daemon crash landed between the durable wake and the injection,
     /// stranding a recorded pass no engine was ever told to run.
     pub pass_recorded_uninjected: bool,
@@ -306,13 +283,6 @@ pub enum ProtocolAction {
     PhoneWakeArm,
     PhoneWakeAppend,
     PhoneEndPass,
-    PhoneHandoffArm,
-    /// Append and see the receipt.
-    PhoneHandoffAppendAcked,
-    /// Append, but the response is lost before the writer sees it.
-    PhoneHandoffAppendLost,
-    /// Retry the identical draft after a lost response.
-    PhoneHandoffRetry,
 }
 
 /// Rebuild a real in-process log from the recorded history. Replay goes
@@ -408,7 +378,6 @@ fn typed_draft(id: &str, actor: &str, payload: EventPayload) -> RecordDraft {
 
 enum AppendOutcome {
     Appended(Vec<Record>),
-    AlreadyPresent(Vec<Record>),
     Conflicted,
 }
 
@@ -427,7 +396,9 @@ fn append_at(records: &[Record], expected_seq: u64, draft: &RecordDraft) -> Appe
             let complete = store.read_all(&head).expect("a complete read");
             match receipt.disposition {
                 AppendDisposition::Appended => AppendOutcome::Appended(complete),
-                AppendDisposition::AlreadyPresent => AppendOutcome::AlreadyPresent(complete),
+                AppendDisposition::AlreadyPresent => {
+                    panic!("the model never retries an identical draft")
+                }
             }
         }
         Err(LogError::HeadConflict { .. }) => AppendOutcome::Conflicted,
@@ -436,28 +407,13 @@ fn append_at(records: &[Record], expected_seq: u64, draft: &RecordDraft) -> Appe
 }
 
 /// Append at the current head. For appends whose read-write gap the model
-/// does not explore; the interesting gaps all sit in the wake and handoff
-/// paths, which go through [`append_at`] with a pinned head.
+/// does not explore; the interesting gaps all sit in the wake path, which
+/// goes through [`append_at`] with a pinned head.
 fn append_now(records: &[Record], draft: &RecordDraft) -> Vec<Record> {
     match append_at(records, records.len() as u64, draft) {
         AppendOutcome::Appended(complete) => complete,
         _ => panic!("an append at the current head lands"),
     }
-}
-
-fn handoff_draft() -> RecordDraft {
-    typed_draft(
-        "phone-handoff-1",
-        PHONE_ACTOR,
-        EventPayload::HandoffSubmitted {
-            handoff: HandoffDefinition {
-                id: "hm-handoff-model".to_owned(),
-                title: "a handoff from the phone".to_owned(),
-                artifact_ref: "branch:phone-session".to_owned(),
-                note: None,
-            },
-        },
-    )
 }
 
 fn consume_rotation(ghosts: &mut Ghosts, consumer: Consumer) {
@@ -592,7 +548,7 @@ impl Scenario {
                     id: pass_id,
                     // What the decision resolved and asked for, not what a
                     // default host happens to run: a Codex-configured loop
-                    // records `codex`, and a handoff-woken pass records `log`.
+                    // records the engine selected by the current decision.
                     engine: engine.clone(),
                     handle: daemon_handle(&self.config),
                     triggers: triggers.clone(),
@@ -618,7 +574,6 @@ impl Scenario {
                 // driver concedes and reads the fold again next poll.
                 state.daemon.ctl = DaemonCtl::Idle;
             }
-            AppendOutcome::AlreadyPresent(_) => return None,
         }
         Some(())
     }
@@ -708,7 +663,6 @@ impl Scenario {
                 consume_rotation(&mut state.ghosts, Consumer::Phone);
             }
             AppendOutcome::Conflicted => state.ghosts.wake_conflicted = true,
-            AppendOutcome::AlreadyPresent(_) => return None,
         }
         state.phone.wake = PhoneWake::Spent;
         Some(())
@@ -758,7 +712,6 @@ impl Model for Scenario {
             },
             phone: Phone {
                 wake: PhoneWake::NotYet,
-                handoff: PhoneHandoff::NotYet,
             },
             tmux: None,
             leader_injected: false,
@@ -868,17 +821,6 @@ impl Model for Scenario {
         if open.is_some_and(|pass| pass.handle == PHONE_HANDLE) {
             actions.push(ProtocolAction::PhoneEndPass);
         }
-        match state.phone.handoff {
-            PhoneHandoff::NotYet if self.phone_handoff => {
-                actions.push(ProtocolAction::PhoneHandoffArm);
-            }
-            PhoneHandoff::Armed { .. } => {
-                actions.push(ProtocolAction::PhoneHandoffAppendAcked);
-                actions.push(ProtocolAction::PhoneHandoffAppendLost);
-            }
-            PhoneHandoff::Unsure => actions.push(ProtocolAction::PhoneHandoffRetry),
-            _ => {}
-        }
     }
 
     fn next_state(&self, last: &Self::State, action: Self::Action) -> Option<Self::State> {
@@ -962,54 +904,6 @@ impl Model for Scenario {
             ProtocolAction::PhoneEndPass => {
                 Self::end_pass_ok(&mut state, PHONE_ACTOR, "phone-end", false)?;
             }
-            ProtocolAction::PhoneHandoffArm => {
-                state.phone.handoff = PhoneHandoff::Armed {
-                    expected: state.log.len() as u64,
-                };
-            }
-            ProtocolAction::PhoneHandoffAppendAcked => {
-                let PhoneHandoff::Armed { expected } = state.phone.handoff else {
-                    return None;
-                };
-                match append_at(&state.log, expected, &handoff_draft()) {
-                    AppendOutcome::Appended(log) | AppendOutcome::AlreadyPresent(log) => {
-                        state.log = log;
-                        state.phone.handoff = PhoneHandoff::Done;
-                    }
-                    AppendOutcome::Conflicted => {
-                        state.ghosts.handoff_conflicted = true;
-                        state.phone.handoff = PhoneHandoff::Armed {
-                            expected: state.log.len() as u64,
-                        };
-                    }
-                }
-            }
-            ProtocolAction::PhoneHandoffAppendLost => {
-                let PhoneHandoff::Armed { expected } = state.phone.handoff else {
-                    return None;
-                };
-                match append_at(&state.log, expected, &handoff_draft()) {
-                    AppendOutcome::Appended(log) => {
-                        state.log = log;
-                        state.phone.handoff = PhoneHandoff::Unsure;
-                    }
-                    // The acked variant already covers the conflict re-arm.
-                    AppendOutcome::Conflicted | AppendOutcome::AlreadyPresent(_) => return None,
-                }
-            }
-            ProtocolAction::PhoneHandoffRetry => {
-                let PhoneHandoff::Unsure = state.phone.handoff else {
-                    return None;
-                };
-                match append_at(&state.log, state.log.len() as u64, &handoff_draft()) {
-                    AppendOutcome::AlreadyPresent(log) => {
-                        state.log = log;
-                        state.ghosts.already_present = true;
-                        state.phone.handoff = PhoneHandoff::Done;
-                    }
-                    _ => return None,
-                }
-            }
         }
         Some(state)
     }
@@ -1042,22 +936,6 @@ impl Model for Scenario {
             Property::<Self>::always("rotate_pending mirrors the request log", |_, state| {
                 interpret(&state.log).is_some_and(|(events, project)| {
                     invariants::rotate_pending_mirrors_the_request_log(&project, &events)
-                })
-            }),
-            Property::<Self>::always("an acknowledged handoff is never lost", |_, state| {
-                // The other witness. `Done` is the shared module's literal
-                // case — the writer saw its receipt. `Unsure` is the stronger
-                // one: the model injected the lost response, so it knows the
-                // append landed even though the writer does not, and the log
-                // owes that submission just as much. Before either, the phone
-                // is entitled to nothing, and the predicate holds the log only
-                // to the no-duplicates half.
-                let landed: &[&str] = match state.phone.handoff {
-                    PhoneHandoff::Unsure | PhoneHandoff::Done => &["phone-handoff-1"],
-                    PhoneHandoff::NotYet | PhoneHandoff::Armed { .. } => &[],
-                };
-                interpret(&state.log).is_some_and(|(events, project)| {
-                    invariants::acknowledged_handoffs_are_never_lost(&project, &events, landed)
                 })
             }),
             Property::<Self>::always(
@@ -1097,23 +975,6 @@ impl Model for Scenario {
                 },
             ),
         ];
-        if self.phone_handoff {
-            // The trigger kinds are the decision's too. A handoff advances the
-            // log, so the wake it provokes is a `log` wake and must say so —
-            // the contract calls the kinds informational, not optional.
-            properties.push(Property::<Self>::sometimes(
-                "a wake records the log trigger that woke it",
-                |model, state| {
-                    fold(&state.log).is_some_and(|project| {
-                        project
-                            .passes
-                            .values()
-                            .filter(|pass| pass.handle == daemon_handle(&model.config))
-                            .any(|pass| pass.triggers.contains(&PassTrigger::Log))
-                    })
-                },
-            ));
-        }
         if self.daemon_crashes > 0 {
             // LOOP.md's first crash window, and its repair. Both are
             // `sometimes` because a window nobody enters proves nothing: the
@@ -1172,16 +1033,6 @@ impl Model for Scenario {
             properties.push(Property::<Self>::sometimes(
                 "a daemon crash is exercised",
                 |model, state| state.daemon.crashes_left < model.daemon_crashes,
-            ));
-        }
-        if self.phone_handoff {
-            properties.push(Property::<Self>::sometimes(
-                "a lost response is absorbed idempotently",
-                |_, state| state.ghosts.already_present,
-            ));
-            properties.push(Property::<Self>::sometimes(
-                "a handoff append loses the CAS race and retries",
-                |_, state| state.ghosts.handoff_conflicted,
             ));
         }
         properties

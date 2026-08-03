@@ -31,7 +31,7 @@ manifest:
 prefix. `store` locates the shared log. `observers` contains executable trusted
 observation commands and may change without producing a durable event.
 
-The prefix becomes immutable when the first work item or handoff is appended.
+The prefix becomes immutable when the first work item is appended.
 Every later operation verifies the configured prefix against the log. A
 mismatch is a configuration error, never an instruction to rename existing
 objects.
@@ -63,11 +63,8 @@ Alder does not assign durable writer roles or distinguish a leader, human,
 worker, or side session for permission purposes. Repository skills and their
 host environment own those workflow policies.
 
-The initial event types are:
+The event types Alder may append are:
 
-- `handoff.submitted`
-- `handoff.integrated`
-- `handoff.withdrawn`
 - `work.changed`
 - `work.finished`
 - `work.dropped`
@@ -93,6 +90,11 @@ is being driven rather than what the project owes:
 These are storage types, not a requirement that every type become a separate
 user-facing concept.
 
+Historical logs may contain `handoff.submitted`, `handoff.integrated`, and
+`handoff.withdrawn`. The decoder retains those wire forms so history remains
+readable, but the fold treats each as inert history: none creates or changes
+live state.
+
 ## Identifiers
 
 Every Alder object ID begins with a repository-configured prefix. The examples
@@ -103,11 +105,10 @@ use `hm`, as a Harmony repository might:
 | Work | `<prefix>-<token>` | `hm-9a1` |
 | Attempt | `<work>-attempt-<ordinal>` | `hm-9a1-attempt-1` |
 | Question | `<work>-question-<ordinal>` | `hm-9a1-question-1` |
-| Handoff | `<prefix>-handoff-<token>` | `hm-handoff-f27` |
 | Pass | `<prefix>-pass-<ordinal>` | `hm-pass-19` |
 
 The prefix is chosen once for the repository and cannot change after its first
-object is appended. Generated tokens contain no hyphens, keeping the five
+object is appended. Generated tokens contain no hyphens, keeping the four
 forms unambiguous.
 
 A pass uses a repository-scoped ordinal rather than a token because passes
@@ -122,8 +123,6 @@ ordinal.
 
 Attempts and questions still store an explicit `work_id`. The readable ID is
 not the authoritative relationship and need not be parsed during replay.
-Handoffs have no work component because they exist before admission; an
-integrated handoff stores its resulting `work_id`.
 
 Event envelope IDs remain separately generated unique values. They provide
 append idempotency and do not use this human-facing domain ID grammar.
@@ -185,60 +184,6 @@ Only `status` and `next` accept `--with` in v0. The overlay contains one
 applicable graph change; it has no preview-only outcome assumptions or
 multi-step scenario language.
 
-## Handoffs
-
-A handoff is a durable asynchronous message for later admission. It is not
-work and has exactly three states:
-
-- `submitted`
-- `integrated`
-- `withdrawn`
-
-| Field | Meaning |
-| --- | --- |
-| `id` | Stable handoff ID |
-| `title` | Short description |
-| `ref` | Spec, branch, report, commit, URL, or other artifact reference |
-| `note` | Optional context for the admitting agent |
-| `state` | `submitted`, `integrated`, or `withdrawn` |
-| `submitted_seq` | Inbox arrival |
-| `work_id` | Work created by integration |
-| `integrated_seq` | Integration event |
-| `withdrawn_seq` | Withdrawal event |
-
-`handoff.submitted` changes no work, dependency, readiness, or attempt state.
-It is the asynchronous side-channel write in v0. Its public operation is
-`alder handoff add`. Unlike `work add`, it accepts no priority, dependency, or check fields.
-
-On a head conflict, submission rereads, refolds, and revalidates. Because it
-only creates a uniquely identified inert inbox record, it may then resubmit
-automatically; an existing event with the same ID resolves the operation as
-already submitted. Integration follows the ordinary reconsider-on-conflict
-rule.
-
-`handoff.integrated` contains the same fields as an `add` operation in
-`work.changed`; folding it atomically creates the work item, records the link,
-and changes the handoff to `integrated`. Its public operation is
-`alder work add --handoff <handoff>`.
-
-An integrated handoff cannot be integrated again. If its proposed work is
-invalid—for example, it introduces a dependency cycle—the append is rejected
-and the handoff remains submitted.
-
-`handoff.withdrawn` retires a submitted handoff without admitting it. Its
-public operation is `alder handoff withdraw <handoff> --why <reason>`, and it
-requires a non-empty reason the same way `work.dropped` and `work.reopened`
-do. Only a `submitted` handoff can be withdrawn; withdrawing an already
-`integrated` or already `withdrawn` handoff is rejected as an
-`invalid_transition`. Withdrawal is terminal — v0 has no un-withdraw — and it
-changes no work, dependency, readiness, or attempt state, the same as
-submission.
-
-Repository skills should submit a handoff only after an explicit human
-instruction. This is an operational permission boundary, not a claim that
-Alder can infer delegation from prose. An unsolicited submission remains inert
-until a writer chooses to integrate it.
-
 ## Work
 
 A work item is a durable requirement that should survive several execution
@@ -269,7 +214,7 @@ but Alder does not define or validate its schema.
 ### State rules
 
 - New work is created explicitly through a `work add` operation in
-  `work.changed` or through `handoff.integrated`, and starts `open`.
+  `work.changed` and starts `open`.
 - Open work can be blocked, finished, dropped, or started.
 - Blocked work can be unblocked, finished externally, dropped, or edited.
 - Blocking and unblocking remain `edit` operations in `work.changed`, not
@@ -628,8 +573,7 @@ remote, but Alder does not use a GitHub-specific API.
 
 If another writer advances the log before step 4, the append changes nothing
 and returns a head conflict. Ordinary mutations are not reapplied to the new
-head; the caller must reread and decide again. Submission of a uniquely
-identified, inert handoff is the only automatic reconsideration in v0.
+head; the caller must reread and decide again.
 
 Reapplying is not withheld out of caution. A mutation is validated against one
 projection and materialized at one sequence, so replaying it against a log
@@ -732,7 +676,6 @@ bounded stderr, validation error, and snapshot time. This powers
 The initial SQLite projection exposes:
 
 - `work_current`
-- `handoffs_submitted`
 - `dependencies`
 - `attempts`
 - `attempt_checks`

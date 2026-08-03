@@ -230,7 +230,7 @@ impl Projection {
 /// from the log, or for observations from the running world — so the honest
 /// response to a schema change is to drop it all and let the next sync and
 /// sweep refill it.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 fn reset_if_schema_changed(connection: &Connection) -> Result<()> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -240,8 +240,11 @@ fn reset_if_schema_changed(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         "
         DROP TABLE IF EXISTS projection_meta;
+        DROP VIEW IF EXISTS handoffs_submitted;
         DROP TABLE IF EXISTS events;
         DROP TABLE IF EXISTS work_current;
+        -- Schema v3 materialized a retired inbox. Remove it during the
+        -- rebuild so a projection never retains obsolete live state.
         DROP TABLE IF EXISTS handoffs;
         DROP TABLE IF EXISTS dependencies;
         DROP TABLE IF EXISTS work_checks;
@@ -284,17 +287,6 @@ fn create_schema(connection: &Connection) -> Result<()> {
             outcome TEXT,
             opened_seq INTEGER NOT NULL,
             changed_seq INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS handoffs (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            artifact_ref TEXT NOT NULL,
-            note TEXT,
-            state TEXT NOT NULL,
-            submitted_seq INTEGER NOT NULL,
-            work_id TEXT,
-            integrated_seq INTEGER,
-            withdrawn_seq INTEGER
         );
         CREATE TABLE IF NOT EXISTS dependencies (
             work_id TEXT NOT NULL,
@@ -395,9 +387,6 @@ fn create_schema(connection: &Connection) -> Result<()> {
             object_count INTEGER NOT NULL
         );
 
-        DROP VIEW IF EXISTS handoffs_submitted;
-        CREATE VIEW handoffs_submitted AS
-            SELECT * FROM handoffs WHERE state = 'submitted';
         DROP VIEW IF EXISTS ready;
         CREATE VIEW ready AS
             SELECT w.*
@@ -490,7 +479,6 @@ fn rebuild(
         DELETE FROM attempts;
         DELETE FROM work_checks;
         DELETE FROM dependencies;
-        DELETE FROM handoffs;
         DELETE FROM work_current;
         DELETE FROM events;
         DELETE FROM projection_meta;
@@ -558,25 +546,6 @@ fn insert_state(transaction: &Transaction<'_>, state: &ProjectState) -> Result<(
                 params![work.id, check.key, check.description],
             )?;
         }
-    }
-    for handoff in state.handoffs.values() {
-        transaction.execute(
-            "INSERT INTO handoffs
-             (id, title, artifact_ref, note, state, submitted_seq, work_id, integrated_seq,
-              withdrawn_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                handoff.id,
-                handoff.title,
-                handoff.artifact_ref,
-                handoff.note,
-                enum_json(handoff.state)?,
-                handoff.submitted_seq,
-                handoff.work_id,
-                handoff.integrated_seq,
-                handoff.withdrawn_seq,
-            ],
-        )?;
     }
     for attempt in state.attempts.values() {
         transaction.execute(
@@ -795,8 +764,8 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        AttemptOutcome, CheckDefinition, CheckStatus, CheckUpdate, EventPayload, HandoffDefinition,
-        ProjectLog, WorkState,
+        AttemptOutcome, CheckDefinition, CheckStatus, CheckUpdate, EventPayload,
+        LegacyHandoffDefinition, ProjectLog, WorkState,
     };
     use alder_log::MemoryLog as MemoryStore;
 
@@ -899,8 +868,8 @@ mod tests {
             seq: 1,
             at: Utc::now(),
             actor: "test".to_owned(),
-            payload: EventPayload::HandoffSubmitted {
-                handoff: HandoffDefinition {
+            payload: EventPayload::LegacyHandoffSubmitted {
+                handoff: LegacyHandoffDefinition {
                     id: "hm-handoff-a".to_owned(),
                     title: "handoff".to_owned(),
                     artifact_ref: "ref".to_owned(),

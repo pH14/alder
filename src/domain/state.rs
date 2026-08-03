@@ -6,14 +6,13 @@ use serde_json::json;
 use crate::error::{AlderError, Result};
 
 use super::{
-    Attempt, AttemptCheck, AttemptOutcome, AttemptState, CheckStatus, Event, EventPayload, Handoff,
-    HandoffState, LoopControl, Pass, PassState, Question, QuestionAnswer, Work, WorkOperation,
-    WorkState, WorkStateChange,
+    Attempt, AttemptCheck, AttemptOutcome, AttemptState, CheckStatus, Event, EventPayload,
+    LoopControl, Pass, PassState, Question, QuestionAnswer, Work, WorkOperation, WorkState,
+    WorkStateChange,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectState {
-    pub handoffs: BTreeMap<String, Handoff>,
     pub work: BTreeMap<String, Work>,
     pub attempts: BTreeMap<String, Attempt>,
     pub questions: BTreeMap<String, Question>,
@@ -66,72 +65,9 @@ impl ProjectState {
     fn apply_in_place(&mut self, event: &Event) -> Result<()> {
         let seq = event.seq;
         match &event.payload {
-            EventPayload::HandoffSubmitted { handoff } => {
-                if self.handoffs.contains_key(&handoff.id) {
-                    return Err(AlderError::validation(format!(
-                        "handoff `{}` already exists",
-                        handoff.id
-                    )));
-                }
-                require_text("handoff title", &handoff.title)?;
-                require_text("handoff ref", &handoff.artifact_ref)?;
-                self.handoffs.insert(
-                    handoff.id.clone(),
-                    Handoff {
-                        id: handoff.id.clone(),
-                        title: handoff.title.clone(),
-                        artifact_ref: handoff.artifact_ref.clone(),
-                        note: handoff.note.clone(),
-                        state: HandoffState::Submitted,
-                        submitted_seq: seq,
-                        work_id: None,
-                        integrated_seq: None,
-                        withdrawn_seq: None,
-                    },
-                );
-            }
-            EventPayload::HandoffIntegrated { handoff_id, work } => {
-                let handoff = self
-                    .handoffs
-                    .get(handoff_id)
-                    .ok_or_else(|| AlderError::not_found("handoff", handoff_id))?;
-                if handoff.state != HandoffState::Submitted {
-                    return Err(AlderError::with_context(
-                        "invalid_transition",
-                        format!(
-                            "handoff `{handoff_id}` cannot be integrated from {:?}",
-                            handoff.state
-                        ),
-                        json!({"handoff_id": handoff_id, "state": handoff.state}),
-                    ));
-                }
-                self.add_work(work, seq)?;
-                let handoff = self.handoffs.get_mut(handoff_id).expect("checked above");
-                handoff.state = HandoffState::Integrated;
-                handoff.work_id = Some(work.id.clone());
-                handoff.integrated_seq = Some(seq);
-                self.validate_graph()?;
-            }
-            EventPayload::HandoffWithdrawn { handoff_id, why } => {
-                require_text("withdraw reason", why)?;
-                let handoff = self
-                    .handoffs
-                    .get(handoff_id)
-                    .ok_or_else(|| AlderError::not_found("handoff", handoff_id))?;
-                if handoff.state != HandoffState::Submitted {
-                    return Err(AlderError::with_context(
-                        "invalid_transition",
-                        format!(
-                            "handoff `{handoff_id}` cannot be withdrawn from {:?}",
-                            handoff.state
-                        ),
-                        json!({"handoff_id": handoff_id, "state": handoff.state}),
-                    ));
-                }
-                let handoff = self.handoffs.get_mut(handoff_id).expect("checked above");
-                handoff.state = HandoffState::Withdrawn;
-                handoff.withdrawn_seq = Some(seq);
-            }
+            EventPayload::LegacyHandoffSubmitted { .. }
+            | EventPayload::LegacyHandoffIntegrated { .. }
+            | EventPayload::LegacyHandoffWithdrawn { .. } => {}
             EventPayload::WorkChanged { operations, .. } => {
                 if operations.is_empty() {
                     return Err(AlderError::validation(
@@ -960,22 +896,10 @@ impl ProjectState {
 
     pub fn validate_prefix(&self, prefix: &str) -> Result<()> {
         let work_prefix = format!("{prefix}-");
-        let handoff_prefix = format!("{prefix}-handoff-");
         if let Some(id) = self.work.keys().find(|id| !id.starts_with(&work_prefix)) {
             return Err(AlderError::with_context(
                 "config_conflict",
                 format!("configured prefix `{prefix}` does not match work `{id}`"),
-                json!({"prefix": prefix, "id": id}),
-            ));
-        }
-        if let Some(id) = self
-            .handoffs
-            .keys()
-            .find(|id| !id.starts_with(&handoff_prefix))
-        {
-            return Err(AlderError::with_context(
-                "config_conflict",
-                format!("configured prefix `{prefix}` does not match handoff `{id}`"),
                 json!({"prefix": prefix, "id": id}),
             ));
         }
@@ -1048,7 +972,7 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        AttemptDefinition, CheckDefinition, CheckUpdate, EventPayload, HandoffDefinition,
+        AttemptDefinition, CheckDefinition, CheckUpdate, EventPayload, LegacyHandoffDefinition,
         QuestionDefinition, WorkDefinition, WorkOperation,
     };
 
@@ -1202,13 +1126,13 @@ mod tests {
     }
 
     #[test]
-    fn handoffs_are_integrated_exactly_once() {
+    fn legacy_handoff_events_are_inert_history() {
         let mut state = ProjectState::default();
         state
             .apply(&event(
                 1,
-                EventPayload::HandoffSubmitted {
-                    handoff: HandoffDefinition {
+                EventPayload::LegacyHandoffSubmitted {
+                    handoff: LegacyHandoffDefinition {
                         id: "hm-handoff-one".to_owned(),
                         title: "handoff".to_owned(),
                         artifact_ref: "branch".to_owned(),
@@ -1217,7 +1141,7 @@ mod tests {
                 },
             ))
             .unwrap();
-        let integration = EventPayload::HandoffIntegrated {
+        let integration = EventPayload::LegacyHandoffIntegrated {
             handoff_id: "hm-handoff-one".to_owned(),
             work: WorkDefinition {
                 id: "hm-work".to_owned(),
@@ -1229,154 +1153,16 @@ mod tests {
             },
         };
         state.apply(&event(2, integration.clone())).unwrap();
-        assert_eq!(
-            state.handoffs["hm-handoff-one"].state,
-            HandoffState::Integrated
-        );
-        assert_eq!(
-            state.apply(&event(3, integration)).unwrap_err().code,
-            "invalid_transition"
-        );
-    }
-
-    #[test]
-    fn withdrawn_handoffs_fold_to_a_terminal_state_and_reject_further_transitions() {
-        let mut state = ProjectState::default();
         state
             .apply(&event(
-                1,
-                EventPayload::HandoffSubmitted {
-                    handoff: HandoffDefinition {
-                        id: "hm-handoff-one".to_owned(),
-                        title: "handoff".to_owned(),
-                        artifact_ref: "branch".to_owned(),
-                        note: None,
-                    },
+                3,
+                EventPayload::LegacyHandoffWithdrawn {
+                    handoff_id: "hm-handoff-one".to_owned(),
+                    why: "superseded".to_owned(),
                 },
             ))
             .unwrap();
-        let withdrawal = EventPayload::HandoffWithdrawn {
-            handoff_id: "hm-handoff-one".to_owned(),
-            why: "superseded".to_owned(),
-        };
-        state.apply(&event(2, withdrawal.clone())).unwrap();
-        assert_eq!(
-            state.handoffs["hm-handoff-one"].state,
-            HandoffState::Withdrawn
-        );
-        assert_eq!(state.handoffs["hm-handoff-one"].withdrawn_seq, Some(2));
-
-        // Rejection: a withdrawn handoff cannot be withdrawn again.
-        assert_eq!(
-            state.apply(&event(3, withdrawal)).unwrap_err().code,
-            "invalid_transition"
-        );
-
-        // Rejection: a withdrawn handoff cannot be integrated.
-        let integration = EventPayload::HandoffIntegrated {
-            handoff_id: "hm-handoff-one".to_owned(),
-            work: WorkDefinition {
-                id: "hm-work".to_owned(),
-                title: "work".to_owned(),
-                spec: None,
-                priority: 0,
-                requires: Vec::new(),
-                checks: Vec::new(),
-            },
-        };
-        assert_eq!(
-            state.apply(&event(4, integration)).unwrap_err().code,
-            "invalid_transition"
-        );
-
-        // Rejection: withdrawing an already-integrated handoff.
-        let mut integrated_state = ProjectState::default();
-        integrated_state
-            .apply(&event(
-                1,
-                EventPayload::HandoffSubmitted {
-                    handoff: HandoffDefinition {
-                        id: "hm-handoff-two".to_owned(),
-                        title: "handoff".to_owned(),
-                        artifact_ref: "branch".to_owned(),
-                        note: None,
-                    },
-                },
-            ))
-            .unwrap();
-        integrated_state
-            .apply(&event(
-                2,
-                EventPayload::HandoffIntegrated {
-                    handoff_id: "hm-handoff-two".to_owned(),
-                    work: WorkDefinition {
-                        id: "hm-work-two".to_owned(),
-                        title: "work".to_owned(),
-                        spec: None,
-                        priority: 0,
-                        requires: Vec::new(),
-                        checks: Vec::new(),
-                    },
-                },
-            ))
-            .unwrap();
-        assert_eq!(
-            integrated_state
-                .apply(&event(
-                    3,
-                    EventPayload::HandoffWithdrawn {
-                        handoff_id: "hm-handoff-two".to_owned(),
-                        why: "too late".to_owned(),
-                    },
-                ))
-                .unwrap_err()
-                .code,
-            "invalid_transition"
-        );
-
-        // Rejection: unknown handoff.
-        assert_eq!(
-            ProjectState::default()
-                .apply(&event(
-                    1,
-                    EventPayload::HandoffWithdrawn {
-                        handoff_id: "hm-handoff-missing".to_owned(),
-                        why: "reason".to_owned(),
-                    },
-                ))
-                .unwrap_err()
-                .code,
-            "not_found"
-        );
-
-        // Rejection: an empty reason.
-        let mut blank_reason_state = ProjectState::default();
-        blank_reason_state
-            .apply(&event(
-                1,
-                EventPayload::HandoffSubmitted {
-                    handoff: HandoffDefinition {
-                        id: "hm-handoff-three".to_owned(),
-                        title: "handoff".to_owned(),
-                        artifact_ref: "branch".to_owned(),
-                        note: None,
-                    },
-                },
-            ))
-            .unwrap();
-        assert_eq!(
-            blank_reason_state
-                .apply(&event(
-                    2,
-                    EventPayload::HandoffWithdrawn {
-                        handoff_id: "hm-handoff-three".to_owned(),
-                        why: "   ".to_owned(),
-                    },
-                ))
-                .unwrap_err()
-                .code,
-            "validation_failed"
-        );
+        assert!(state.work.is_empty());
     }
 
     #[test]
@@ -1994,22 +1780,6 @@ mod tests {
         );
         assert!(state.validate_prefix("hm").is_ok());
         assert!(state.validate_prefix("other").is_err());
-        state.handoffs.insert(
-            "wrong-handoff-one".to_owned(),
-            Handoff {
-                id: "wrong-handoff-one".to_owned(),
-                title: "handoff".to_owned(),
-                artifact_ref: "ref".to_owned(),
-                note: None,
-                state: HandoffState::Submitted,
-                submitted_seq: 3,
-                work_id: None,
-                integrated_seq: None,
-                withdrawn_seq: None,
-            },
-        );
-        assert!(state.validate_prefix("hm").is_err());
-
         for invalid in [
             CheckDefinition {
                 key: String::new(),

@@ -92,4 +92,46 @@ mod tests {
             .unwrap();
         assert_eq!(serde_json::to_value(persisted.record).unwrap(), document);
     }
+
+    #[test]
+    fn legacy_handoff_events_decode_and_fold_as_inert_history() {
+        let documents = [
+            json!({
+                "id": "legacy-submit",
+                "seq": 1,
+                "at": "2026-07-27T12:00:00Z",
+                "actor": "tester",
+                "type": "handoff.submitted",
+                "body": {"handoff": {"id": "hm-handoff-old", "title": "old", "ref": "branch:old", "note": null}},
+                "schema": "alder.event.v0"
+            }),
+            json!({
+                "id": "legacy-integrate",
+                "seq": 1,
+                "at": "2026-07-27T12:00:00Z",
+                "actor": "tester",
+                "type": "handoff.integrated",
+                "body": {"handoff_id": "hm-handoff-old", "work": {"id": "hm-old", "title": "old", "spec": null, "priority": 0, "requires": [], "checks": []}},
+                "schema": "alder.event.v0"
+            }),
+            json!({
+                "id": "legacy-withdraw",
+                "seq": 1,
+                "at": "2026-07-27T12:00:00Z",
+                "actor": "tester",
+                "type": "handoff.withdrawn",
+                "body": {"handoff_id": "hm-handoff-old", "why": "old"},
+                "schema": "alder.event.v0"
+            }),
+        ];
+
+        for document in documents {
+            let record: Record = serde_json::from_value(document).unwrap();
+            let event = decode_record(&record).unwrap();
+            let state = crate::domain::ProjectState::fold(&[event]).unwrap();
+            assert!(state.work.is_empty());
+            assert!(state.attempts.is_empty());
+            assert!(state.questions.is_empty());
+        }
+    }
 }

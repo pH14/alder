@@ -119,8 +119,8 @@ with the UUID it names; never ask the leader to fall back to `--last`.
   session by exact name. Inside a tmux pane — where you live — `$TMUX` names
   the real server and takes precedence, so `TMUX_TMPDIR` isolates nothing and
   a bare `kill-server` kills every worker on the machine.
-- Never run `alder work add` — if you discover new work worth doing, submit
-  `alder handoff add` instead; admission is the leader's call.
+- Never run `alder work add` — if you discover new work worth doing, record it
+  in your attempt note for the leader; admission is the leader's call.
 - You may `work ask` on your own item and `attempt edit` your own attempt.
   Every other write to the log belongs to the leader.
 - Never weaken a check to get to done; ask instead.

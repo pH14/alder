@@ -48,11 +48,11 @@
 //! `reconcile` reasons about attempts and handles and knows nothing about
 //! directories. [`Simulator::stray_paths`] and [`Simulator::clean_strays`] are
 //! this harness standing in for a leader-side sweep production does not have
-//! yet — handoff `al-handoff-vpzdqw`. Fixing that is not this branch's job;
+//! yet — tracked as work `al-vpzdqw`. Fixing that is not this branch's job;
 //! naming it is, so the convergence property below stays honest rather than
 //! quietly excluding the subsets that expose it.
 //!
-//! Two other torn states this surfaced need no handoff. A session created but
+//! Two other torn states this surfaced need no follow-up work. A session created but
 //! not yet stamped with `ALDER_ATTEMPT` is already named `unclaimed` by
 //! `reconcile` and killed by repair, and the unmerged adoptive-spawn branch
 //! `work/al-730568` closes the window entirely by stamping the attempt as the
@@ -1040,7 +1040,7 @@ impl Simulator {
     /// `worktree add` or a torn removal — a directory or a file under no
     /// registered worktree at all — is residue git will not clean up and no
     /// production code path removes today, and a respawn onto that path fails
-    /// its pre-flight forever. That gap is handoff `al-handoff-vpzdqw`.
+    /// its pre-flight forever. That gap is work `al-vpzdqw`.
     /// Modelling the sweep here keeps the convergence property meaningful and
     /// keeps the missing production step visible instead of silently excluded.
     fn clean_strays(&self) -> Result<bool> {
@@ -1231,14 +1231,6 @@ impl Simulator {
         assert!(
             invariants::rotate_pending_mirrors_the_request_log(&snapshot.state, &snapshot.events),
             "the shared rotation-log safety predicate failed"
-        );
-        assert!(
-            invariants::acknowledged_handoffs_are_never_lost(
-                &snapshot.state,
-                &snapshot.events,
-                &[],
-            ),
-            "the shared handoff safety predicate failed"
         );
         assert!(findings.is_empty(), "unreconciled findings: {findings:#?}");
         assert!(

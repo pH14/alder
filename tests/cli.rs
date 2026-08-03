@@ -378,18 +378,6 @@ fn drive_work_and_preserve_the_completion_contract() {
             .human(&["status", "--full"])
             .contains("answered questions still blocked")
     );
-
-    let handoff = project.success(&[
-        "handoff",
-        "add",
-        "--title",
-        "Side work",
-        "--ref",
-        "branch:side",
-    ]);
-    assert_eq!(project.success(&["status"])["counts"]["handoffs"], 1);
-    let status = project.success(&["status", "--full"]);
-    assert_eq!(status["handoffs"][0]["id"], handoff["handoff_id"]);
 }
 
 #[test]
@@ -601,21 +589,19 @@ fn observations_distinguish_presence_outage_and_missing_configuration() {
 
     let sectioned = project.success(&["status", "--section", "attention"]);
     assert_eq!(sectioned["attention"][0]["kind"], "unconfigured");
-    assert!(sectioned.get("handoffs").is_none());
     assert!(sectioned.get("blocked").is_none());
     assert_eq!(sectioned["counts"]["attention"], 1);
 }
 
-const STATUS_SECTIONS: [&str; 6] = [
+const STATUS_SECTIONS: [&str; 5] = [
     "attention",
-    "handoffs",
     "in_flight",
     "ready",
     "waiting_on_human",
     "blocked",
 ];
 
-/// One item lands in each of the six counted sections, so `counts` and every
+/// One item lands in each of the five counted sections, so `counts` and every
 /// `--full` / `--section` expansion can be checked against the same fixture.
 #[test]
 fn status_defaults_to_counts_and_expands_only_on_request() {
@@ -642,16 +628,6 @@ fn status_defaults_to_counts_and_expands_only_on_request() {
         "work_id",
     );
     project.success(&["work", "ask", &blocked_work, "Ship now?"]);
-
-    // handoffs: submitted, not yet admitted.
-    project.success(&[
-        "handoff",
-        "add",
-        "--title",
-        "Side work",
-        "--ref",
-        "branch:side",
-    ]);
 
     let counts_only = project.success(&["status"]);
     for section in STATUS_SECTIONS {
@@ -716,7 +692,7 @@ fn status_defaults_to_counts_and_expands_only_on_request() {
     ]);
     assert_eq!(selected["ready"], full["ready"]);
     assert_eq!(selected["blocked"], full["blocked"]);
-    for other in ["attention", "handoffs", "in_flight", "waiting_on_human"] {
+    for other in ["attention", "in_flight", "waiting_on_human"] {
         assert!(selected.get(other).is_none(), "{other} leaked");
     }
     let selected_human = project.human(&[
@@ -1122,88 +1098,16 @@ fn work_state_verbs_replace_the_removed_edit_flags() {
 }
 
 #[test]
-fn handoff_withdraw_retires_a_submission_and_status_stops_listing_it() {
+fn handoff_commands_and_work_add_flag_are_not_in_the_cli() {
     let project = TestProject::new();
-
-    let handoff = project.success(&[
-        "handoff",
-        "add",
-        "--title",
-        "Side work",
-        "--ref",
-        "branch:side",
-    ]);
-    let handoff_id = string(&handoff, "handoff_id");
-    assert_eq!(project.success(&["status"])["counts"]["handoffs"], 1);
-    let status = project.success(&["status", "--full"]);
-    assert_eq!(status["handoffs"][0]["id"], handoff_id);
-
-    // An empty reason is rejected before anything is appended.
-    assert_eq!(
-        project.failure(&["handoff", "withdraw", &handoff_id, "--why", "   "])["code"],
-        "validation_failed"
-    );
-
-    let withdrawn = project.success(&[
-        "handoff",
-        "withdraw",
-        &handoff_id,
-        "--why",
-        "superseded by a follow-up handoff",
-    ]);
-    assert_eq!(withdrawn["schema"], "alder.handoff.withdraw.v0");
-    assert_eq!(withdrawn["handoff_id"], handoff_id);
-    assert_eq!(withdrawn["state"], "withdrawn");
-
-    // Status-filter: a withdrawn handoff is no longer an inbox entry.
-    assert_eq!(project.success(&["status"])["counts"]["handoffs"], 0);
-    let status = project.success(&["status", "--full"]);
-    assert!(status["handoffs"].as_array().unwrap().is_empty());
-    assert!(!project.human(&["status", "--full"]).contains(&handoff_id));
-
-    // `show` still renders it, now terminal.
-    let shown = project.success(&["show", &handoff_id]);
-    assert_eq!(shown["current"]["state"], "withdrawn");
-
-    // Rejection: a withdrawn handoff cannot be withdrawn again.
-    assert_eq!(
-        project.failure(&["handoff", "withdraw", &handoff_id, "--why", "again"])["code"],
-        "invalid_transition"
-    );
-
-    // Rejection: a withdrawn handoff cannot be integrated.
-    assert_eq!(
-        project.failure(&["work", "add", "--handoff", &handoff_id])["code"],
-        "invalid_transition"
-    );
-
-    // Rejection: withdrawing an unknown handoff.
-    assert_eq!(
-        project.failure(&[
-            "handoff",
-            "withdraw",
-            "hm-handoff-missing",
-            "--why",
-            "reason"
-        ])["code"],
-        "not_found"
-    );
-
-    // Rejection: withdrawing an already-integrated handoff.
-    let integrated_handoff = project.success(&[
-        "handoff",
-        "add",
-        "--title",
-        "Integrated work",
-        "--ref",
-        "branch:other",
-    ]);
-    let integrated_id = string(&integrated_handoff, "handoff_id");
-    project.success(&["work", "add", "--handoff", &integrated_id]);
-    assert_eq!(
-        project.failure(&["handoff", "withdraw", &integrated_id, "--why", "too late"])["code"],
-        "invalid_transition"
-    );
+    for arguments in [
+        vec!["handoff", "add"],
+        vec!["work", "add", "--handoff", "hm-legacy"],
+        vec!["status", "--section", "handoffs"],
+    ] {
+        let output = project.command().args(arguments).output().unwrap();
+        assert!(!output.status.success());
+    }
 }
 
 #[test]
