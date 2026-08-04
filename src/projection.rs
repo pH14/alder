@@ -230,7 +230,7 @@ impl Projection {
 /// from the log, or for observations from the running world — so the honest
 /// response to a schema change is to drop it all and let the next sync and
 /// sweep refill it.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 fn reset_if_schema_changed(connection: &Connection) -> Result<()> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -284,6 +284,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
             priority INTEGER NOT NULL,
             state TEXT NOT NULL,
             block_reason TEXT,
+            block_until TEXT,
             outcome TEXT,
             opened_seq INTEGER NOT NULL,
             changed_seq INTEGER NOT NULL
@@ -340,33 +341,13 @@ fn create_schema(connection: &Connection) -> Result<()> {
             actor TEXT NOT NULL,
             PRIMARY KEY (question_id, seq)
         );
-        CREATE TABLE IF NOT EXISTS passes (
-            id TEXT PRIMARY KEY,
-            engine TEXT NOT NULL,
-            handle TEXT NOT NULL,
-            triggers TEXT NOT NULL,
-            state TEXT NOT NULL,
-            outcome TEXT,
-            report TEXT,
-            wake_at TEXT,
-            rotate INTEGER NOT NULL,
-            why TEXT,
-            at_head INTEGER NOT NULL,
-            started_at TEXT NOT NULL,
-            started_seq INTEGER NOT NULL,
-            ended_at TEXT,
-            ended_seq INTEGER
-        );
         CREATE TABLE IF NOT EXISTS loop_control (
             id INTEGER PRIMARY KEY CHECK (id = 0),
             paused INTEGER NOT NULL,
             pause_reason TEXT,
             engine TEXT,
-            rotate_pending INTEGER NOT NULL,
             rotate_requested_seq INTEGER,
-            nudge_pending INTEGER NOT NULL,
-            nudge_requested_seq INTEGER,
-            last_wake_seq INTEGER
+            nudge_requested_seq INTEGER
         );
         CREATE TABLE IF NOT EXISTS observed_handles (
             handle TEXT PRIMARY KEY,
@@ -415,9 +396,6 @@ fn create_schema(connection: &Connection) -> Result<()> {
             SELECT q.*
             FROM questions q JOIN work_current w ON w.id = q.work_id
             WHERE q.answer IS NULL AND w.state NOT IN ('done', 'dropped');
-        DROP VIEW IF EXISTS pass_open;
-        CREATE VIEW pass_open AS
-            SELECT * FROM passes WHERE state = 'open';
         DROP VIEW IF EXISTS downstream;
         CREATE VIEW downstream AS
             WITH RECURSIVE graph(root_id, work_id) AS (
@@ -472,7 +450,6 @@ fn rebuild(
     transaction.execute_batch(
         "
         DELETE FROM loop_control;
-        DELETE FROM passes;
         DELETE FROM question_answers;
         DELETE FROM questions;
         DELETE FROM attempt_checks;
@@ -520,8 +497,9 @@ fn insert_state(transaction: &Transaction<'_>, state: &ProjectState) -> Result<(
     for work in state.work.values() {
         transaction.execute(
             "INSERT INTO work_current
-             (id, title, spec, priority, state, block_reason, outcome, opened_seq, changed_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (id, title, spec, priority, state, block_reason, block_until, outcome,
+              opened_seq, changed_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 work.id,
                 work.title,
@@ -529,6 +507,7 @@ fn insert_state(transaction: &Transaction<'_>, state: &ProjectState) -> Result<(
                 work.priority,
                 enum_json(work.state)?,
                 work.block_reason,
+                work.block_until.map(|until| until.to_rfc3339()),
                 work.outcome,
                 work.opened_seq,
                 work.changed_seq,
@@ -584,50 +563,17 @@ fn insert_state(transaction: &Transaction<'_>, state: &ProjectState) -> Result<(
     for question in state.questions.values() {
         insert_question(transaction, question)?;
     }
-    for pass in state.passes.values() {
-        transaction.execute(
-            "INSERT INTO passes
-             (id, engine, handle, triggers, state, outcome, report, wake_at, rotate, why,
-              at_head, started_at, started_seq, ended_at, ended_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![
-                pass.id,
-                pass.engine,
-                pass.handle,
-                pass.triggers
-                    .iter()
-                    .map(|trigger| trigger.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                enum_json(pass.state)?,
-                pass.outcome.map(enum_json).transpose()?,
-                pass.report,
-                pass.wake_at.map(|at| at.to_rfc3339()),
-                pass.rotate as i64,
-                pass.why,
-                pass.at_head,
-                pass.started_at.to_rfc3339(),
-                pass.started_seq,
-                pass.ended_at.map(|at| at.to_rfc3339()),
-                pass.ended_seq,
-            ],
-        )?;
-    }
     let control = &state.loop_control;
     transaction.execute(
         "INSERT INTO loop_control
-         (id, paused, pause_reason, engine, rotate_pending, rotate_requested_seq,
-          nudge_pending, nudge_requested_seq, last_wake_seq)
-         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (id, paused, pause_reason, engine, rotate_requested_seq, nudge_requested_seq)
+         VALUES (0, ?1, ?2, ?3, ?4, ?5)",
         params![
             control.paused as i64,
             control.pause_reason,
             control.engine,
-            control.rotate_pending() as i64,
             control.rotate_requested_seq,
-            control.nudge_pending() as i64,
             control.nudge_requested_seq,
-            control.last_wake_seq,
         ],
     )?;
     Ok(())

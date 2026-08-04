@@ -97,16 +97,21 @@ fn every_torn_subset_of_every_spawn_effect_converges() {
     }
 }
 
-/// The same enumeration over a complete daemon poll: the wake, the injection,
-/// the pass ending, and every read and clock tick between them, each torn
-/// every way its footprint allows.
+/// The same enumeration over a complete daemon poll: the session
+/// reconciliation, the injection, the notes write, and every read and clock
+/// tick between them, each torn every way its footprint allows.
+///
+/// This is the crash half of the new invariant: nothing durable records a
+/// wake, so a crash anywhere in the wake path costs at most one missed or one
+/// duplicated delivery, and recovery converges without any repair verdicts.
 #[test]
-fn every_torn_subset_of_the_pass_lifecycle_converges() {
+fn every_torn_subset_of_the_wake_lifecycle_converges() {
     let probe = Simulator::new(3);
     let mut driver = Driver::new(probe.clone(), config());
     driver.poll_once().unwrap();
+    probe.run_leader_if_injected();
     let lifecycle = probe.trace();
-    for label in ["pass.wake", "pass.inject", "pass.end"] {
+    for label in ["wake.session-create", "wake.inject", "notes.write"] {
         position_of(&lifecycle, label);
     }
 
@@ -116,7 +121,12 @@ fn every_torn_subset_of_the_pass_lifecycle_converges() {
             host.schedule_faults(vec![Fault::torn(boundary.ordinal, mask)]);
             let mut driver = Driver::new(host.clone(), config());
             assert!(
-                catch_sim_crash(|| driver.poll_once()).is_none(),
+                catch_sim_crash(|| {
+                    driver.poll_once()?;
+                    host.run_leader_if_injected();
+                    Ok::<(), alderd::error::DriverError>(())
+                })
+                .is_none(),
                 "lifecycle fault {} landing {:?} did not fire; trace={:#?}",
                 boundary.ordinal,
                 boundary.landed(mask),
@@ -126,6 +136,36 @@ fn every_torn_subset_of_the_pass_lifecycle_converges() {
             host.assert_invariant(false);
         }
     }
+}
+
+/// A crash between the injection and the notes write is the duplicate-wake
+/// window: the leader was handed the line, but the restarted daemon does not
+/// know that and delivers it again. Pinned so the interesting subset does not
+/// depend on enumeration order, and asserted to actually produce the second
+/// delivery — which the invariant then holds harmless.
+#[test]
+fn a_crash_between_injection_and_notes_delivers_the_wake_twice_harmlessly() {
+    let probe = Simulator::new(29);
+    let mut driver = Driver::new(probe.clone(), config());
+    driver.poll_once().unwrap();
+    let trace = probe.trace();
+    let inject = position_of(&trace, "wake.inject");
+    let notes = position_of(&trace, "notes.write");
+    assert!(inject < notes, "the injection must precede the notes write");
+
+    let host = Simulator::new(29);
+    // The injection lands whole; the process dies before the notes write.
+    host.schedule_faults(vec![Fault::whole(inject)]);
+    let mut driver = Driver::new(host.clone(), config());
+    assert!(catch_sim_crash(|| driver.poll_once()).is_none());
+    assert_eq!(host.wakes_delivered(), 1);
+
+    host.recover(false);
+    host.assert_invariant(false);
+    assert!(
+        host.wakes_delivered() >= 2,
+        "the restarted daemon never re-delivered the unnoted wake"
+    );
 }
 
 /// The atomicity asymmetry, checked against the effects the system actually
@@ -159,13 +199,20 @@ fn a_log_append_tears_to_nothing_or_everything() {
     for boundary in &spawn_probe(5).trace() {
         check(boundary);
     }
+    // The daemon poll path is checked too, and the stronger fact rides along:
+    // it contains no append at all. The daemon appends nothing.
     let leader = Simulator::new(6);
     Driver::new(leader.clone(), config()).poll_once().unwrap();
+    leader.run_leader_if_injected();
     for boundary in &leader.trace() {
+        assert!(
+            !boundary.footprint.contains(&"append"),
+            "the daemon poll path appended to the log: {boundary:#?}"
+        );
         check(boundary);
     }
 
-    assert!(appended >= 4, "only {appended} appends were exercised");
+    assert!(appended >= 2, "only {appended} appends were exercised");
     assert!(worlds >= 4, "only {worlds} world effects were exercised");
 }
 
@@ -256,13 +303,6 @@ fn the_simulated_dispatcher_serves_no_nested_shape_production_lacks() {
         &["key", "description"],
     );
 
-    // `show <pass>` — read by the driver as /current/state and /current/outcome.
-    let pass_id = state.passes.keys().next().expect("the poll opened a pass");
-    let answer = alderd::effects::Effects::alder(&host, &["show", pass_id]).unwrap();
-    let pass = serde_json::to_value(&state.passes[pass_id]).unwrap();
-    assert_no_invented_keys("show <pass> current", &answer["current"], &pass);
-    assert_still_emitted("show <pass> current", &pass, &["id", "state", "outcome"]);
-
     // `status --section in_flight` items — read by `spawn::open_attempt`.
     let answer =
         alderd::effects::Effects::alder(&host, &["status", "--section", "in_flight"]).unwrap();
@@ -277,40 +317,16 @@ fn the_simulated_dispatcher_serves_no_nested_shape_production_lacks() {
 }
 
 /// The simulator serves the production status builder, then the driver's real
-/// reader consumes that document. The scenario makes both pass sub-objects
-/// nonempty, so the check covers more than the empty loop shape.
+/// reader consumes that document. The scenario populates every field the loop
+/// section carries, so the check covers more than the empty shape.
 #[test]
 fn the_simulated_status_serves_the_loop_section_production_builds() {
-    // Both sub-objects have to be populated or half the comparison is vacuous,
-    // so this wants one pass ended and another still open. Crashing right
-    // after the second wake leaves exactly that.
-    let probe = Simulator::new(19);
-    Driver::new(probe.clone(), config()).poll_once().unwrap();
-    probe.nudge();
-    probe.schedule_faults(Vec::new());
-    Driver::new(probe.clone(), config()).poll_once().unwrap();
-    let wake = position_of(&probe.trace(), "pass.wake");
-
     let host = Simulator::new(19);
-    Driver::new(host.clone(), config()).poll_once().unwrap();
+    // A nudge request populates the manual-trigger sequence.
     host.nudge();
-    host.schedule_faults(vec![Fault::whole(wake)]);
-    let mut driver = Driver::new(host.clone(), config());
-    assert!(
-        catch_sim_crash(|| driver.poll_once()).is_none(),
-        "the wake fault did not fire; trace={:#?}",
-        host.trace()
-    );
-
     let snapshot = host.snapshot();
-    let state = &snapshot.state;
-    assert!(state.open_pass().is_some(), "no pass is open to compare");
-    assert!(
-        state.last_ended_pass().is_some(),
-        "no pass has ended to compare"
-    );
 
-    let real = alder::app::status_document(state, &snapshot.head, false, None);
+    let real = alder::app::status_document(&snapshot.state, &snapshot.head, false, None);
     let simulated = alderd::effects::Effects::alder(&host, &["status"]).unwrap();
     assert_eq!(
         simulated, real,
@@ -331,24 +347,14 @@ fn the_simulated_status_serves_the_loop_section_production_builds() {
     );
 
     // An equality between two empty states would prove nothing, so pin the
-    // fields the loop actually turns on. `wake_at` is null on both sides: no
-    // command the daemon sends sets one, so no scenario this harness reaches
-    // populates it. Requiring the simulator to emit the key is what catches it
-    // being renamed or dropped; the equality above carries its value whenever
-    // there is one.
+    // fields the loop actually turns on. `review_at` is null on both sides: no
+    // command the daemon sends defers work, so no scenario this harness
+    // reaches populates it — the CLI test suite covers it end to end.
     assert!(from_real.head > 0, "the status document reports head 0");
-    let open = from_real
-        .open_pass
-        .expect("production reports the open pass");
-    assert!(!open.id.is_empty(), "loop.open_pass.id is empty");
-    assert!(!open.handle.is_empty(), "loop.open_pass.handle is empty");
-    let last = from_real
-        .last_pass
-        .expect("production reports the last pass");
-    assert!(last.outcome.is_some(), "loop.last_pass.outcome is gone");
+    assert_eq!(from_real.engine.as_deref(), Some("stub"));
     assert!(
-        last.ended_seq.is_some(),
-        "loop.last_pass.ended_seq is gone, and it is the whole log trigger"
+        from_real.nudge_requested_seq.is_some(),
+        "loop.nudge_requested_seq is gone, and it is the manual trigger"
     );
 }
 
@@ -444,14 +450,14 @@ fn a_worktree_torn_before_its_admin_entry_still_converges() {
 
 /// Production types the injection and presses Enter as two separate tmux
 /// invocations, so a daemon killed between them leaves the pane holding a line
-/// nobody submitted while the log already says the pass was woken. Pinned so
-/// the subset does not depend on proptest finding it.
+/// nobody submitted — a missed wake. Pinned so the subset does not depend on
+/// proptest finding it.
 #[test]
 fn an_injection_torn_before_its_enter_leaves_text_nobody_submitted() {
     let probe = Simulator::new(13);
     Driver::new(probe.clone(), config()).poll_once().unwrap();
     let trace = probe.trace();
-    let inject = trace[position_of(&trace, "pass.inject") - 1].clone();
+    let inject = trace[position_of(&trace, "wake.inject") - 1].clone();
     assert_eq!(
         inject.footprint,
         vec!["typed", "submitted"],
@@ -474,16 +480,20 @@ fn an_injection_torn_before_its_enter_leaves_text_nobody_submitted() {
             .any(|session| session.ends_with(":typed")),
         "the torn injection left no unsubmitted text: {digest:#?}"
     );
-    assert!(
-        digest.state.contains("Open"),
-        "the pass should be open and unhanded-over: {digest:#?}"
-    );
+    // Nothing was handed over and — the point — nothing durable says
+    // otherwise: the wake that was missed is recorded nowhere.
+    assert_eq!(host.wakes_delivered(), 0);
 
-    // Convergence, and with it the pane invariant: recovery times the
-    // abandoned pass out, and `assert_invariant` holds the leftover text to
-    // the rule that makes it transient rather than pretending it is gone.
+    // Convergence, and with it the pane invariant: the restarted daemon does
+    // not know the dirty session, restarts it, and delivers a fresh wake;
+    // `assert_invariant` holds any leftover text to the rule that makes it
+    // transient rather than pretending it is gone.
     host.recover(false);
     host.assert_invariant(false);
+    assert!(
+        host.wakes_delivered() >= 1,
+        "the missed wake was never made up"
+    );
 }
 
 fn generated_case(seed: u64, noise: Vec<u8>, fault_slots: Vec<(u8, u8)>) -> Case {
@@ -534,13 +544,11 @@ fn a_daemon_that_died_mid_injection_does_not_reuse_the_pane_it_dirtied() {
     // The same prefix `execute_case` runs, so boundary ordinals line up.
     let probe = spawn_probe(23);
     Driver::new(probe.clone(), config()).poll_once().unwrap();
-    let inject = position_of(&probe.trace(), "pass.inject");
+    let inject = position_of(&probe.trace(), "wake.inject");
 
     // Tear the injection — text typed, Enter not — and then let the case go on
-    // to fire again with no restart of its own in between. The one extra poll
-    // matters: it times the abandoned pass out, because while a pass is open
-    // the driver only awaits it and never reaches the injection path at all.
-    // The nudge inside the death operation is what then makes it fire.
+    // to fire again with no restart of its own in between. The nudge inside
+    // the death operation is what makes it fire.
     let mut case = generated_case(23, vec![1], Vec::new());
     case.fault_schedule = vec![Fault::torn(inject, 0b01)];
     let digest = execute_case(&case);
@@ -553,9 +561,9 @@ fn a_daemon_that_died_mid_injection_does_not_reuse_the_pane_it_dirtied() {
     );
 }
 
-/// One armed script means one scripted pass, whoever runs it.
+/// One armed script means one scripted act, whoever runs it.
 ///
-/// The script belongs to the pass, not to a session, and getting that wrong
+/// The script belongs to the wake, not to a session, and getting that wrong
 /// has failed in both directions here. Arming only the *next* session creation
 /// never reached a leader the daemon reuses, so an operation named for a death
 /// produced none. Arming both the live session and the next creation fired on
@@ -570,12 +578,16 @@ fn one_armed_leader_death_kills_exactly_one_leader() {
     // A leader session exists and this daemon knows it, so the next fire
     // reuses it rather than restarting it.
     driver.poll_once().unwrap();
-    host.script_leader(AgentScript::DieMidPass);
+    host.run_leader_if_injected();
+    host.script_leader(AgentScript::DieMidAct);
     host.nudge();
     driver.poll_once().unwrap();
-    // The scripted leader is gone; firing again builds a replacement.
+    host.run_leader_if_injected();
+    // The scripted leader is gone; firing again builds a replacement, which
+    // acts as an ordinary leader.
     host.nudge();
     let _ = driver.poll_once();
+    host.run_leader_if_injected();
 
     let deaths = host
         .trace()
@@ -612,7 +624,7 @@ fn the_leader_death_operation_kills_a_leader_that_is_already_running() {
     let created = digest
         .trace
         .iter()
-        .position(|boundary| boundary.contains("pass.session-create"))
+        .position(|boundary| boundary.contains("wake.session-create"))
         .expect("the poll before the death creates a leader session");
     let died = digest
         .trace
@@ -660,11 +672,12 @@ proptest! {
 }
 
 #[test]
-fn a_leader_stub_can_die_mid_pass_without_stranding_it() {
+fn a_leader_stub_can_die_mid_act_without_stranding_anything() {
     let host = Simulator::new(4);
-    host.script_leader(AgentScript::DieMidPass);
+    host.script_leader(AgentScript::DieMidAct);
     let mut driver = Driver::new(host.clone(), config());
     driver.poll_once().unwrap();
+    host.run_leader_if_injected();
     host.recover(false);
     host.assert_invariant(false);
 }

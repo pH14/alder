@@ -5,10 +5,12 @@ use serde_json::json;
 
 use crate::error::{AlderError, Result};
 
+use chrono::{DateTime, Utc};
+
 use super::{
     Attempt, AttemptCheck, AttemptOutcome, AttemptState, CheckStatus, Event, EventPayload,
-    LoopControl, Observation, ObservationKey, Pass, PassState, Question, QuestionAnswer, Work,
-    WorkOperation, WorkState, WorkStateChange,
+    LoopControl, Observation, ObservationKey, Question, QuestionAnswer, Work, WorkOperation,
+    WorkState, WorkStateChange,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -18,7 +20,6 @@ pub struct ProjectState {
     pub work: BTreeMap<String, Work>,
     pub attempts: BTreeMap<String, Attempt>,
     pub questions: BTreeMap<String, Question>,
-    pub passes: BTreeMap<String, Pass>,
     pub loop_control: LoopControl,
 }
 
@@ -235,7 +236,7 @@ impl ProjectState {
                             }
                             if let Some(state_change) = state_change {
                                 match state_change {
-                                    WorkStateChange::Block { reason } => {
+                                    WorkStateChange::Block { reason, until } => {
                                         require_text("block reason", reason)?;
                                         if !matches!(
                                             work.state,
@@ -248,6 +249,10 @@ impl ProjectState {
                                         }
                                         work.state = WorkState::Blocked;
                                         work.block_reason = Some(reason.clone());
+                                        // The latest block's statement wins
+                                        // whole: a re-block without a deadline
+                                        // clears the previous one.
+                                        work.block_until = *until;
                                     }
                                     WorkStateChange::Unblock { reason } => {
                                         require_text("unblock reason", reason)?;
@@ -265,6 +270,7 @@ impl ProjectState {
                                         }
                                         work.state = WorkState::Open;
                                         work.block_reason = None;
+                                        work.block_until = None;
                                     }
                                 }
                             }
@@ -477,6 +483,7 @@ impl ProjectState {
                 let work = self.work.get_mut(work_id).expect("checked above");
                 work.state = WorkState::Done;
                 work.block_reason = None;
+                work.block_until = None;
                 work.outcome = Some(if *external {
                     format!("external: {}", evidence.as_deref().unwrap_or_default())
                 } else {
@@ -543,6 +550,7 @@ impl ProjectState {
                 let work = self.work.get_mut(work_id).expect("checked above");
                 work.state = WorkState::Dropped;
                 work.block_reason = None;
+                work.block_until = None;
                 work.outcome = Some(why.clone());
                 work.changed_seq = seq;
             }
@@ -564,6 +572,7 @@ impl ProjectState {
                 let surviving = self.unanswered_questions(work_id).into_iter().next();
                 let work = self.work.get_mut(work_id).expect("checked above");
                 work.outcome = None;
+                work.block_until = None;
                 match surviving {
                     Some(question_id) => {
                         work.state = WorkState::Blocked;
@@ -631,77 +640,15 @@ impl ProjectState {
                     actor: event.actor.clone(),
                 });
             }
-            EventPayload::PassStarted { pass } => {
-                if self.passes.contains_key(&pass.id) {
-                    return Err(AlderError::validation(format!(
-                        "pass `{}` already exists",
-                        pass.id
-                    )));
-                }
-                if let Some(open) = self.open_pass() {
-                    return Err(AlderError::with_context(
-                        "pass_open",
-                        format!("pass `{}` is still open", open.id),
-                        json!({"pass_id": open.id, "engine": open.engine}),
-                    ));
-                }
-                require_text("pass engine", &pass.engine)?;
-                validate_handle(&pass.handle)?;
-                let mut triggers = pass.triggers.clone();
-                triggers.sort();
-                triggers.dedup();
-                self.passes.insert(
-                    pass.id.clone(),
-                    Pass {
-                        id: pass.id.clone(),
-                        engine: pass.engine.clone(),
-                        handle: pass.handle.clone(),
-                        triggers,
-                        state: PassState::Open,
-                        outcome: None,
-                        report: None,
-                        wake_at: None,
-                        rotate: false,
-                        why: None,
-                        at_head: pass.at_head,
-                        started_at: event.at,
-                        started_seq: seq,
-                        ended_at: None,
-                        ended_seq: None,
-                    },
-                );
-                // A wake consumes any pending rotation simply by being later in
-                // the log than its request.
-                self.loop_control.last_wake_seq = Some(seq);
-            }
-            EventPayload::PassEnded {
-                pass_id,
-                outcome,
-                report,
-                wake_at,
-                rotate,
-                why,
-            } => {
-                let pass = self
-                    .passes
-                    .get_mut(pass_id)
-                    .ok_or_else(|| AlderError::not_found("pass", pass_id))?;
-                if pass.state == PassState::Ended {
-                    return Err(AlderError::with_context(
-                        "pass_ended",
-                        format!("pass `{pass_id}` has already ended"),
-                        json!({"pass_id": pass_id, "outcome": pass.outcome}),
-                    ));
-                }
-                pass.state = PassState::Ended;
-                pass.outcome = Some(*outcome);
-                pass.report = report.clone().filter(|report| !report.trim().is_empty());
-                pass.wake_at = *wake_at;
-                pass.rotate = *rotate;
-                pass.why = why.clone().filter(|why| !why.trim().is_empty());
-                pass.ended_at = Some(event.at);
-                pass.ended_seq = Some(seq);
-                if *rotate {
+            // Passes were run records of the loop reading its own log. They
+            // are inert history now: the fold gives them no state, and no
+            // append path can produce a new one.
+            EventPayload::LegacyPassStarted(_) => {}
+            EventPayload::LegacyPassEnded(body) => {
+                // A historical `pass end --rotate` was also a rotation
+                // request, and that half of the event was a statement about
+                // the loop rather than about the pass, so it still folds.
+                if body.get("rotate").and_then(serde_json::Value::as_bool) == Some(true) {
                     self.loop_control.rotate_requested_seq = Some(seq);
                 }
             }
@@ -763,6 +710,7 @@ impl ProjectState {
                 priority: definition.priority,
                 state: WorkState::Open,
                 block_reason: None,
+                block_until: None,
                 outcome: None,
                 opened_seq: seq,
                 changed_seq: seq,
@@ -838,20 +786,16 @@ impl ProjectState {
         Ok(())
     }
 
-    /// The one pass that has not ended, if any. Passes are serialized, so this
-    /// is the loop's equivalent of one active attempt per work item.
-    pub fn open_pass(&self) -> Option<&Pass> {
-        self.passes
+    /// The earliest review deadline any blocked work item carries. A deferral
+    /// is a statement on the work item — `work block --until` — and this is
+    /// its one derived rendezvous: the driver wakes the leader at this time,
+    /// and the leader reviews whatever demanded the deferral.
+    pub fn next_review_at(&self) -> Option<DateTime<Utc>> {
+        self.work
             .values()
-            .find(|pass| pass.state == PassState::Open)
-    }
-
-    /// The most recently ended pass in log order.
-    pub fn last_ended_pass(&self) -> Option<&Pass> {
-        self.passes
-            .values()
-            .filter(|pass| pass.state == PassState::Ended)
-            .max_by_key(|pass| pass.ended_seq)
+            .filter(|work| work.state == WorkState::Blocked)
+            .filter_map(|work| work.block_until)
+            .min()
     }
 
     pub fn active_attempt_for(&self, work_id: &str) -> Option<&Attempt> {
@@ -971,14 +915,6 @@ impl ProjectState {
             return Err(AlderError::with_context(
                 "config_conflict",
                 format!("configured prefix `{prefix}` does not match work `{id}`"),
-                json!({"prefix": prefix, "id": id}),
-            ));
-        }
-        let pass_prefix = format!("{prefix}-pass-");
-        if let Some(id) = self.passes.keys().find(|id| !id.starts_with(&pass_prefix)) {
-            return Err(AlderError::with_context(
-                "config_conflict",
-                format!("configured prefix `{prefix}` does not match pass `{id}`"),
                 json!({"prefix": prefix, "id": id}),
             ));
         }
@@ -1435,6 +1371,7 @@ mod tests {
         if let WorkOperation::Edit { state_change, .. } = &mut block_b {
             *state_change = Some(WorkStateChange::Block {
                 reason: "pause".to_owned(),
+                until: None,
             });
         }
         state
@@ -1895,154 +1832,171 @@ mod tests {
         }
     }
 
-    fn wake(id: &str) -> EventPayload {
-        EventPayload::PassStarted {
-            pass: crate::domain::PassDefinition {
-                id: id.to_owned(),
-                engine: "claude".to_owned(),
-                handle: "tmux:alder-leader".to_owned(),
-                triggers: vec![
-                    crate::domain::PassTrigger::Log,
-                    crate::domain::PassTrigger::Log,
-                ],
-                at_head: 0,
-            },
-        }
-    }
-
-    fn end(id: &str, rotate: bool) -> EventPayload {
-        EventPayload::PassEnded {
-            pass_id: id.to_owned(),
-            outcome: crate::domain::PassOutcome::Ok,
-            report: Some("did the work\nsecond line".to_owned()),
-            wake_at: None,
-            rotate,
-            why: None,
+    /// A historical pass event decoded off the wire, complete with the body
+    /// shapes the old schema wrote.
+    fn legacy_pass(seq: u64, kind: &str, body: serde_json::Value) -> Event {
+        let payload = serde_json::from_value(json!({"type": kind, "body": body}))
+            .expect("a historical pass event decodes");
+        Event {
+            id: format!("legacy-{seq}"),
+            seq,
+            at: Utc::now(),
+            actor: "alderd".to_owned(),
+            payload,
+            schema: "alder.event.v0".to_owned(),
         }
     }
 
     #[test]
-    fn only_one_pass_may_be_open_at_a_time() {
+    fn legacy_pass_events_fold_as_inert_history() {
         let mut state = ProjectState::default();
-        state.apply(&event(1, wake("hm-pass-1"))).unwrap();
-        assert_eq!(state.open_pass().unwrap().id, "hm-pass-1");
-        // Triggers are deduplicated so the record reads cleanly.
-        assert_eq!(state.passes["hm-pass-1"].triggers.len(), 1);
-
-        assert_eq!(
-            state.apply(&event(2, wake("hm-pass-2"))).unwrap_err().code,
-            "pass_open"
-        );
-        assert_eq!(
-            state.apply(&event(2, wake("hm-pass-1"))).unwrap_err().code,
-            "validation_failed"
-        );
-
-        state.apply(&event(2, end("hm-pass-1", false))).unwrap();
-        assert!(state.open_pass().is_none());
-        assert_eq!(state.last_ended_pass().unwrap().id, "hm-pass-1");
-        assert_eq!(
-            state.passes["hm-pass-1"].report_line(),
-            Some("did the work")
-        );
-        assert_eq!(
-            state
-                .apply(&event(3, end("hm-pass-1", false)))
-                .unwrap_err()
-                .code,
-            "pass_ended"
-        );
-        assert_eq!(
-            state
-                .apply(&event(3, end("hm-pass-9", false)))
-                .unwrap_err()
-                .code,
-            "not_found"
-        );
-        state.apply(&event(3, wake("hm-pass-2"))).unwrap();
-        assert_eq!(state.open_pass().unwrap().id, "hm-pass-2");
+        state
+            .apply(&legacy_pass(
+                1,
+                "pass.started",
+                json!({"pass": {"id": "hm-pass-1", "engine": "claude",
+                        "handle": "tmux:alder-leader", "triggers": ["log"], "at_head": 0}}),
+            ))
+            .unwrap();
+        state
+            .apply(&legacy_pass(
+                2,
+                "pass.ended",
+                json!({"pass_id": "hm-pass-1", "outcome": "ok",
+                        "report": "swept", "wake_at": null, "rotate": false, "why": null}),
+            ))
+            .unwrap();
+        // Nothing folds: no object, no loop state, no constraint on order.
+        assert!(state.work.is_empty());
+        assert!(state.loop_control.rotate_requested_seq.is_none());
+        // Two historical opens in a row were once rejected; as history they
+        // are inert and both replay.
+        state
+            .apply(&legacy_pass(
+                3,
+                "pass.started",
+                json!({"pass": {"id": "hm-pass-2"}}),
+            ))
+            .unwrap();
+        state
+            .apply(&legacy_pass(
+                4,
+                "pass.started",
+                json!({"pass": {"id": "hm-pass-3"}}),
+            ))
+            .unwrap();
     }
 
     #[test]
-    fn a_pass_keeps_the_reason_it_was_ended_for_and_drops_a_blank_one() {
-        let ended_with = |why: Option<&str>| {
-            let mut state = ProjectState::default();
-            state.apply(&event(1, wake("hm-pass-1"))).unwrap();
-            state
-                .apply(&event(
-                    2,
-                    EventPayload::PassEnded {
-                        pass_id: "hm-pass-1".to_owned(),
-                        outcome: crate::domain::PassOutcome::Timeout,
-                        report: None,
-                        wake_at: None,
-                        rotate: false,
-                        why: why.map(ToOwned::to_owned),
-                    },
-                ))
-                .unwrap();
-            state.passes["hm-pass-1"].why.clone()
-        };
-
-        // A pass the driver had to close itself leaves no report, so the
-        // reason it records is the only account of what happened.
-        assert_eq!(
-            ended_with(Some("the pass exceeded its time budget")),
-            Some("the pass exceeded its time budget".to_owned())
-        );
-        assert_eq!(ended_with(Some("   ")), None);
-        assert_eq!(ended_with(None), None);
+    fn a_legacy_pass_end_that_asked_to_rotate_still_reads_as_a_request() {
+        let mut state = ProjectState::default();
+        state
+            .apply(&legacy_pass(
+                1,
+                "pass.ended",
+                json!({"pass_id": "hm-pass-1", "outcome": "ok", "report": null,
+                        "wake_at": null, "rotate": true, "why": null}),
+            ))
+            .unwrap();
+        assert_eq!(state.loop_control.rotate_requested_seq, Some(1));
     }
 
     #[test]
-    fn a_wake_consumes_the_rotation_that_precedes_it() {
+    fn rotation_and_nudge_requests_record_the_sequence_they_were_asked_at() {
         let mut state = ProjectState::default();
-        assert!(!state.loop_control.rotate_pending());
+        assert!(state.loop_control.rotate_requested_seq.is_none());
+        assert!(state.loop_control.nudge_requested_seq.is_none());
 
         state
             .apply(&event(1, EventPayload::LoopRotationRequested { why: None }))
             .unwrap();
-        assert!(state.loop_control.rotate_pending());
+        state
+            .apply(&event(2, EventPayload::LoopNudgeRequested { why: None }))
+            .unwrap();
+        assert_eq!(state.loop_control.rotate_requested_seq, Some(1));
+        assert_eq!(state.loop_control.nudge_requested_seq, Some(2));
 
-        state.apply(&event(2, wake("hm-pass-1"))).unwrap();
-        assert!(!state.loop_control.rotate_pending());
+        // A later request replaces the recorded sequence; whether either has
+        // been acted on is each driver's machine-local knowledge, not a fold
+        // fact.
+        state
+            .apply(&event(3, EventPayload::LoopRotationRequested { why: None }))
+            .unwrap();
+        assert_eq!(state.loop_control.rotate_requested_seq, Some(3));
+        assert_eq!(state.loop_control.nudge_requested_seq, Some(2));
+    }
 
-        // `pass end --rotate` requests the next rotation the same way.
-        state.apply(&event(3, end("hm-pass-1", true))).unwrap();
-        assert!(state.loop_control.rotate_pending());
-        assert!(state.passes["hm-pass-1"].rotate);
-
-        state.apply(&event(4, wake("hm-pass-2"))).unwrap();
-        assert!(!state.loop_control.rotate_pending());
+    fn block_until(id: &str, until: Option<&str>) -> EventPayload {
+        let mut operation = edit(id);
+        if let WorkOperation::Edit { state_change, .. } = &mut operation {
+            *state_change = Some(WorkStateChange::Block {
+                reason: "deferred".to_owned(),
+                until: until.map(|value| {
+                    value
+                        .parse::<DateTime<Utc>>()
+                        .expect("a test instant parses")
+                }),
+            });
+        }
+        EventPayload::WorkChanged {
+            why: Some("deferred".to_owned()),
+            operations: vec![operation],
+        }
     }
 
     #[test]
-    fn a_wake_consumes_the_nudge_that_precedes_it() {
+    fn a_block_may_carry_a_review_deadline_and_the_latest_block_wins_whole() {
         let mut state = ProjectState::default();
-        assert!(!state.loop_control.nudge_pending());
+        state
+            .apply(&event(
+                1,
+                EventPayload::WorkChanged {
+                    why: None,
+                    operations: vec![add("hm-a", &[], &[]), add("hm-b", &[], &[])],
+                },
+            ))
+            .unwrap();
+        assert!(state.next_review_at().is_none());
 
         state
-            .apply(&event(1, EventPayload::LoopNudgeRequested { why: None }))
+            .apply(&event(2, block_until("hm-a", Some("2026-08-04T15:00:00Z"))))
             .unwrap();
-        assert!(state.loop_control.nudge_pending());
-
-        state.apply(&event(2, wake("hm-pass-1"))).unwrap();
-        assert!(!state.loop_control.nudge_pending());
-
-        // A nudge after the wake waits for the next one.
         state
-            .apply(&event(3, EventPayload::LoopNudgeRequested { why: None }))
+            .apply(&event(3, block_until("hm-b", Some("2026-08-04T12:00:00Z"))))
             .unwrap();
-        assert!(state.loop_control.nudge_pending());
-        // A nudge is not a rotation: each is consumed independently.
-        assert!(!state.loop_control.rotate_pending());
+        assert_eq!(
+            state.work["hm-a"].block_until.unwrap().to_rfc3339(),
+            "2026-08-04T15:00:00+00:00"
+        );
+        // The earliest deadline over all blocked work is the loop's next
+        // review rendezvous.
+        assert_eq!(
+            state.next_review_at().unwrap().to_rfc3339(),
+            "2026-08-04T12:00:00+00:00"
+        );
 
-        // Ending the pass is not a wake, so the nudge stays pending.
-        state.apply(&event(4, end("hm-pass-1", false))).unwrap();
-        assert!(state.loop_control.nudge_pending());
+        // Re-blocking without a deadline clears it: the latest statement wins.
+        state.apply(&event(4, block_until("hm-b", None))).unwrap();
+        assert!(state.work["hm-b"].block_until.is_none());
 
-        state.apply(&event(5, wake("hm-pass-2"))).unwrap();
-        assert!(!state.loop_control.nudge_pending());
+        // Unblocking clears the deadline with the reason.
+        let mut unblock = edit("hm-a");
+        if let WorkOperation::Edit { state_change, .. } = &mut unblock {
+            *state_change = Some(WorkStateChange::Unblock {
+                reason: "reviewed".to_owned(),
+            });
+        }
+        state
+            .apply(&event(
+                5,
+                EventPayload::WorkChanged {
+                    why: Some("reviewed".to_owned()),
+                    operations: vec![unblock],
+                },
+            ))
+            .unwrap();
+        assert!(state.work["hm-a"].block_until.is_none());
+        assert!(state.next_review_at().is_none());
     }
 
     #[test]
@@ -2104,51 +2058,6 @@ mod tests {
                 .unwrap_err()
                 .code,
             "validation_failed"
-        );
-    }
-
-    #[test]
-    fn passes_must_carry_a_valid_engine_handle_and_prefix() {
-        let mut state = ProjectState::default();
-        let invalid_engine = EventPayload::PassStarted {
-            pass: crate::domain::PassDefinition {
-                id: "hm-pass-1".to_owned(),
-                engine: " ".to_owned(),
-                handle: "tmux:alder-leader".to_owned(),
-                triggers: vec![],
-                at_head: 0,
-            },
-        };
-        assert_eq!(
-            state
-                .clone()
-                .apply(&event(1, invalid_engine))
-                .unwrap_err()
-                .code,
-            "validation_failed"
-        );
-        let invalid_handle = EventPayload::PassStarted {
-            pass: crate::domain::PassDefinition {
-                id: "hm-pass-1".to_owned(),
-                engine: "claude".to_owned(),
-                handle: "no-kind".to_owned(),
-                triggers: vec![],
-                at_head: 0,
-            },
-        };
-        assert_eq!(
-            state
-                .clone()
-                .apply(&event(1, invalid_handle))
-                .unwrap_err()
-                .code,
-            "validation_failed"
-        );
-
-        state.apply(&event(1, wake("other-pass-1"))).unwrap();
-        assert_eq!(
-            state.validate_prefix("hm").unwrap_err().code,
-            "config_conflict"
         );
     }
 

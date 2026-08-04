@@ -77,8 +77,7 @@ use std::{
 use alder::{
     domain::{
         AttemptDefinition, AttemptOutcome, AttemptState, CheckDefinition, EventDraft, EventPayload,
-        PassDefinition, PassOutcome, PassState, PassTrigger, ProjectState, Snapshot,
-        WorkDefinition, WorkOperation, decode_record, encode_draft,
+        ProjectState, Snapshot, WorkDefinition, WorkOperation, decode_record, encode_draft,
     },
     observer::{ReconcileFinding, reconcile},
     projection::{ObservationStatus, ObservedHandle},
@@ -86,7 +85,7 @@ use alder::{
 use alder_log::{Head, Log, LogError, MemoryLog, RecordDraft};
 use alderd::{
     config::Engine,
-    decide::{Decision, Poll, SessionAction, decide, session_action},
+    decide::{Decision, Notes, Poll, SessionAction, decide, session_action},
     driver::Driver,
     effects::Effects,
     error::{DriverError, Result},
@@ -100,12 +99,13 @@ use serde_json::{Value, json};
 const ROOT: &str = "/sim/alder";
 const WORK_ID: &str = "al-sim";
 const LEADER_SESSION: &str = "alder-leader";
+const NOTES_FILE: &str = ".alder/alderd-notes.json";
 const MAX_RECOVERY_ROUNDS: usize = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentScript {
     Complete,
-    DieMidPass,
+    DieMidAct,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,8 +125,9 @@ struct Session {
     /// a killed daemon really can leave, and the next injection would be typed
     /// on top of it.
     pending_input: Option<String>,
-    /// The pass the leader was actually handed, once the text was submitted.
-    injected_pass: Option<String>,
+    /// The wake line the leader was actually handed, once the text was
+    /// submitted and not yet acted on.
+    injected_line: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +172,8 @@ enum Mutation {
     SessionSubmit(String),
     SessionClearInjection(String),
     SessionRemove(String),
+    /// The driver's machine-local notes file replaced whole.
+    Notes(Vec<u8>),
     WorktreeEntryRemoved(PathBuf),
     FilesRemovedUnder(PathBuf),
     DirectoriesRemovedUnder(PathBuf),
@@ -197,6 +200,7 @@ impl Mutation {
             Self::SessionSubmit(_) => "submitted",
             Self::SessionClearInjection(_) => "injection-cleared",
             Self::SessionRemove(_) => "session-removed",
+            Self::Notes(_) => "notes",
             Self::WorktreeEntryRemoved(_) => "worktree-entry-removed",
             Self::FilesRemovedUnder(_) => "files-removed",
             Self::DirectoriesRemovedUnder(_) => "directories-removed",
@@ -360,13 +364,16 @@ struct World {
     branches: BTreeSet<String>,
     directories: BTreeSet<PathBuf>,
     files: BTreeSet<PathBuf>,
-    /// What the next leader agent to be handed a pass will do. A one-shot:
-    /// running it consumes it, so one `script_leader` means one scripted pass,
+    /// What the next leader agent to be handed a wake will do. A one-shot:
+    /// running it consumes it, so one `script_leader` means one scripted act,
     /// whichever session ends up handling it.
     pending_script: AgentScript,
-    /// The witness the shared crashed-verdict predicate needs: how many live
-    /// leader sessions the simulator actually saw disappear.
-    real_leader_deaths: usize,
+    /// The driver's machine-local notes file, as bytes on the fake disk.
+    notes: Option<Vec<u8>>,
+    /// How many wake lines were ever submitted into the leader's pane. Not
+    /// process state: a witness, so a test can prove a duplicate delivery
+    /// actually happened and was harmless.
+    wakes_delivered: usize,
     notices: Vec<String>,
     messages: Vec<String>,
 }
@@ -385,7 +392,8 @@ impl World {
             directories: BTreeSet::new(),
             files: BTreeSet::new(),
             pending_script: AgentScript::Complete,
-            real_leader_deaths: 0,
+            notes: None,
+            wakes_delivered: 0,
             notices: Vec::new(),
             messages: Vec::new(),
         }
@@ -499,18 +507,24 @@ impl Simulator {
         self.shared.world.borrow().faults.iter().copied().collect()
     }
 
-    /// Script what the leader agent does on the next pass it is handed.
+    /// Script what the leader agent does on the next wake it is handed.
     ///
-    /// The script belongs to the *pass*, not to a session, and that is what
-    /// makes one call mean exactly one scripted pass. Scripting a session
-    /// instead has a failure on each side and the harness has now had both: a
+    /// The script belongs to the *wake*, not to a session, and that is what
+    /// makes one call mean exactly one scripted act. Scripting a session
+    /// instead has a failure on each side and the harness has had both: a
     /// script left on the next *creation* never reaches a leader the daemon
     /// reuses, and a script written to both places fires on the live session
     /// and then stays armed for the replacement, so one call meant two deaths.
-    /// Whichever session ends up running the pass consumes it — see
-    /// [`Simulator::run_agent_if_ready`] — so reuse and restart behave alike.
+    /// Whichever session ends up handed the wake consumes it — see
+    /// [`Simulator::run_leader_if_injected`] — so reuse and restart behave
+    /// alike.
     pub fn script_leader(&self, script: AgentScript) {
         self.shared.world.borrow_mut().pending_script = script;
+    }
+
+    /// How many wake lines have ever been submitted at the leader.
+    pub fn wakes_delivered(&self) -> usize {
+        self.shared.world.borrow().wakes_delivered
     }
 
     pub fn advance(&self, ticks: u64) {
@@ -586,17 +600,11 @@ impl Simulator {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let passes = snapshot
-            .state
-            .passes
-            .values()
-            .map(|pass| format!("{}:{:?}:{:?}", pass.id, pass.state, pass.outcome))
-            .collect::<Vec<_>>()
-            .join(",");
         Digest {
             state: format!(
-                "head={};attempts=[{attempts}];passes=[{passes}]",
-                snapshot.head.sequence()
+                "head={};attempts=[{attempts}];wakes={}",
+                snapshot.head.sequence(),
+                world.wakes_delivered,
             ),
             sessions: world
                 .sessions
@@ -640,6 +648,7 @@ impl Simulator {
         decide(
             &config(),
             &state,
+            &self.notes(),
             &Poll {
                 now: self.logical_now(),
                 refresh_changed: false,
@@ -647,6 +656,19 @@ impl Simulator {
                 attached_client: false,
             },
         )
+    }
+
+    /// The driver's notes as the driver itself would read them back: absent or
+    /// unreadable degrades to the fresh state, which only ever costs one
+    /// harmless extra wake.
+    fn notes(&self) -> Notes {
+        self.shared
+            .world
+            .borrow()
+            .notes
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice(bytes).ok())
+            .unwrap_or_default()
     }
 
     fn logical_now(&self) -> DateTime<Utc> {
@@ -782,7 +804,7 @@ impl Simulator {
                         cwd: cwd.clone(),
                         attempt_id: None,
                         pending_input: None,
-                        injected_pass: None,
+                        injected_line: None,
                     },
                 );
             }
@@ -802,31 +824,28 @@ impl Simulator {
                 }
             }
             Mutation::SessionSubmit(name) => {
-                if let Some(session) = self.shared.world.borrow_mut().sessions.get_mut(name) {
-                    // Enter submits the line as it stands. A pass ID is read
-                    // out of it here rather than at send time, so text that was
-                    // corrupted by an earlier torn injection is submitted as
-                    // the garbage it is.
-                    session.injected_pass = session
-                        .pending_input
-                        .take()
-                        .as_deref()
-                        .and_then(injected_pass_id)
-                        .map(str::to_owned);
+                let mut world = self.shared.world.borrow_mut();
+                let mut delivered = false;
+                if let Some(session) = world.sessions.get_mut(name) {
+                    // Enter submits the line as it stands, garbage included if
+                    // an earlier torn injection corrupted it.
+                    session.injected_line = session.pending_input.take();
+                    delivered = name == LEADER_SESSION && session.injected_line.is_some();
+                }
+                if delivered {
+                    world.wakes_delivered += 1;
                 }
             }
             Mutation::SessionClearInjection(name) => {
                 if let Some(session) = self.shared.world.borrow_mut().sessions.get_mut(name) {
-                    session.injected_pass = None;
+                    session.injected_line = None;
                 }
             }
             Mutation::SessionRemove(name) => {
-                let mut world = self.shared.world.borrow_mut();
-                if name == LEADER_SESSION && world.sessions.remove(name).is_some() {
-                    world.real_leader_deaths += 1;
-                } else {
-                    world.sessions.remove(name);
-                }
+                self.shared.world.borrow_mut().sessions.remove(name);
+            }
+            Mutation::Notes(bytes) => {
+                self.shared.world.borrow_mut().notes = Some(bytes.clone());
             }
             Mutation::WorktreeEntryRemoved(path) => {
                 self.shared.world.borrow_mut().worktrees.remove(path);
@@ -886,7 +905,8 @@ impl Simulator {
             .sessions
             .iter()
             // Production's tmux observer deliberately lists only worker
-            // sessions. The leader is a pass handle, not an attempt handle.
+            // sessions. The leader is the loop's session, not an attempt
+            // handle.
             .filter(|(_, session)| session.kind == SessionKind::Worker)
             .map(|(name, session)| ObservedHandle {
                 handle: format!("tmux:{name}"),
@@ -1166,13 +1186,17 @@ impl Simulator {
         let mut daemon = Driver::new(self.clone(), config());
         for _ in 0..MAX_RECOVERY_ROUNDS {
             let round = catch_sim_crash(|| {
+                // The leader acts on any wake it was handed. It reads the fold
+                // and finds this loop already doing the repairs, so it idles —
+                // which is exactly why a duplicated wake is harmless.
+                self.run_leader_if_injected();
                 // observe
                 let _observations = self.observations();
                 // reconcile
                 let findings = self.reconcile();
                 self.assert_anomalies_named(want_worker, &findings);
                 // decide (the production driver repeats this from the same
-                // folded status immediately before applying its loop repair).
+                // folded status immediately before acting).
                 let _decision = self.decision();
                 // repair
                 let mut changed = self.repair_findings(&findings)?;
@@ -1182,10 +1206,10 @@ impl Simulator {
             });
             match round {
                 Some(Ok(_)) => {
+                    self.run_leader_if_injected();
                     let findings = self.reconcile();
                     let stable = findings.is_empty()
                         && self.anomalies(want_worker).is_empty()
-                        && self.snapshot().state.open_pass().is_none()
                         && matches!(self.decision(), Decision::Idle(_))
                         && self.remaining_faults().is_empty();
                     if stable {
@@ -1197,7 +1221,9 @@ impl Simulator {
                     panic!("recovery failed: {error}; digest={:#?}", self.digest())
                 }
                 None => {
-                    // Process death forgets daemon-local session bookkeeping.
+                    // Process death forgets daemon-local session bookkeeping;
+                    // the notes file on the fake disk survives, exactly like
+                    // the real `.alder/` file.
                     daemon = Driver::new(self.clone(), config());
                 }
             }
@@ -1219,17 +1245,16 @@ impl Simulator {
             invariants::log_folds_cleanly(&records),
             "the simulated log does not fold cleanly"
         );
+        // The new central claim: whatever crashed, however many wakes were
+        // missed or duplicated, the log this system produced never mentions
+        // its own readers. Nothing durable records a wake, so there is nothing
+        // for a crash to leave half-said about one.
         assert!(
-            invariants::at_most_one_open_pass(&snapshot.state),
-            "the shared open-pass safety predicate failed"
+            invariants::mentions_no_readers(&snapshot.events),
+            "the simulated log mentions its own readers"
         );
-        let real_leader_deaths = self.shared.world.borrow().real_leader_deaths;
         assert!(
-            invariants::crashed_verdicts_follow_real_crashes(&snapshot.state, real_leader_deaths,),
-            "the log has more crashed pass verdicts than observed leader deaths"
-        );
-        assert!(
-            invariants::rotate_pending_mirrors_the_request_log(&snapshot.state, &snapshot.events),
+            invariants::rotation_request_mirrors_the_log(&snapshot.state, &snapshot.events),
             "the shared rotation-log safety predicate failed"
         );
         assert!(findings.is_empty(), "unreconciled findings: {findings:#?}");
@@ -1237,10 +1262,6 @@ impl Simulator {
             self.anomalies(want_worker).is_empty(),
             "stranded world state: {:?}",
             self.anomalies(want_worker)
-        );
-        assert!(
-            snapshot.state.open_pass().is_none(),
-            "the recovery fixpoint still has an open pass"
         );
         assert!(
             matches!(self.decision(), Decision::Idle(_)),
@@ -1253,11 +1274,11 @@ impl Simulator {
     /// What a pane holding unsubmitted text has to satisfy at the fixpoint.
     ///
     /// A torn `tmux_send_keys` — the literal text sent, the Enter not — really
-    /// does leave text nobody submitted, and *nothing clears it eagerly*:
-    /// `await_pass` times the abandoned pass out and the loop goes idle with
-    /// the line still sitting in the pane. Requiring the fixpoint to be free of
-    /// it would be requiring something the daemon never promised, and would
-    /// only be satisfiable by inventing a sweep production does not perform.
+    /// does leave text nobody submitted, and *nothing clears it eagerly*: the
+    /// loop goes idle with the line still sitting in the pane. Requiring the
+    /// fixpoint to be free of it would be requiring something the daemon never
+    /// promised, and would only be satisfiable by inventing a sweep production
+    /// does not perform.
     ///
     /// What production does promise is that the residue cannot outlive the
     /// silence: the daemon that comes back has forgotten a session it never
@@ -1279,9 +1300,7 @@ impl Simulator {
         if dirty.is_empty() {
             return;
         }
-        let status = self.status_document();
-        let state = LoopState::from_status(&status).expect("status is production-readable");
-        let action = session_action(&config(), &state, "stub", 0, true, None);
+        let action = session_action(&config(), false, "stub", 0, true, None, self.logical_now());
         assert!(
             matches!(action, SessionAction::Restart(_)),
             "panes {dirty:?} hold unsubmitted text, and the next fire would \
@@ -1289,53 +1308,38 @@ impl Simulator {
         );
     }
 
-    /// The scripted leader agent, run when the driver reads the pass it was
-    /// handed.
+    /// The scripted leader agent, run when a submitted wake line is waiting.
     ///
-    /// The append comes first and is atomic; the injection is cleared after.
-    /// A crash between the two replays this, which is why ending the pass is
-    /// guarded on the pass still being open — the second run finds it ended
-    /// and only clears the injection.
-    fn run_agent_if_ready(&self, pass_id: &str) {
+    /// The ordinary script reads the fold and finds nothing this harness has
+    /// not already handled, so it acts by doing nothing and clears the line.
+    /// That is the load-bearing half of the protocol's crash story: a wake
+    /// delivered twice — or to a leader that already acted — changes nothing,
+    /// because the wake carries no work of its own and nothing durable records
+    /// it.
+    pub fn run_leader_if_injected(&self) {
         let script = {
             let mut world = self.shared.world.borrow_mut();
             let handed = world
                 .sessions
                 .get(LEADER_SESSION)
-                .is_some_and(|session| session.injected_pass.as_deref() == Some(pass_id));
-            // Consumed by whichever session runs the pass, so the replacement
-            // created after a scripted death is an ordinary leader again.
+                .is_some_and(|session| session.injected_line.is_some());
+            // Consumed by whichever session was handed the wake, so the
+            // replacement created after a scripted death is an ordinary
+            // leader again.
             handed.then(|| std::mem::replace(&mut world.pending_script, AgentScript::Complete))
         };
         match script {
             Some(AgentScript::Complete) => {
-                let open = self
-                    .snapshot()
-                    .state
-                    .passes
-                    .get(pass_id)
-                    .is_some_and(|pass| pass.state == PassState::Open);
-                if open {
-                    let (footprint, _) = self
-                        .stage(EventPayload::PassEnded {
-                            pass_id: pass_id.to_owned(),
-                            outcome: PassOutcome::Ok,
-                            report: Some("scripted pass complete".to_owned()),
-                            wake_at: None,
-                            rotate: false,
-                            why: None,
-                        })
-                        .expect("the scripted agent ends the pass it was handed");
-                    self.effect("pass.end", footprint);
-                }
+                // The leader's read of the current state.
+                self.effect("leader.read-state", Footprint::read_only());
                 self.effect(
-                    "pass.clear-injection",
+                    "leader.idle",
                     Footprint::tearable(vec![Mutation::SessionClearInjection(
                         LEADER_SESSION.to_owned(),
                     )]),
                 );
             }
-            Some(AgentScript::DieMidPass) => {
+            Some(AgentScript::DieMidAct) => {
                 self.effect(
                     "agent.die",
                     Footprint::tearable(vec![Mutation::SessionRemove(LEADER_SESSION.to_owned())]),
@@ -1374,19 +1378,6 @@ impl Simulator {
     fn answer(&self, args: &[&str]) -> Answer {
         match args {
             ["show", id] if *id == WORK_ID => {
-                let snapshot = self.snapshot();
-                Answer::Read(
-                    alder::app::show_document(
-                        &snapshot.state,
-                        &snapshot.events,
-                        &snapshot.head,
-                        id,
-                    )
-                    .map_err(|error| DriverError::new(error.to_string())),
-                )
-            }
-            ["show", id] if id.contains("-pass-") => {
-                self.run_agent_if_ready(id);
                 let snapshot = self.snapshot();
                 Answer::Read(
                     alder::app::show_document(
@@ -1486,72 +1477,6 @@ impl Simulator {
                     },
                     schema: "alder.attempt.end.v0",
                     fields: json!({"attempt_id": attempt_id, "outcome": requested}),
-                }
-            }
-            ["loop", "wake", rest @ ..] => {
-                let snapshot = self.snapshot();
-                if let Some(open) = snapshot.state.open_pass() {
-                    return Answer::Read(Err(DriverError::coded(
-                        "pass_open",
-                        format!("pass `{}` is open", open.id),
-                    )));
-                }
-                let ordinal = snapshot.state.passes.len() + 1;
-                let pass_id = format!("al-pass-{ordinal}");
-                let engine = value_after(rest, "--engine").unwrap_or("stub").to_owned();
-                let handle = value_after(rest, "--handle")
-                    .unwrap_or("tmux:alder-leader")
-                    .to_owned();
-                let names = values_after(rest, "--trigger");
-                let triggers: Vec<PassTrigger> = names
-                    .iter()
-                    .map(|trigger| match *trigger {
-                        "log" => PassTrigger::Log,
-                        "observations" => PassTrigger::Observations,
-                        "manual" => PassTrigger::Manual,
-                        _ => PassTrigger::Due,
-                    })
-                    .collect();
-                Answer::Mutation {
-                    payload: EventPayload::PassStarted {
-                        pass: PassDefinition {
-                            id: pass_id.clone(),
-                            engine: engine.clone(),
-                            handle: handle.clone(),
-                            triggers,
-                            at_head: snapshot.head.sequence(),
-                        },
-                    },
-                    schema: "alder.loop.wake.v0",
-                    fields: json!({
-                        "pass_id": pass_id,
-                        "engine": engine,
-                        "handle": handle,
-                        "triggers": names,
-                    }),
-                }
-            }
-            ["pass", "end", pass_id, rest @ ..] => {
-                let outcome = match value_after(rest, "--outcome").unwrap_or("timeout") {
-                    "crashed" => PassOutcome::Crashed,
-                    "timeout" => PassOutcome::Timeout,
-                    _ => PassOutcome::Ok,
-                };
-                Answer::Mutation {
-                    payload: EventPayload::PassEnded {
-                        pass_id: (*pass_id).to_owned(),
-                        outcome,
-                        report: None,
-                        wake_at: None,
-                        rotate: false,
-                        why: value_after(rest, "--why").map(str::to_owned),
-                    },
-                    schema: "alder.pass.end.v0",
-                    fields: json!({
-                        "pass_id": pass_id,
-                        "outcome": outcome.as_str(),
-                        "rotate": false,
-                    }),
                 }
             }
             other => Answer::Read(Err(DriverError::new(format!(
@@ -1700,7 +1625,7 @@ impl SpawnHost for Simulator {
             return Err(DriverError::new("session already exists"));
         }
         let label = if session == LEADER_SESSION {
-            "pass.session-create"
+            "wake.session-create"
         } else {
             "spawn.session-create"
         };
@@ -1810,7 +1735,7 @@ impl Effects for Simulator {
 
     fn tmux_session_exists(&self, session: &str) -> Result<bool> {
         let exists = self.shared.world.borrow().sessions.contains_key(session);
-        self.effect("pass.session-probe", Footprint::read_only());
+        self.effect("wake.session-probe", Footprint::read_only());
         Ok(exists)
     }
 
@@ -1819,7 +1744,7 @@ impl Effects for Simulator {
             return Err(DriverError::new("session already exists"));
         }
         self.effect(
-            "pass.session-create",
+            "wake.session-create",
             Footprint::tearable(vec![Mutation::SessionCreate {
                 name: session.to_owned(),
                 cwd: self.root.clone(),
@@ -1830,14 +1755,13 @@ impl Effects for Simulator {
 
     fn tmux_kill_session(&self, session: &str) -> Result<()> {
         self.effect(
-            "pass.session-kill",
+            "wake.session-kill",
             Footprint::tearable(vec![Mutation::SessionRemove(session.to_owned())]),
         );
         Ok(())
     }
 
     fn tmux_send_keys(&self, session: &str, text: &str) -> Result<()> {
-        injected_pass_id(text).ok_or_else(|| DriverError::new("injection has no pass ID"))?;
         let pending = {
             let world = self.shared.world.borrow();
             match world.sessions.get(session) {
@@ -1847,9 +1771,9 @@ impl Effects for Simulator {
         };
         // The invariant unsubmitted text is really held to: nothing is ever
         // typed on top of it. tmux appends, so an injection typed onto a dirty
-        // pane produces one line naming two passes, and the leader would run
-        // neither. This fires the moment that happens rather than leaving it to
-        // be inferred from a stuck fixpoint.
+        // pane produces one garbled line the leader cannot act on. This fires
+        // the moment that happens rather than leaving it to be inferred from a
+        // stuck fixpoint.
         assert!(
             pending.is_none(),
             "injecting `{text}` into `{session}`, which still holds unsubmitted \
@@ -1858,9 +1782,9 @@ impl Effects for Simulator {
         // Production types the literal text and presses Enter as two separate
         // tmux invocations, so this is genuinely two mutations: a daemon killed
         // between them leaves the pane holding text nobody submitted, and the
-        // leader is never handed the pass the log already says was woken.
+        // leader is never handed the wake.
         self.effect(
-            "pass.inject",
+            "wake.inject",
             Footprint::tearable(vec![
                 Mutation::SessionType {
                     name: session.to_owned(),
@@ -1873,13 +1797,39 @@ impl Effects for Simulator {
     }
 
     fn tmux_has_clients(&self, _session: &str) -> Result<bool> {
-        self.effect("pass.clients", Footprint::read_only());
+        self.effect("wake.clients", Footprint::read_only());
         Ok(false)
     }
 
-    fn read_file(&self, _path: &Path) -> Result<Vec<u8>> {
-        self.effect("pass.read-doc", Footprint::read_only());
-        Ok(b"run the scripted pass".to_vec())
+    fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        if path == Path::new(NOTES_FILE) {
+            // Reading one's own notes is part of process birth, not a world
+            // effect: it crosses no effect boundary, so `Driver::new` cannot
+            // itself be a crash site. The notes *write* is the mutation, and
+            // every crash around it is scheduled there.
+            return self
+                .shared
+                .world
+                .borrow()
+                .notes
+                .clone()
+                .ok_or_else(|| DriverError::new("no notes yet"));
+        }
+        self.effect("wake.read-doc", Footprint::read_only());
+        Ok(b"run one bounded iteration".to_vec())
+    }
+
+    fn write_file(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        assert_eq!(
+            path,
+            Path::new(NOTES_FILE),
+            "the driver writes nothing but its own notes"
+        );
+        self.effect(
+            "notes.write",
+            Footprint::tearable(vec![Mutation::Notes(bytes.to_vec())]),
+        );
+        Ok(())
     }
 
     fn file_mtime(&self, _path: &Path) -> Option<DateTime<Utc>> {
@@ -1889,7 +1839,7 @@ impl Effects for Simulator {
 
     fn notify(&self, message: &str) {
         self.effect(
-            "pass.notify",
+            "wake.notify",
             Footprint::tearable(vec![Mutation::Notice(message.to_owned())]),
         );
     }
@@ -1903,7 +1853,7 @@ impl Effects for Simulator {
 
     fn log(&self, message: &str) {
         self.effect(
-            "pass.log",
+            "wake.log",
             Footprint::tearable(vec![Mutation::Message(message.to_owned())]),
         );
     }
@@ -1967,11 +1917,18 @@ pub fn assert_case_converges(case: &Case) -> Digest {
                 daemon = Driver::new(host.clone(), config());
                 true
             }
-            Operation::PollDaemon => catch_sim_crash(|| daemon.poll_once()).is_some(),
+            Operation::PollDaemon => {
+                let survived = catch_sim_crash(|| daemon.poll_once()).is_some();
+                // The leader acts on whatever the poll delivered.
+                catch_sim_crash(|| host.run_leader_if_injected());
+                survived
+            }
             Operation::LeaderDiesMidPass => {
                 host.nudge();
-                host.script_leader(AgentScript::DieMidPass);
-                catch_sim_crash(|| daemon.poll_once()).is_some()
+                host.script_leader(AgentScript::DieMidAct);
+                let survived = catch_sim_crash(|| daemon.poll_once()).is_some();
+                catch_sim_crash(|| host.run_leader_if_injected());
+                survived
             }
             Operation::Tick(ticks) => {
                 host.advance(u64::from(*ticks));
@@ -2004,9 +1961,6 @@ fn dispatch_label(args: &[&str]) -> &'static str {
         ["work", "start", ..] => "spawn.work-start",
         ["attempt", "edit", ..] => "spawn.bind",
         ["attempt", "end", ..] => "repair.attempt-end",
-        ["loop", "wake", ..] => "pass.wake",
-        ["pass", "end", ..] => "pass.repair-end",
-        ["show", id] if id.contains("-pass-") => "pass.show",
         ["show", ..] => "spawn.show",
         ["status", "--section", ..] => "spawn.status",
         ["status"] => "daemon.status",
@@ -2015,24 +1969,10 @@ fn dispatch_label(args: &[&str]) -> &'static str {
     }
 }
 
-/// The pass an injection line hands the leader, read out of the line itself.
-fn injected_pass_id(text: &str) -> Option<&str> {
-    text.split("pass-id: ")
-        .nth(1)
-        .and_then(|tail| tail.split([';', ')']).next())
-}
-
 fn value_after<'a>(args: &'a [&str], flag: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|pair| pair[0] == flag)
         .map(|pair| pair[1])
-}
-
-fn values_after<'a>(args: &'a [&str], flag: &str) -> Vec<&'a str> {
-    args.windows(2)
-        .filter(|pair| pair[0] == flag)
-        .map(|pair| pair[1])
-        .collect()
 }
 
 fn driver_error(error: alder::error::AlderError) -> DriverError {

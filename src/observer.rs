@@ -854,6 +854,7 @@ mod tests {
             priority: 0,
             state,
             block_reason: None,
+            block_until: None,
             outcome: None,
             opened_seq: 1,
             changed_seq: 1,

@@ -69,17 +69,14 @@ $ alder question answer ex-qq6rkd-question-1 "No; reject them with a diagnostic.
 ex-qq6rkd-question-1  answered
 ```
 
-The loop opens a pass, the pass records its outcome, and rotation requests a
-fresh session for the next wake:
+The loop's controls are standing instructions to whatever drives it —
+the log records no runs of the loop itself:
 
 ```text
-$ alder loop wake --engine gpt-5.6-terra --handle process:leader-4242 --trigger manual
-ex-pass-1
+$ alder loop use gpt-5.6-terra
+loop engine gpt-5.6-terra
 
-$ alder pass end ex-pass-1 --outcome ok --report "Reviewed parser decision." --wake 20m
-ex-pass-1  ended ok
-
-$ alder loop rotate --why "Start the next pass in a fresh session."
+$ alder loop rotate --why "Engine upgraded; start the next wake on a fresh session."
 rotation requested
 ```
 
@@ -98,8 +95,7 @@ $ alder status --section ready
 head 11
 
 loop
-  rotate pending
-  last ex-pass-1  ok  Reviewed parser decision.  wake 2026-07-31T19:36:09.751085+00:00
+  engine gpt-5.6-terra
 
 ready
   ex-y60hza  Refresh the release notes  priority 30

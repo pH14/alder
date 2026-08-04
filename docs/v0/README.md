@@ -31,11 +31,12 @@ Work may also carry a durable question when progress requires an asynchronous
 human decision. Questions are subordinate to work rather than a second kind of
 work or a general messaging system.
 
-It also records the driving loop itself: passes, which are the loop's run
-records, and a small set of loop controls. Work is to an attempt what the loop
-is to a pass. These are namespaced separately from the five core structures
-because they describe how the project is being driven rather than what the
-project owes. [LOOP.md](LOOP.md) defines them.
+It also records a small set of loop controls — pause, desired engine,
+rotation and nudge requests — namespaced separately from the five core
+structures because they describe how the project is to be driven rather than
+what the project owes. The log never mentions its own readers: there are no
+run records for the loop, and nothing durable says a pass happened.
+[LOOP.md](LOOP.md) defines this.
 
 Events are stored in Git. Current state, including observations from external
 systems, is a deterministic fold of those events into a local SQLite database.
@@ -65,12 +66,15 @@ One bounded pass is:
 Alder supplies the state needed for this loop. It does not contain the loop's
 engineering judgment.
 
-A pass is that iteration made durable. `alder loop wake` opens one before an
-agent is prompted and `alder pass end` closes it with an outcome, an optional
-report, and an optional request to be woken again. Alder records passes; it
-does not run them. Deciding *when* to wake an agent belongs to a small external
-driver whose read surface is deliberately tiny, and deciding *what* to do
-belongs to the agent.
+A pass is deliberately not made durable. The agent's decisions land on the
+items they concern — which already carry actor and timestamp, so a pass
+reappears in the log as a cluster of appends — and a deferral is a statement
+on the work item (`work block --until`). Deciding *when* to wake an agent
+belongs to a small external driver whose read surface is deliberately tiny
+and which appends nothing; deciding *what* to do belongs to the agent, which
+rebuilds its picture from the fold every time. That idempotence is the crash
+story: a missed or duplicated wake is harmless because nothing durable
+records one.
 
 ## Principles
 
@@ -122,16 +126,12 @@ This makes both crash windows repairable:
 - worker exists, handle was not recorded: find it by attempt ID and attach its
   handle with `alder attempt edit`.
 
-A pass follows the same rule. `alder loop wake` is appended before an agent is
-prompted, and it returns the pass ID the prompt carries:
-
-- recorded pass, agent never prompted: the pass stays open until someone ends
-  it as `crashed` or, past its time budget, `timeout`;
-- prompted agent, no record: impossible, because the prompt carries the pass ID
-  the wake produced.
-
-An open pass rejects the next wake, so the repair is forced rather than
-optional, and any reader with a terminal can perform it.
+The loop deliberately does not follow this rule, because a wake has no
+effects worth recording: it launches nothing and owns nothing. The driver
+delivers a line and notes, machine-locally, which head it acted on; a crash
+on either side of that note costs a duplicated or briefly delayed wake, and
+both are harmless because the woken agent reads the fold and acts only on
+what the state demands.
 
 ### Attempts outlive callers
 
@@ -163,9 +163,9 @@ another valid writer.
 again requires explicitly ending that attempt with `alder attempt end`, so a
 second launch cannot silently hide the first.
 
-One open pass per loop is the same rule at the loop's scale. `alder loop wake`
-rejects a second pass while one is open, so two drivers cannot quietly run two
-leaders.
+The loop needs no counterpart rule. Wakes are not records, so two drivers
+pointed at one log at worst deliver duplicate wakes — and a duplicate wake is
+a no-op for the same reason a crash is.
 
 ### Completion criteria precede execution
 

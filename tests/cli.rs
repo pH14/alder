@@ -1383,14 +1383,14 @@ fn hypothetical_ordinals_and_debug_selection_are_exact() {
 }
 
 #[test]
-fn the_loop_records_passes_and_folds_its_desired_state() {
+fn the_loop_folds_desired_state_and_the_pass_noun_is_gone() {
     let project = TestProject::new();
     let empty = project.success(&["status"]);
     assert_eq!(empty["loop"]["paused"], false);
-    assert_eq!(empty["loop"]["rotate_pending"], false);
     assert!(empty["loop"]["engine"].is_null());
-    assert!(empty["loop"]["open_pass"].is_null());
-    assert!(empty["loop"]["last_pass"].is_null());
+    assert!(empty["loop"]["rotate_requested_seq"].is_null());
+    assert!(empty["loop"]["nudge_requested_seq"].is_null());
+    assert!(empty["loop"]["review_at"].is_null());
     assert!(!project.human(&["status"]).contains("\nloop\n"));
 
     project.success(&["loop", "use", "claude"]);
@@ -1408,189 +1408,205 @@ fn the_loop_records_passes_and_folds_its_desired_state() {
     project.success(&["loop", "resume"]);
     assert_eq!(project.success(&["status"])["loop"]["paused"], false);
 
-    let woke = project.success(&[
-        "loop",
-        "wake",
-        "--engine",
-        "claude",
-        "--handle",
-        "tmux:alder-leader",
-        "--trigger",
-        "log",
-        "--trigger",
-        "due",
-    ]);
-    assert_eq!(woke["schema"], "alder.loop.wake.v0");
-    let pass = string(&woke, "pass_id");
-    assert_eq!(pass, "hm-pass-1");
-    // Triggers fold into a canonical order rather than command-line order.
-    assert_eq!(woke["triggers"], json!(["log", "due"]));
+    // The pass noun and `loop wake` are gone from the grammar entirely: the
+    // log carries no statements about its own readers, so there is nothing
+    // for either command to write. Clap rejects them before any code runs.
+    for gone in [
+        &["pass", "end", "--outcome", "ok"][..],
+        &["loop", "wake"][..],
+    ] {
+        let output = project.command().args(gone).output().unwrap();
+        assert!(!output.status.success(), "{gone:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unrecognized subcommand"),
+            "{gone:?}: {stderr}"
+        );
+    }
+    // And no live object answers to a pass ID.
+    assert_eq!(project.failure(&["show", "hm-pass-1"])["code"], "not_found");
 
-    let open = project.success(&["status"])["loop"]["open_pass"].clone();
-    assert_eq!(open["id"], pass);
-    assert_eq!(open["engine"], "claude");
-    assert_eq!(open["handle"], "tmux:alder-leader");
-    assert_eq!(open["at_head"], 3);
-
-    // Passes are serialized, exactly like one active attempt per work item.
-    let conflict = project.failure(&[
-        "loop",
-        "wake",
-        "--engine",
-        "claude",
-        "--handle",
-        "tmux:alder-leader",
-    ]);
-    assert_eq!(conflict["code"], "pass_open");
-    assert_eq!(conflict["context"]["pass_id"], pass);
-
-    let ended = project.success(&[
-        "pass",
-        "end",
-        "--outcome",
-        "ok",
-        "--report",
-        "started hm-9a1\nsecond line",
-        "--wake",
-        "20m",
-    ]);
-    assert_eq!(ended["schema"], "alder.pass.end.v0");
-    assert_eq!(ended["pass_id"], pass);
-    assert_eq!(ended["outcome"], "ok");
-    let last = project.success(&["status"])["loop"]["last_pass"].clone();
-    assert_eq!(last["id"], pass);
-    assert_eq!(last["outcome"], "ok");
-    assert_eq!(last["report_line"], "started hm-9a1");
-    assert!(last["wake_at"].is_string());
-    // The head at which the pass ended is the driver's log-trigger baseline:
-    // it equals the current head until someone else appends.
-    assert_eq!(last["ended_seq"], project.success(&["status"])["head"]);
-    assert!(
-        project
-            .human(&["status"])
-            .contains("last hm-pass-1  ok  started hm-9a1")
-    );
-
-    assert_eq!(
-        project.failure(&["pass", "end", "--outcome", "ok"])["code"],
-        "no_open_pass"
-    );
-    assert_eq!(
-        project.failure(&["pass", "end", &pass, "--outcome", "ok"])["code"],
-        "pass_ended"
-    );
-    assert_eq!(
-        project.failure(&["pass", "end", "hm-pass-9", "--outcome", "ok"])["code"],
-        "not_found"
-    );
-    assert_eq!(
-        project.failure(&[
-            "loop",
-            "wake",
-            "--engine",
-            "claude",
-            "--handle",
-            "tmux:alder-leader",
-            "--wake",
-            "20x",
-        ])["code"],
-        "invalid_command"
-    );
-
-    let shown = project.success(&["show", &pass]);
-    assert_eq!(shown["kind"], "pass");
-    assert_eq!(shown["current"]["engine"], "claude");
-    assert_eq!(shown["current"]["triggers"], json!(["log", "due"]));
-    let types: Vec<_> = shown["history"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|event| event["type"].as_str().unwrap())
-        .collect();
-    assert_eq!(types, ["pass.started", "pass.ended"]);
-
-    let rows = project.success(&[
-        "debug",
-        "query",
-        "SELECT id, engine, state, outcome FROM passes ORDER BY started_seq",
-    ]);
-    assert_eq!(rows["result"]["rows"][0]["id"], pass);
-    assert_eq!(rows["result"]["rows"][0]["state"], "ended");
     let control = project.success(&["debug", "query", "SELECT * FROM loop_control"]);
     assert_eq!(control["result"]["rows"][0]["engine"], "claude");
     assert_eq!(control["result"]["rows"][0]["paused"], 0);
+    assert!(control["result"]["rows"][0]["rotate_requested_seq"].is_null());
 }
 
 #[test]
-fn a_rotation_is_pending_only_until_the_next_wake() {
+fn rotation_and_nudge_requests_record_the_sequence_they_were_asked_at() {
     let project = TestProject::new();
     let requested = project.success(&["loop", "rotate", "--why", "engine upgraded"]);
     assert_eq!(requested["schema"], "alder.loop.rotate.v0");
-    assert_eq!(project.success(&["status"])["loop"]["rotate_pending"], true);
-    assert!(project.human(&["status"]).contains("rotate pending"));
+    let status = project.success(&["status"]);
+    // The request records its own sequence — the head it appended at. Whether
+    // any driver has acted on it is that driver's machine-local knowledge,
+    // not a log fact, so the fold serves the raw sequence and nothing more.
+    assert_eq!(status["loop"]["rotate_requested_seq"], status["head"]);
+    assert!(status["loop"]["nudge_requested_seq"].is_null());
 
-    let wake = [
-        "loop",
-        "wake",
-        "--engine",
-        "codex",
-        "--handle",
-        "tmux:alder-leader",
-    ];
-    project.success(&wake);
-    assert_eq!(
-        project.success(&["status"])["loop"]["rotate_pending"],
-        false
-    );
+    let nudged = project.success(&["loop", "nudge", "--why", "an answer landed"]);
+    assert_eq!(nudged["schema"], "alder.loop.nudge.v0");
+    let status = project.success(&["status"]);
+    assert_eq!(status["loop"]["nudge_requested_seq"], status["head"]);
+    // A nudge is not a rotation; each records its own request.
+    assert_eq!(status["loop"]["rotate_requested_seq"], 1);
 
-    // `pass end --rotate` requests the next rotation without a second command.
-    project.success(&["pass", "end", "--outcome", "ok", "--rotate"]);
-    assert_eq!(project.success(&["status"])["loop"]["rotate_pending"], true);
-    project.success(&wake);
-    assert_eq!(
-        project.success(&["status"])["loop"]["rotate_pending"],
-        false
-    );
-    project.success(&[
-        "pass",
-        "end",
-        "--outcome",
-        "crashed",
-        "--why",
-        "engine exited",
-    ]);
-    assert_eq!(
-        project.success(&["status"])["loop"]["rotate_pending"],
-        false
-    );
-    assert_eq!(
-        project.success(&["status"])["loop"]["last_pass"]["outcome"],
-        "crashed"
-    );
+    // A later request replaces the recorded sequence.
+    project.success(&["loop", "rotate"]);
+    let status = project.success(&["status"]);
+    assert_eq!(status["loop"]["rotate_requested_seq"], status["head"]);
 }
 
 #[test]
-fn a_nudge_is_pending_only_until_the_next_wake() {
+fn a_deferral_is_a_statement_on_the_work_item_and_expires_into_review() {
     let project = TestProject::new();
-    let requested = project.success(&["loop", "nudge", "--why", "an answer landed"]);
-    assert_eq!(requested["schema"], "alder.loop.nudge.v0");
-    assert_eq!(project.success(&["status"])["loop"]["nudge_pending"], true);
-    assert!(project.human(&["status"]).contains("nudge pending"));
-    // A nudge is not a rotation; each is pending on its own request.
-    assert_eq!(
-        project.success(&["status"])["loop"]["rotate_pending"],
-        false
+    let early = string(
+        &project.success(&["work", "add", "--title", "Deferred early"]),
+        "work_id",
+    );
+    let late = string(
+        &project.success(&["work", "add", "--title", "Deferred late"]),
+        "work_id",
     );
 
-    project.success(&[
-        "loop",
-        "wake",
-        "--engine",
-        "codex",
-        "--handle",
-        "tmux:alder-leader",
+    // A malformed instant never reaches the log.
+    assert_eq!(
+        project.failure(&["work", "block", &early, "--why", "wait", "--until", "3pm"])["code"],
+        "validation_failed"
+    );
+
+    let blocked = project.success(&[
+        "work",
+        "block",
+        &early,
+        "--why",
+        "third-party outage",
+        "--until",
+        "2099-01-02T15:00:00Z",
     ]);
-    assert_eq!(project.success(&["status"])["loop"]["nudge_pending"], false);
+    assert_eq!(blocked["until"], "2099-01-02T15:00:00+00:00");
+    project.success(&[
+        "work",
+        "block",
+        &late,
+        "--why",
+        "vendor review",
+        "--until",
+        "2099-06-01T09:00:00Z",
+    ]);
+
+    // The earliest deadline over all blocked work is the loop's next review
+    // rendezvous — what the driver wakes the leader at.
+    let status = project.success(&["status", "--section", "blocked"]);
+    assert_eq!(status["loop"]["review_at"], "2099-01-02T15:00:00Z");
+    let untils: Vec<_> = status["blocked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|work| work["block_until"].clone())
+        .collect();
+    assert!(untils.contains(&json!("2099-01-02T15:00:00Z")));
+    assert!(
+        project
+            .human(&["status", "--section", "blocked"])
+            .contains("third-party outage · until 2099-01-02T15:00:00+00:00")
+    );
+    // A future deadline is not yet anyone's business: no attention finding,
+    // and the item is not actionable.
+    assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
+    assert!(
+        !project.success(&["next"])["work"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|work| work["id"] == json!(early.clone()))
+    );
+
+    // A deadline already in the past has expired: the item surfaces under
+    // attention for review, and nothing unblocks by itself.
+    let overdue = string(
+        &project.success(&["work", "add", "--title", "Deferred and overdue"]),
+        "work_id",
+    );
+    project.success(&[
+        "work",
+        "block",
+        &overdue,
+        "--why",
+        "check again later",
+        "--until",
+        "2020-01-01T00:00:00Z",
+    ]);
+    let status = project.success(&["status", "--section", "attention"]);
+    assert_eq!(status["counts"]["attention"], 1);
+    let finding = status["attention"][0].clone();
+    assert_eq!(finding["kind"], "block_expired");
+    assert!(finding["detail"].as_str().unwrap().contains(&overdue));
+    assert!(
+        string(&finding, "suggested_command").starts_with(&format!("alder work unblock {overdue}"))
+    );
+    // Expired is still blocked: review is an explicit, reasoned act.
+    assert!(
+        !project.success(&["next"])["work"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|work| work["id"] == json!(overdue.clone()))
+    );
+    project.success(&["work", "unblock", &overdue, "--why", "reviewed: retry now"]);
+    assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
+
+    // Re-blocking without a deadline clears it: the latest statement wins.
+    // The key is present and explicitly null, not merely absent.
+    project.success(&["work", "block", &overdue, "--why", "paused indefinitely"]);
+    let shown = project.success(&["show", &overdue]);
+    assert!(
+        shown["current"]
+            .as_object()
+            .unwrap()
+            .contains_key("block_until")
+    );
+    assert!(shown["current"]["block_until"].is_null());
+}
+
+#[test]
+fn finish_drop_and_reopen_each_clear_the_deferral_deadline() {
+    let project = TestProject::new();
+    let until = "2099-01-02T15:00:00Z";
+    let block_until =
+        |work: &str| project.success(&["show", work])["current"]["block_until"].clone();
+
+    // Finishing deferred work (externally: blocked work may only be finished
+    // with evidence) clears its deadline with it.
+    let finished = string(
+        &project.success(&["work", "add", "--title", "Deferred then finished"]),
+        "work_id",
+    );
+    project.success(&[
+        "work", "block", &finished, "--why", "wait", "--until", until,
+    ]);
+    project.success(&[
+        "work",
+        "finish",
+        &finished,
+        "--external",
+        "--evidence",
+        "done upstream",
+    ]);
+    assert!(block_until(&finished).is_null());
+
+    // Dropping deferred work clears it too.
+    let dropped = string(
+        &project.success(&["work", "add", "--title", "Deferred then dropped"]),
+        "work_id",
+    );
+    project.success(&["work", "block", &dropped, "--why", "wait", "--until", until]);
+    project.success(&["work", "drop", &dropped, "--why", "requirement withdrawn"]);
+    assert!(block_until(&dropped).is_null());
+
+    // And a reopened item carries no stale deadline from its blocked past.
+    project.success(&["work", "reopen", &finished, "--why", "not actually done"]);
+    assert!(block_until(&finished).is_null());
 }
 
 #[test]
@@ -1817,46 +1833,26 @@ fn a_dead_workers_liveness_stays_absent_until_its_attempt_ends() {
     assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
 }
 
-/// The live incident of al-pass-64, reproduced and pinned exactly as it
-/// behaves today: the leader ran `pass end` while a worker was appending its
-/// own milestones and lost the compare-and-append.
+/// The live incident of al-pass-64, reproduced over the mutation that
+/// remains: a leader-side write lost the compare-and-append to a worker
+/// appending its own milestones.
 ///
 /// The loss itself is correct and stays: an ordinary mutation validated
 /// against one head is never replayed against another. What is under test is
 /// that losing announces the command's effect — nothing — in a form no caller
 /// can read as success, and that rereading and rerunning is what settles it.
 #[test]
-fn a_pass_end_that_loses_the_race_says_it_wrote_nothing() {
+fn a_mutation_that_loses_the_race_says_it_wrote_nothing() {
     let project = TestProject::new();
     let work = string(
         &project.success(&["work", "add", "--title", "Raced"]),
         "work_id",
     );
     let attempt = string(&project.success(&["work", "start", &work]), "attempt_id");
-    let pass = string(
-        &project.success(&[
-            "loop",
-            "wake",
-            "--engine",
-            "claude",
-            "--handle",
-            "tmux:alder-leader",
-        ]),
-        "pass_id",
-    );
     let rival = project.rival();
 
     let lost = project.losing(
-        &[
-            "pass",
-            "end",
-            "--outcome",
-            "ok",
-            "--report",
-            "swept the frontier",
-            "--wake",
-            "20m",
-        ],
+        &["work", "block", &work, "--why", "paused for the worker"],
         &rival,
         &["attempt", "edit", &attempt, "--note", "worker milestone"],
     );
@@ -1868,8 +1864,8 @@ fn a_pass_end_that_loses_the_race_says_it_wrote_nothing() {
     // names the event that was not written.
     assert_eq!(
         lines.next().unwrap(),
-        "error [head_conflict]: nothing was appended: `pass.ended` lost the \
-         compare-and-append to another writer, which moved the shared log from 3 to 4; \
+        "error [head_conflict]: nothing was appended: `work.changed` lost the \
+         compare-and-append to another writer, which moved the shared log from 2 to 3; \
          reread and run the command again"
     );
     // Nothing under it has the shape of a result document: the receipt-shaped
@@ -1878,31 +1874,29 @@ fn a_pass_end_that_loses_the_race_says_it_wrote_nothing() {
         lines.collect::<Vec<_>>(),
         [
             "  appended: false",
-            "  current_head: 4",
-            "  event: pass.ended",
-            "  expected_head: 3",
+            "  current_head: 3",
+            "  event: work.changed",
+            "  expected_head: 2",
         ]
     );
     assert!(!stderr.contains('{'), "{stderr}");
 
-    // Nothing was written, so the pass is still open and unreported.
-    let open = project.success(&["status"])["loop"].clone();
-    assert_eq!(open["open_pass"]["id"], pass);
-    assert!(open["last_pass"].is_null());
+    // Nothing was written, so the work is still open.
+    assert_eq!(
+        project.success(&["show", &work])["current"]["state"],
+        "open"
+    );
 
     // The same loss over the JSON channel: one document on standard output,
     // per the output contract, but one no reader can take for a mutation
     // result.
     let structured = project.losing(
         &[
-            "pass",
-            "end",
-            "--outcome",
-            "ok",
-            "--report",
-            "swept the frontier",
-            "--wake",
-            "20m",
+            "work",
+            "block",
+            &work,
+            "--why",
+            "paused for the worker",
             "--json",
         ],
         &rival,
@@ -1918,38 +1912,18 @@ fn a_pass_end_that_loses_the_race_says_it_wrote_nothing() {
         document["context"],
         json!({
             "appended": false,
-            "event": "pass.ended",
-            "expected_head": 4,
-            "current_head": 5,
+            "event": "work.changed",
+            "expected_head": 3,
+            "current_head": 4,
         })
     );
 
-    // A33: rereading and rerunning settles it, and records exactly one ending.
-    let ended = project.success(&[
-        "pass",
-        "end",
-        "--outcome",
-        "ok",
-        "--report",
-        "swept the frontier",
-        "--wake",
-        "20m",
-    ]);
-    assert_eq!(ended["pass_id"], pass);
-    let last = project.success(&["status"])["loop"]["last_pass"].clone();
-    assert_eq!(last["id"], pass);
-    assert_eq!(last["report_line"], "swept the frontier");
-    let endings = project.success(&["show", &pass])["history"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|event| event["type"] == "pass.ended")
-        .count();
-    assert_eq!(endings, 1);
-    assert_eq!(
-        project.failure(&["pass", "end", "--outcome", "ok"])["code"],
-        "no_open_pass"
-    );
+    // A2: rereading and rerunning settles it, and records exactly one block.
+    let blocked = project.success(&["work", "block", &work, "--why", "paused for the worker"]);
+    assert_eq!(blocked["work_id"], json!(work.clone()));
+    let shown = project.success(&["show", &work]);
+    assert_eq!(shown["current"]["state"], "blocked");
+    assert_eq!(shown["current"]["block_reason"], "paused for the worker");
 }
 
 /// The Git subcommand of each recorded call, which is what a cost assertion

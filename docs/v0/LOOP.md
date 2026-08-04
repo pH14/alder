@@ -1,22 +1,30 @@
 # Alder v0 loop
 
 [README.md](README.md) describes one bounded pass of the driving loop. This
-document defines what makes that loop durable: who wakes it, what it records,
-and how a reader repairs it after a crash.
+document defines what makes that loop durable: who wakes the leader, what is
+recorded where, and why a crash anywhere in the wake path is harmless.
 
-## The parallel
+## The one rule
 
-Work is to an attempt what the loop is to a pass.
+**The log never mentions its own readers.** It carries statements about work,
+attempts, questions, and observations — never about the processes that read
+it. There are no pass records: nothing durable says the loop ran, is running,
+or should run next. What earlier versions put into pass records survives
+elsewhere, each fact where it belongs:
 
-| | Parent | Run record | Creator | Closer |
-| --- | --- | --- | --- | --- |
-| Execution | work item | attempt | `work start` | `attempt end` |
-| Iteration | the loop | pass | `loop wake` | `pass end` |
+- decisions land on the items they concern, which already carry actor and
+  timestamp — a pass reappears in the log as a cluster of appends;
+- "check again at 3pm" is a statement on the work item
+  (`work block --until`), not on the loop;
+- crash forensics live in session transcripts;
+- the loop's heartbeat lives in the driver's own local log.
 
-The parallel is not decoration. It is why the same reasoning transfers: intent
-is recorded before effects, at most one run is open at a time, the parent
-creates because only the parent knows whether another one is allowed, and the
-record closes itself because by then it exists.
+The payoff is the crash story. A wake is delivered by typing one line into a
+terminal and noting, machine-locally, which head it was for. Nothing durable
+records it, so there is nothing for a crash to half-say: a missed wake is made
+up by the next poll, a duplicated wake finds a leader with nothing new to do,
+and both cost nothing because **passes are idempotent** — the leader rebuilds
+its picture from the fold every time.
 
 The loop is a singleton per log. There is one loop, so it needs no ID, and
 `alder status` reports it rather than a `loop show` command.
@@ -26,18 +34,17 @@ The loop is a singleton per log. There is one loop, so it needs no ID, and
 Alder stores. The driver schedules. The leader thinks.
 
 The **driver** (`alderd`, or anything that behaves like it) decides *when* to
-wake a leader. It exercises no judgment about work. Its complete read surface
-is three things:
+wake a leader. It exercises no judgment about work, and it appends nothing.
+Its complete read surface is two things:
 
 1. `alder status --json`: the current head, and the loop section. It ignores
    the rest of the document.
 2. `alder refresh --json` → `.changed`.
-3. `alder show <pass-id> --json`, while it is waiting for a pass to end.
 
-Everything the driver needs about the log is in the first of those, including
-the wake deadline the last pass requested. It runs no Git command of its own:
-the head is already in `status`, and a second view of the store would only be
-another thing that can disagree.
+Its complete durable write surface is one machine-local file:
+`.alder/alderd-notes.json`, the last head it acted on and when. That file is
+the wake rule's whole memory, it belongs to the machine rather than to the
+project, and losing it costs exactly one redundant wake.
 
 A driver may additionally stat `.alder/last-append`, a marker the CLI touches
 after each confirmed append, to shorten the sleep before its next read. A
@@ -48,9 +55,12 @@ That list is the contract. A driver that reads the ready frontier to decide
 whether waking is worthwhile has started doing the leader's job, and it will
 be wrong in ways nobody can see, because its reasoning is not in the log.
 
-The **leader** is an agent in an interactive session. It reads the pass
-document, runs one bounded pass, and ends it with a report. Every judgment
-lives there.
+The **leader** is an agent in an interactive session. Woken, it reads the
+pass document, rebuilds its picture from the fold, and acts on whatever the
+state demands — open work with no attempt, an unanswered question, a dead
+execution, an observation nothing is addressing — then exits or idles.
+Anything a pass would once have reported goes as a statement about the
+specific item it concerns.
 
 **Alder** validates and folds. It never launches a session, never validates an
 engine name, and never enforces the pause it stores.
@@ -72,174 +82,128 @@ agent uses the repository as its working directory and sends both standard
 output and standard error to `.alder/alderd.log`. Loading is opt-in: nothing
 in the build or test path invokes `launchctl`.
 
-The daemon must remain safe to kill at any instant. Its useful state is either
-in the durable Alder log or observable from the leader and worker sessions;
-after a kill, the next daemon starts from those facts and applies the stale
-pass repair rule above. This statelessness is what makes `KeepAlive`
-sufficient: launchd only needs to bring back the daemon, not reconstruct an
-in-memory checkpoint or coordinate a binary self-restart. Rebuilding a binary
-does not restart an already-running daemon.
+The daemon must remain safe to kill at any instant. Its one durable file is
+advisory, so after a kill the next daemon starts from the log, the notes if
+they survive, and whatever sessions it can observe. This statelessness is
+what makes `KeepAlive` sufficient: launchd only needs to bring back the
+daemon, not reconstruct a checkpoint.
 
-## Pass lifecycle
+## The wake
 
-### Intent before effects
+### The rule
 
-The driver appends `loop wake` **before** it types anything into the leader's
-terminal. This is the same rule as `work start`, and it makes both crash
-windows repairable:
+> Wake the leader when the observed head differs from the last head this
+> driver acted on.
 
-- **Recorded pass, nothing injected.** The next poll finds an open pass, waits
-  for it, and eventually ends it as `timeout`. Nothing was launched, so nothing
-  leaks; the log honestly shows a pass that produced no report.
-- **Injected, wake not recorded.** This cannot happen, because the wake is what
-  produces the pass ID the injection carries. A leader that receives no
-  injection does nothing.
+The baseline is the driver's notes, not the log. Immediately after a wake the
+noted head *is* the observed head, so a driver's own delivery cannot
+self-trigger; anything anyone appends afterwards — the leader acting, a
+worker's milestone, a phone command — moves the head past the note and wakes
+the leader again. Being woken by your own writes is harmless: the leader
+reads the fold, and a fold with nothing new demands nothing.
 
-If instead the injection came first, a driver crash between the two would leave
-a leader running a pass no record mentions, and a second driver would happily
-start another one.
+Three more conditions wake without a head movement, each read from the same
+status document or the driver's own observation:
 
-### Who writes what
+- **observations**: `alder refresh` reported a semantic change;
+- **due**: a deferral deadline (any entry in the loop section's
+  `review_deadlines`) has arrived and no wake has been delivered since it
+  passed, or `maxIntervalSeconds` elapsed since the last wake — the ceiling
+  that keeps a quiet loop honest;
+- **manual**: a nudge request is later in the log than the noted head.
 
-| Event | Written by | Why |
-| --- | --- | --- |
-| `pass.started` | the driver, via `loop wake` | Only the driver knows it is about to launch. |
-| `pass.ended` (`ok`) | the leader, via `pass end` | Only the leader knows what it did. |
-| `pass.ended` (`crashed`, `timeout`) | the driver | The leader is, by definition, not available to say so. |
+### The delivery
 
-`crashed` and `timeout` are the driver's two honest statements. `crashed` means
-the engine session is gone; `timeout` means the pass outlived its budget. The
-driver never writes `ok`, because it cannot know that anything was
-accomplished.
+Firing is strictly ordered: reconcile the session, inject the line, then
+write the notes. The two crash windows this leaves are both benign, and both
+are pinned by the crash simulator and the model checker:
 
-### The stale pass
+- **Injected, not noted.** The leader was handed the line; the restarted
+  daemon does not know that, and delivers it again. A duplicate wake finds a
+  leader with nothing new to do.
+- **Torn injection.** The text was typed, the Enter was not. Nothing was
+  delivered and nothing was noted; the next fire restarts the pane it does
+  not recognize and delivers a fresh line.
 
-A pass left open by a crashed engine, a killed daemon, or a machine restart
-blocks the next wake, which is the point: `loop wake` returns `pass_open`
-rather than opening a second one. Recovery is one rule, and any reader can
-apply it:
+The injected message takes one of two forms and nothing else:
 
-> End the open pass with `crashed` if its session is observably gone, with
-> `timeout` if it has outlived the pass budget, and leave it alone otherwise.
+```text
+Read <passDoc>, then read the current Alder state and act on it (triggers: <kinds>).
+Read the current Alder state and act on it (triggers: <kinds>).
+```
 
-A driver applies this rule where it belongs — when a poll *finds* a pass open,
-never when its own wake loses a race. Those two cases look identical to the
-CLI and are opposites in fact:
+The first is the bootstrap form, used on a fresh session that has not read
+the pass document. There is no identifier in the line, because nothing
+durable exists to identify.
 
-- **A pass found open at poll start** predates this driver's attention. It may
-  be minutes or hours old, its session may be gone, and resolving it is the
-  only way the loop moves again.
-- **A `pass_open` rejection from a wake** means someone opened a pass in the
-  seconds since this poll read status — a second driver, or a human. That pass
-  is new and almost certainly alive. The right response is to concede: log it,
-  do nothing, and read the fold again next poll.
+The message is deliberately not a prompt. Everything the leader needs to know
+about *how* to act lives in the pass document, in the repository, under
+review. Anything the driver said instead would be operational instruction
+smuggled past the place where it can be read and changed.
 
-A driver that treats the second case like the first kills a live pass and
-steals its slot. The rule is therefore: **a driver ends only passes it found
-already open, never a pass that beat it to the wake.**
-
-`crashed` also requires a session the driver can actually look at. A pass
-records the handle of whatever runs it, and that handle may name a different
-tmux session or no tmux session at all — another writer's pass might be
-`codex:019f…`. A driver may only report `crashed` for a `tmux:<session>` handle
-whose session it has checked and found gone. For any other handle it can
-observe nothing, and time is the only fact it has, so `timeout` is the only
-verdict available to it.
-
-A human with a terminal applies the same rule with `alder pass end <id>
---outcome crashed --why "…"`. Nothing about the repair is privileged.
-
-### Reading a pass
-
-`alder show <pass-id>` returns the full record — engine, handle, trigger kinds,
-the head the wake was appended at, outcome, report, requested wake time — plus
-its two events. `alder status` carries the open pass and the last ended pass,
-which is what a fresh agent needs to answer "did the loop run, and what
-happened."
-
-A pass records two heads, and both exist so that a reader needs no memory.
-`at_head` is what the pass could see when it started. `ended_seq` is where the
-log stood when it finished, which is why "has anything happened since the loop
-last ran" is a comparison between two numbers in one `status` document rather
-than a note the driver keeps to itself.
+**Trigger kinds are informational. They are never scope limiters.** A leader
+woken by `observations` reads the complete state exactly like one woken by
+`due`; the driver cannot know what else changed while it was not looking.
 
 ## Fold rules
 
-The loop's durable state is small and every rule is stated precisely, because
-a fold rule that is only *mostly* understood produces bugs nobody can localise.
-
-**Passes.** `pass.started` inserts a pass in state `open` and is rejected if
-any pass is already open. `pass.ended` moves it to `ended` and is rejected if
-it already ended. Pass ordinals start at one, increase by one, and are never
-reused; passes are serialized, so the ordinal is safe.
+The loop's durable state is small and every rule is stated precisely.
 
 **Pause.** Last writer wins. `loop.paused` sets `paused` to true with the
 reason from the event; `loop.resumed` sets it to false and clears the reason.
-No count, no nesting, no owner. Two agents pausing and one resuming leaves the
-loop running, which is the correct reading of "the latest instruction wins."
+No count, no nesting, no owner.
 
 **Engine.** Last writer wins. `loop.engine_selected` replaces the desired
-engine name. The name is an opaque string that Alder never validates: a driver
-that cannot run it says so out of band rather than Alder refusing to store the
-operator's stated intent.
+engine name. The name is an opaque string that Alder never validates.
 
-**Rotation.** Derived from event order, never stored as a flag:
+**Rotation and nudge.** Each request records the sequence it was asked at:
+`rotate_requested_seq`, `nudge_requested_seq`. That is all the fold says.
+Whether a request has been *acted on* is not a log fact — the log does not
+record its readers — so each driver compares the request sequence with its
+own noted head: later than the note means outstanding, and acting (which
+moves the note past it) consumes it. Two drivers with separate notes each
+honor the request once, which is the harmless direction.
 
-> A rotation is pending when the sequence of the most recent rotation request
-> is greater than the sequence of the most recent `pass.started`, or when a
-> rotation has been requested and no wake has ever happened.
-
-A rotation request is either a `loop.rotation_requested` event or a
-`pass.ended` carrying `rotate`. The next wake consumes the request simply by
-being later in the log, so there is no clearing write, no window in which the
-flag is stale, and no way for two drivers to disagree about whether a rotation
-already happened.
-
-**Nudge.** The identical derivation over its own request kind:
-
-> A nudge is pending when the sequence of the most recent
-> `loop.nudge_requested` event is greater than the sequence of the most recent
-> `pass.started`, or when a nudge has been requested and no wake has ever
-> happened.
-
-The next wake consumes it by log order alone, exactly as with rotation.
+**Deferral.** `work block --until <RFC3339>` stores a review deadline on the
+work item. The loop section serves every blocked item's deadline, sorted, as
+`review_deadlines`, plus `review_at`, the earliest, for the human status
+line. The fold is a
+pure function of the log and cannot read a clock, so nothing unblocks by
+itself — when the deadline passes, `alder status` surfaces the item as a
+`block_expired` attention finding, and the driver's `due` trigger wakes the
+leader to review it. Historical `pass.started`/`pass.ended` events decode and
+replay as inert history (a historical `pass end --rotate` still reads as a
+rotation request); no append path can produce a new one.
 
 ## Eras and rotation
 
-A **session era** is one engine process serving a run of passes. An era ends
+A **session era** is one engine process serving a run of wakes. An era ends
 for one of five reasons, and the driver checks them in this order:
 
 1. the running session is not one this daemon started;
 2. the desired engine changed;
-3. a rotation is pending;
+3. a rotation request is later in the log than the noted head;
 4. the pass document changed;
-5. the session reached its pass budget.
+5. the session outlived `maxSessionAgeSeconds`.
 
-The first is why a driver restart replaces the session rather than adopting it:
-the daemon cannot tell what engine is running or how much context it has
+The first is why a driver restart replaces the session rather than adopting
+it: the daemon cannot tell what engine is running or how much context it has
 accumulated, and adopting a stranger would silently defeat every other rule.
+The last is wall-clock age on purpose: nothing durable counts passes, so
+nothing counts them here either.
 
-Rotation is the operator's manual era boundary. `loop rotate` after upgrading
-an engine, and `pass end --rotate` when the leader itself concludes the session
-has drifted — a context window near its limit, a tool in a bad state, an
-engine that has started repeating itself. Only the leader can judge that, which
-is why `--rotate` rides on `pass end` rather than being something the driver
-infers.
-
-Rotation is *not* an emergency stop. It changes which process serves the next
-pass; it does not stop passes. `loop pause` stops passes.
+Rotation is the operator's manual era boundary: `loop rotate` after upgrading
+an engine, or when a session has drifted. It is *not* an emergency stop — it
+changes which process serves the next wake; `loop pause` stops wakes.
 
 ## Nudging
 
-A nudge is the operator's "wake it now". The last pass may have picked a long
-wake honestly and then the world changed — an answer landed or a new work item
-was filed — and `loop nudge` asks the driver to run the next pass ahead of that
-schedule. The driver reports a pending nudge as the `manual` trigger and lets
-it override both of its deferrals, the debounce and the attached-client hold,
-the way the `maxIntervalSeconds` ceiling does: a nudge is the human overriding
-the driver's politeness. It does not override `loop pause`, and it cannot open
-a second pass while one is open. A nudge changes *when* the next pass runs,
-never *what* it does.
+A nudge is the operator's "wake it now". `loop nudge` appends a request; the
+append itself moves the head, and the request being later in the log than the
+driver's note makes it the `manual` trigger, which overrides both of the
+driver's deferrals — the debounce and the attached-client hold — the way the
+`maxIntervalSeconds` ceiling does. It does not override `loop pause`. A nudge
+changes *when* the leader is next woken, never *what* it does.
 
 ## Workers
 
@@ -301,35 +265,6 @@ ladder carries the whole climb and a one-shot worker carries its resume
 handle. All are ordinary open-ended metadata: Alder stores and displays them
 and reads nothing into them.
 
-## The trigger-message contract
-
-A wake records why it fired: `log`, `observations`, `due`, or `manual`. The
-driver repeats those kinds in the message it injects.
-
-**Trigger kinds are informational. They are never scope limiters.**
-
-A pass woken by `observations` runs its complete sync — status, reconcile,
-questions, selection — exactly like a pass woken by `due`. The
-driver cannot know what else changed while it was not looking, and the whole
-point of a durable log is that the leader does not have to be told; it
-reads.
-
-The injected message therefore takes one of two forms and nothing else:
-
-```text
-Read <passDoc>, then run one pass (pass-id: <id>; triggers: <kinds>).
-Run one pass (pass-id: <id>; triggers: <kinds>).
-```
-
-The first is the bootstrap form, used on a fresh session that has not read the
-pass document. The pass ID is included so the leader can end the right pass and
-so a human reading the terminal can find the record.
-
-The message is deliberately not a prompt. Everything the leader needs to know
-about *how* to run a pass lives in the pass document, in the repository, under
-review. Anything the driver said instead would be operational instruction
-smuggled past the place where it can be read and changed.
-
 ## Driver configuration
 
 `.alder/driver.json`, local to the machine and gitignored:
@@ -345,8 +280,7 @@ smuggled past the place where it can be read and changed.
   "pollSeconds": 60,
   "debounceSeconds": 20,
   "maxIntervalSeconds": 1800,
-  "passTimeoutSeconds": 3600,
-  "maxPassesPerSession": 25,
+  "maxSessionAgeSeconds": 21600,
   "notify": "terminal-notifier -title alder -message"
 }
 ```
@@ -362,28 +296,28 @@ the log would invite one machine's configuration to become another's problem.
 See [crates/alderd/README.md](../../crates/alderd/README.md) for the field
 table and the poll sequence.
 
-## Deferral
+## Deferral of the injection
 
 Two conditions hold an injection without cancelling it:
 
-- **Debounce.** A burst of commits should produce one pass, not one per commit.
+- **Debounce.** A burst of commits should produce one wake, not one per commit.
 - **An attached client.** If someone is watching the tmux session, an injection
   would land under their cursor.
 
-Neither survives `maxIntervalSeconds`. A loop that never runs is a worse
-failure than an inconvenient injection, and a deferral with no ceiling is
-indistinguishable from a hang.
+Neither survives `maxIntervalSeconds`, and neither survives a pending nudge.
+A loop that never runs is a worse failure than an inconvenient injection, and
+a deferral with no ceiling is indistinguishable from a hang.
 
 ## What the loop is not
 
 - **Not a scheduler.** It decides when to wake one agent, not what runs.
 - **Not a leader role.** Alder still stores no leader, generation, or lease.
-  Two drivers pointed at one log are not an error; the one-open-pass rule makes
-  the second one's wake fail, and it reads the loop fold again next poll. The
-  loser concedes; it never ends the winner's pass to take the slot.
+  Two drivers pointed at one log are not an error; each keeps its own notes,
+  and the worst case is a duplicate wake, which costs nothing for the same
+  reason a crash costs nothing.
 - **Not a sensor trace.** `refresh` records only changed current levels. The
   log is the folded observation picture, so a flip and return between observer
   runs is intentionally absent.
 - **Not a place for driver diagnostics.** A driver that cannot reach the store
   or cannot find its engine says so to its operator. It does not write its own
-  troubles into the project's log.
+  troubles into the project's log — the log never mentions its readers.

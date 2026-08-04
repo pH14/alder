@@ -4,21 +4,21 @@ use std::{
     io::{self, Read},
 };
 
-use chrono::TimeDelta;
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use crate::{
     cli::{
         AttemptCommand, AttemptEditArgs, Command, DebugCommand, DebugDbCommand, DebugLogCommand,
-        LoopCommand, NonSuccessOutcome, ObservationCommand, PassCommand, PassOutcomeArg,
-        QuestionCommand, StatusSection, TriggerKind, WorkAddArgs, WorkCommand, WorkEditArgs,
+        LoopCommand, NonSuccessOutcome, ObservationCommand, QuestionCommand, StatusSection,
+        WorkAddArgs, WorkCommand, WorkEditArgs,
     },
     config::{Project, initialize},
     domain::{
         AppendResult, Attempt, AttemptOutcome, ChangeMode, CheckDefinition, CheckStatus,
         CheckUpdate, Event, EventPayload, GraphChangeDocument, Head, NullableString,
-        ObservationAppend, ObservationKey, PassOutcome, PassTrigger, ProjectLog, ProjectState,
-        Question, Snapshot, WorkStateChange, prepare_change,
+        ObservationAppend, ObservationKey, ProjectLog, ProjectState, Question, Snapshot,
+        WorkStateChange, prepare_change,
     },
     error::{AlderError, Result},
     observer,
@@ -140,30 +140,6 @@ impl App {
                 ),
             },
             Command::Loop(args) => loop_command(&context, &args.command),
-            Command::Pass(args) => match &args.command {
-                PassCommand::End(args) => {
-                    let wake_after = args.wake.as_deref().map(parse_duration).transpose()?;
-                    let (result, id) = context.log.end_pass(
-                        args.pass.as_deref(),
-                        args.outcome.into(),
-                        args.report.clone(),
-                        wake_after,
-                        args.rotate,
-                        args.why.clone(),
-                    )?;
-                    let outcome: PassOutcome = args.outcome.into();
-                    Ok(mutation_output(
-                        "alder.pass.end.v0",
-                        &result,
-                        json!({
-                            "pass_id": id,
-                            "outcome": outcome.as_str(),
-                            "rotate": args.rotate,
-                        }),
-                        format!("{id}  ended {}", outcome.as_str()),
-                    ))
-                }
-            },
             Command::Debug(args) => debug(&context, &args.command),
         }
     }
@@ -319,17 +295,28 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
         }
         WorkCommand::Block(args) => {
             require_reason("--why", Some(&args.why))?;
+            let until = args.until.as_deref().map(parse_instant).transpose()?;
             let result = context.log.set_work_state(
                 &args.work,
                 WorkStateChange::Block {
                     reason: args.why.clone(),
+                    until,
                 },
             )?;
             Ok(mutation_output(
                 "alder.work.block.v0",
                 &result,
-                json!({"work_id": args.work, "state": "blocked"}),
-                format!("{}  blocked", args.work),
+                json!({
+                    "work_id": args.work,
+                    "state": "blocked",
+                    "until": until.map(|until| until.to_rfc3339()),
+                }),
+                match until {
+                    Some(until) => {
+                        format!("{}  blocked until {}", args.work, until.to_rfc3339())
+                    }
+                    None => format!("{}  blocked", args.work),
+                },
             ))
         }
         WorkCommand::Unblock(args) => {
@@ -361,32 +348,6 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
 
 fn loop_command(context: &Context, command: &LoopCommand) -> Result<Output> {
     match command {
-        LoopCommand::Wake(args) => {
-            let mut triggers: Vec<PassTrigger> =
-                args.trigger.iter().copied().map(Into::into).collect();
-            // A wake with no stated trigger came from a person at a terminal.
-            if triggers.is_empty() {
-                triggers.push(PassTrigger::Manual);
-            }
-            triggers.sort();
-            triggers.dedup();
-            let (result, id) = context.log.wake_loop(
-                args.engine.clone(),
-                args.handle.clone(),
-                triggers.clone(),
-            )?;
-            Ok(mutation_output(
-                "alder.loop.wake.v0",
-                &result,
-                json!({
-                    "pass_id": id,
-                    "engine": args.engine,
-                    "handle": args.handle,
-                    "triggers": trigger_names(&triggers),
-                }),
-                id,
-            ))
-        }
         LoopCommand::Pause(args) => {
             let result = context.log.pause_loop(args.why.clone())?;
             Ok(mutation_output(
@@ -726,7 +687,7 @@ fn status(
         .filter_map(|handle| handle.split_once(':'))
         .map(|(kind, _)| kind.to_owned())
         .collect();
-    let findings: Vec<observer::ReconcileFinding> =
+    let mut findings: Vec<observer::ReconcileFinding> =
         observer::reconcile(&state, &handles, &configured, &BTreeSet::new())
             .into_iter()
             .filter(|finding| {
@@ -736,6 +697,11 @@ fn status(
                 )
             })
             .collect();
+    // A deferral whose deadline has passed demands review. Nothing unblocks by
+    // itself — the fold is a pure function of the log and cannot read a clock —
+    // so the expired block surfaces here, where things demanding action live,
+    // until someone reviews it and unblocks or re-blocks the item.
+    findings.extend(expired_block_findings(&state, chrono::Utc::now()));
     let in_flight = in_flight_attempts(&state);
     let ready: Vec<_> = state.ready().into_iter().cloned().collect();
     let mut all_questions: Vec<_> = state.questions.values().cloned().collect();
@@ -873,11 +839,15 @@ fn status(
     };
     let blocked_lines = || {
         blocked.iter().map(|work| {
-            format!(
+            let mut line = format!(
                 "{}  {}",
                 work.id,
                 work.block_reason.as_deref().unwrap_or("blocked")
-            )
+            );
+            if let Some(until) = work.block_until {
+                line.push_str(&format!(" · until {}", until.to_rfc3339()));
+            }
+            line
         })
     };
     if full {
@@ -944,41 +914,79 @@ fn selected_status_sections(
     .filter(move |section| requested.contains(section))
 }
 
-/// The loop's desired state and its two interesting passes. The driver reads
-/// this section and ignores the rest of `status`. It is public so the model
-/// checker and the simulator read the loop through the same projection the
-/// daemon does. [`status_document`] files this value under the `loop` key,
-/// letting simulator tests compare the full production document instead of
-/// grepping source literals.
+/// The loop's desired state. The driver reads this section — plus the head at
+/// the top of the document — and ignores the rest of `status`. It is public so
+/// the model checker and the simulator read the loop through the same
+/// projection the daemon does. [`status_document`] files this value under the
+/// `loop` key, letting simulator tests compare the full production document
+/// instead of grepping source literals.
+///
+/// The section carries only durable statements about the loop: whether it is
+/// paused, which engine is desired, the sequence of the latest rotation and
+/// nudge requests, and the earliest review deadline any blocked work item
+/// carries. The log never mentions its own readers, so "has a request been
+/// acted on" is not here — each driver compares the request sequences with the
+/// last head it acted on, kept in that driver's machine-local notes.
 pub fn loop_section(state: &ProjectState) -> Value {
     let control = &state.loop_control;
+    // Every blocked item's deadline, sorted, alongside `review_at` (the
+    // earliest, kept for the human status line and existing consumers). The
+    // driver checks each one, so an item still blocked past its own deadline
+    // does not swallow the wake a later deadline is owed.
+    let mut review_deadlines: Vec<DateTime<Utc>> = state
+        .work
+        .values()
+        .filter(|work| work.state == crate::domain::WorkState::Blocked)
+        .filter_map(|work| work.block_until)
+        .collect();
+    review_deadlines.sort_unstable();
     json!({
         "paused": control.paused,
         "pause_reason": control.pause_reason,
         "engine": control.engine,
-        "rotate_pending": control.rotate_pending(),
-        "nudge_pending": control.nudge_pending(),
-        "open_pass": state.open_pass().map(|pass| json!({
-            "id": pass.id,
-            "engine": pass.engine,
-            "handle": pass.handle,
-            "triggers": trigger_names(&pass.triggers),
-            "started_at": pass.started_at,
-            "at_head": pass.at_head,
-        })),
-        "last_pass": state.last_ended_pass().map(|pass| json!({
-            "id": pass.id,
-            "engine": pass.engine,
-            "outcome": pass.outcome.map(PassOutcome::as_str),
-            "report_line": pass.report_line(),
-            "wake_at": pass.wake_at,
-            "ended_at": pass.ended_at,
-            // The head the log stood at when this pass ended. A reader
-            // comparing it with the current head learns whether anything has
-            // been appended since, without remembering anything itself.
-            "ended_seq": pass.ended_seq,
-        })),
+        "rotate_requested_seq": control.rotate_requested_seq,
+        "nudge_requested_seq": control.nudge_requested_seq,
+        "review_at": state.next_review_at(),
+        "review_deadlines": review_deadlines,
     })
+}
+
+/// The attention findings for deferrals whose deadline has passed.
+///
+/// `now` is a parameter rather than a clock read so the derivation stays a
+/// pure function a test can pin: an expired `--until` is
+/// "unblocked-pending-review", meaning the item stays blocked in the fold and
+/// this finding is what puts the review in front of the leader.
+pub fn expired_block_findings(
+    state: &ProjectState,
+    now: DateTime<Utc>,
+) -> Vec<observer::ReconcileFinding> {
+    let mut blocked: Vec<_> = state
+        .work
+        .values()
+        .filter(|work| work.state == crate::domain::WorkState::Blocked)
+        .filter(|work| work.block_until.is_some_and(|until| until <= now))
+        .collect();
+    blocked.sort_by_key(|work| work.opened_seq);
+    blocked
+        .into_iter()
+        .map(|work| observer::ReconcileFinding {
+            kind: "block_expired".to_owned(),
+            attempt_id: None,
+            handle: None,
+            status: "blocked".to_owned(),
+            detail: format!(
+                "`{}` was deferred until {} and that time has passed — review it",
+                work.id,
+                work.block_until.expect("filtered above").to_rfc3339()
+            ),
+            suggested_command: Some(format!(
+                "alder work unblock {} --why \"deferral reviewed: …\"",
+                work.id
+            )),
+            metadata: json!({"work_id": work.id, "until": work.block_until}),
+        })
+        .collect()
 }
 
 fn loop_lines(state: &ProjectState) -> Vec<String> {
@@ -994,43 +1002,13 @@ fn loop_lines(state: &ProjectState) -> Vec<String> {
     if let Some(engine) = control.engine.as_deref() {
         desired.push(format!("engine {engine}"));
     }
-    if control.rotate_pending() {
-        desired.push("rotate pending".to_owned());
-    }
-    if control.nudge_pending() {
-        desired.push("nudge pending".to_owned());
-    }
     if !desired.is_empty() {
         lines.push(desired.join(" · "));
     }
-    if let Some(pass) = state.open_pass() {
-        lines.push(format!(
-            "open {}  {}  {}  started {}",
-            pass.id,
-            pass.engine,
-            pass.handle,
-            pass.started_at.to_rfc3339()
-        ));
-    }
-    if let Some(pass) = state.last_ended_pass() {
-        let mut line = format!(
-            "last {}  {}",
-            pass.id,
-            pass.outcome.map(PassOutcome::as_str).unwrap_or("ended")
-        );
-        if let Some(report) = pass.report_line() {
-            line.push_str(&format!("  {report}"));
-        }
-        if let Some(wake_at) = pass.wake_at {
-            line.push_str(&format!("  wake {}", wake_at.to_rfc3339()));
-        }
-        lines.push(line);
+    if let Some(review_at) = state.next_review_at() {
+        lines.push(format!("next review {}", review_at.to_rfc3339()));
     }
     lines
-}
-
-fn trigger_names(triggers: &[PassTrigger]) -> Vec<&'static str> {
-    triggers.iter().copied().map(PassTrigger::as_str).collect()
 }
 
 fn next(context: &mut Context, changes: Option<&str>) -> Result<Output> {
@@ -1138,12 +1116,6 @@ pub fn show_document(
             (
                 "question",
                 question_value(state, value)?,
-                BTreeSet::from([id.to_owned()]),
-            )
-        } else if let Some(value) = state.passes.get(id) {
-            (
-                "pass",
-                serde_json::to_value(value)?,
                 BTreeSet::from([id.to_owned()]),
             )
         } else {
@@ -1986,33 +1958,16 @@ fn read_text_file(
     }
 }
 
-/// Parse a wake delay such as `270s`, `20m`, `1h`, or `2d`. The stored value is
-/// an absolute time, so a reader never has to know when the pass ended.
-fn parse_duration(value: &str) -> Result<TimeDelta> {
-    let trimmed = value.trim();
-    let invalid = || {
+/// Parse an RFC 3339 instant such as `2026-08-04T15:00:00Z`. The stored value
+/// is an absolute time, so a reader never has to know when it was written.
+fn parse_instant(value: &str) -> Result<DateTime<Utc>> {
+    value.trim().parse::<DateTime<Utc>>().map_err(|error| {
         AlderError::with_context(
             "validation_failed",
-            format!("duration `{value}` must look like 270s, 20m, 1h, or 2d"),
-            json!({"duration": value}),
+            format!("`{value}` is not an RFC 3339 instant such as 2026-08-04T15:00:00Z: {error}"),
+            json!({"until": value}),
         )
-    };
-    let (digits, unit) = trimmed.split_at(trimmed.len().saturating_sub(1));
-    let amount: i64 = digits.parse().map_err(|_| invalid())?;
-    if amount <= 0 {
-        return Err(invalid());
-    }
-    let seconds = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3_600,
-        "d" => 86_400,
-        _ => return Err(invalid()),
-    };
-    amount
-        .checked_mul(seconds)
-        .map(TimeDelta::seconds)
-        .ok_or_else(invalid)
+    })
 }
 
 fn require_reason(flag: &str, why: Option<&String>) -> Result<()> {
@@ -2057,30 +2012,9 @@ impl From<NonSuccessOutcome> for AttemptOutcome {
     }
 }
 
-impl From<PassOutcomeArg> for PassOutcome {
-    fn from(value: PassOutcomeArg) -> Self {
-        match value {
-            PassOutcomeArg::Ok => Self::Ok,
-            PassOutcomeArg::Crashed => Self::Crashed,
-            PassOutcomeArg::Timeout => Self::Timeout,
-        }
-    }
-}
-
-impl From<TriggerKind> for PassTrigger {
-    fn from(value: TriggerKind) -> Self {
-        match value {
-            TriggerKind::Log => Self::Log,
-            TriggerKind::Observations => Self::Observations,
-            TriggerKind::Due => Self::Due,
-            TriggerKind::Manual => Self::Manual,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::domain::{AttemptState, Pass, PassState};
+    use crate::domain::AttemptState;
 
     use super::*;
 
@@ -2333,22 +2267,19 @@ mod tests {
     }
 
     #[test]
-    fn wake_durations_accept_only_a_positive_amount_and_known_unit() {
-        assert_eq!(parse_duration("270s").unwrap(), TimeDelta::seconds(270));
-        assert_eq!(parse_duration("20m").unwrap(), TimeDelta::minutes(20));
-        assert_eq!(parse_duration(" 1h ").unwrap(), TimeDelta::hours(1));
-        assert_eq!(parse_duration("2d").unwrap(), TimeDelta::days(2));
-        for invalid in [
-            "",
-            "m",
-            "20",
-            "0m",
-            "-5m",
-            "20w",
-            "1.5h",
-            "9223372036854775807d",
-        ] {
-            assert!(parse_duration(invalid).is_err(), "{invalid}");
+    fn review_instants_accept_only_rfc3339_and_reasons_cannot_be_blank() {
+        assert_eq!(
+            parse_instant("2026-08-04T15:00:00Z").unwrap().to_rfc3339(),
+            "2026-08-04T15:00:00+00:00"
+        );
+        assert_eq!(
+            parse_instant(" 2026-08-04T15:00:00+02:00 ")
+                .unwrap()
+                .to_rfc3339(),
+            "2026-08-04T13:00:00+00:00"
+        );
+        for invalid in ["", "3pm", "20m", "2026-08-04", "2026-08-04 15:00"] {
+            assert!(parse_instant(invalid).is_err(), "{invalid}");
         }
 
         assert!(require_reason("--why", Some(&"reason".to_owned())).is_ok());
@@ -2356,69 +2287,105 @@ mod tests {
         assert!(require_reason("--why", None).is_err());
     }
 
+    fn blocked_work(id: &str, until: Option<&str>) -> crate::domain::Work {
+        crate::domain::Work {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            spec: None,
+            priority: 0,
+            state: crate::domain::WorkState::Blocked,
+            block_reason: Some("deferred".to_owned()),
+            block_until: until.map(|value| value.parse().expect("a test instant parses")),
+            outcome: None,
+            opened_seq: 1,
+            changed_seq: 1,
+            requires: Vec::new(),
+            checks: Vec::new(),
+        }
+    }
+
     #[test]
-    fn the_loop_section_reports_desired_state_and_both_interesting_passes() {
+    fn the_loop_section_reports_desired_state_and_the_next_review() {
         let mut state = ProjectState::default();
         let empty = loop_section(&state);
         assert_eq!(empty["paused"], false);
         assert!(empty["engine"].is_null());
-        assert!(empty["open_pass"].is_null());
-        assert!(empty["last_pass"].is_null());
+        assert!(empty["rotate_requested_seq"].is_null());
+        assert!(empty["nudge_requested_seq"].is_null());
+        assert!(empty["review_at"].is_null());
+        assert_eq!(empty["review_deadlines"], json!([]));
         assert!(loop_lines(&state).is_empty());
 
         state.loop_control.paused = true;
         state.loop_control.pause_reason = Some("release freeze".to_owned());
         state.loop_control.engine = Some("codex".to_owned());
         state.loop_control.rotate_requested_seq = Some(3);
+        state.loop_control.nudge_requested_seq = Some(5);
         let paused = loop_section(&state);
         assert_eq!(paused["pause_reason"], "release freeze");
         assert_eq!(paused["engine"], "codex");
-        assert_eq!(paused["rotate_pending"], true);
+        assert_eq!(paused["rotate_requested_seq"], 3);
+        assert_eq!(paused["nudge_requested_seq"], 5);
         assert_eq!(
             loop_lines(&state)[0],
-            "paused · release freeze · engine codex · rotate pending"
+            "paused · release freeze · engine codex"
         );
 
-        let at = chrono::Utc::now();
-        state.passes.insert(
-            "hm-pass-1".to_owned(),
-            Pass {
-                id: "hm-pass-1".to_owned(),
-                engine: "claude".to_owned(),
-                handle: "tmux:alder-leader".to_owned(),
-                triggers: vec![PassTrigger::Log],
-                state: PassState::Ended,
-                outcome: Some(PassOutcome::Ok),
-                report: Some("swept the frontier\nand more".to_owned()),
-                wake_at: Some(at),
-                rotate: false,
-                why: None,
-                at_head: 4,
-                started_at: at,
-                started_seq: 5,
-                ended_at: Some(at),
-                ended_seq: Some(6),
-            },
+        // The earliest deferral deadline over all blocked work is the loop's
+        // next review rendezvous.
+        state.work.insert(
+            "hm-a".to_owned(),
+            blocked_work("hm-a", Some("2026-08-04T15:00:00Z")),
         );
-        let ended = loop_section(&state);
-        assert_eq!(ended["last_pass"]["id"], "hm-pass-1");
-        assert_eq!(ended["last_pass"]["outcome"], "ok");
-        assert_eq!(ended["last_pass"]["report_line"], "swept the frontier");
-        assert_eq!(ended["last_pass"]["ended_seq"], 6);
-        let lines = loop_lines(&state);
-        assert!(lines[1].starts_with("last hm-pass-1  ok  swept the frontier  wake "));
+        state.work.insert(
+            "hm-b".to_owned(),
+            blocked_work("hm-b", Some("2026-08-04T12:00:00Z")),
+        );
+        let deferred = loop_section(&state);
+        assert_eq!(deferred["review_at"], "2026-08-04T12:00:00Z");
+        // Every deadline is served, sorted, not just the earliest.
+        assert_eq!(
+            deferred["review_deadlines"],
+            json!(["2026-08-04T12:00:00Z", "2026-08-04T15:00:00Z"])
+        );
+        assert_eq!(
+            loop_lines(&state)[1],
+            "next review 2026-08-04T12:00:00+00:00"
+        );
+    }
 
-        let mut open = state.passes["hm-pass-1"].clone();
-        open.id = "hm-pass-2".to_owned();
-        open.state = PassState::Open;
-        open.outcome = None;
-        open.ended_seq = None;
-        state.passes.insert(open.id.clone(), open);
-        let both = loop_section(&state);
-        assert_eq!(both["open_pass"]["id"], "hm-pass-2");
-        assert_eq!(both["open_pass"]["triggers"], json!(["log"]));
-        assert_eq!(both["last_pass"]["id"], "hm-pass-1");
-        assert!(loop_lines(&state)[1].starts_with("open hm-pass-2  claude  tmux:alder-leader"));
+    #[test]
+    fn an_expired_deferral_is_an_attention_finding_and_an_unexpired_one_is_not() {
+        let mut state = ProjectState::default();
+        state.work.insert(
+            "hm-a".to_owned(),
+            blocked_work("hm-a", Some("2026-08-04T12:00:00Z")),
+        );
+        state
+            .work
+            .insert("hm-b".to_owned(), blocked_work("hm-b", None));
+
+        let before: DateTime<Utc> = "2026-08-04T11:59:59Z".parse().unwrap();
+        assert!(expired_block_findings(&state, before).is_empty());
+
+        let after: DateTime<Utc> = "2026-08-04T12:00:00Z".parse().unwrap();
+        let findings = expired_block_findings(&state, after);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, "block_expired");
+        assert!(findings[0].detail.contains("hm-a"));
+        assert!(
+            findings[0]
+                .suggested_command
+                .as_deref()
+                .unwrap()
+                .starts_with("alder work unblock hm-a")
+        );
+
+        // Unblocking — reviewing — clears the finding; nothing unblocks by
+        // itself.
+        state.work.get_mut("hm-a").unwrap().state = crate::domain::WorkState::Open;
+        state.work.get_mut("hm-a").unwrap().block_until = None;
+        assert!(expired_block_findings(&state, after).is_empty());
     }
 
     #[test]
