@@ -15,52 +15,12 @@ use super::{
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectState {
-    #[serde(with = "observation_map")]
+    #[serde(with = "alder_observation::observation_map")]
     pub observations: BTreeMap<ObservationKey, Observation>,
     pub work: BTreeMap<String, Work>,
     pub attempts: BTreeMap<String, Attempt>,
     pub questions: BTreeMap<String, Question>,
     pub loop_control: LoopControl,
-}
-
-mod observation_map {
-    use std::collections::BTreeMap;
-
-    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
-
-    use super::{Observation, ObservationKey};
-
-    pub fn serialize<S>(
-        observations: &BTreeMap<ObservationKey, Observation>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        observations
-            .values()
-            .collect::<Vec<_>>()
-            .serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<BTreeMap<ObservationKey, Observation>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let observations = Vec::<Observation>::deserialize(deserializer)?;
-        let mut folded = BTreeMap::new();
-        for observation in observations {
-            if folded
-                .insert(observation.key.clone(), observation)
-                .is_some()
-            {
-                return Err(D::Error::custom("duplicate observation key"));
-            }
-        }
-        Ok(folded)
-    }
 }
 
 impl ProjectState {
@@ -109,30 +69,10 @@ impl ProjectState {
         let seq = event.seq;
         match &event.payload {
             EventPayload::ObservationReported { observation } => {
-                validate_observation_key(&observation.key)?;
-                require_text("observation level", &observation.level)?;
-                self.observations.insert(
-                    observation.key.clone(),
-                    Observation {
-                        key: observation.key.clone(),
-                        level: observation.level.clone(),
-                        reported_seq: seq,
-                    },
-                );
+                alder_observation::report(&mut self.observations, observation, seq)?;
             }
             EventPayload::ObservationRetired { key } => {
-                validate_observation_key(key)?;
-                if self.observations.remove(key).is_none() {
-                    return Err(AlderError::with_context(
-                        "not_found",
-                        "observation key is not current",
-                        json!({
-                            "observer": key.observer,
-                            "subject": key.subject,
-                            "field": key.field,
-                        }),
-                    ));
-                }
+                alder_observation::retire(&mut self.observations, key)?;
             }
             EventPayload::LegacyHandoffSubmitted { .. }
             | EventPayload::LegacyHandoffWithdrawn { .. } => {}
@@ -941,28 +881,6 @@ fn require_text(field: &str, value: &str) -> Result<()> {
     }
 }
 
-pub fn validate_observation_key(key: &ObservationKey) -> Result<()> {
-    if !valid_name(&key.observer) {
-        return Err(AlderError::validation(format!(
-            "observation observer `{}` is not a valid name",
-            key.observer
-        )));
-    }
-    if !valid_name(&key.field) {
-        return Err(AlderError::validation(format!(
-            "observation field `{}` is not a valid name",
-            key.field
-        )));
-    }
-    require_text("observation subject", &key.subject)?;
-    if key.subject.contains('\0') {
-        return Err(AlderError::validation(
-            "observation subject cannot contain a NUL character",
-        ));
-    }
-    Ok(())
-}
-
 fn validate_check(check: &super::CheckDefinition) -> Result<()> {
     require_text("check key", &check.key)?;
     require_text("check description", &check.description)?;
@@ -973,21 +891,6 @@ fn validate_check(check: &super::CheckDefinition) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-pub fn valid_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.chars().all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
-        })
-        && value
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
-        && value
-            .chars()
-            .last()
-            .is_some_and(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
 }
 
 #[cfg(test)]

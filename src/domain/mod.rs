@@ -6,6 +6,9 @@ mod model;
 mod state;
 
 pub use alder_log::Head;
+pub use alder_observation::{
+    Observation, ObservationDefinition, ObservationKey, valid_name, validate_observation_key,
+};
 pub use change::*;
 pub use codec::*;
 pub use log::*;

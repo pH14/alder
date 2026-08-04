@@ -29,6 +29,7 @@ name = "alder"
 version = "0.1.0"
 dependencies = [
  "alder-log",
+ "alder-observation",
  "assert_cmd",
  "chrono",
  "clap",
@@ -64,6 +65,15 @@ dependencies = [
  "clap",
  "serde_json",
  "stateright",
+]
+
+[[package]]
+name = "alder-observation"
+version = "0.1.0"
+dependencies = [
+ "alder-log",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
