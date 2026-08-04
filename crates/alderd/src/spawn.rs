@@ -11,7 +11,13 @@
 //! its final argument. Nothing is typed into the pane, so nothing waits for
 //! the engine to boot, nothing can be read as a key name, and a goal
 //! containing quotes or semicolons is just a string. There is no sleep
-//! anywhere on this path.
+//! anywhere on this path. Three tests below hold that, and all three are
+//! titled for it: one counts the questions a dispatch puts to the world, and
+//! two read the source for a duration or a clock it could wait on — this
+//! module's own half, and the two halves of `effects::Host` the dispatch runs
+//! in. None of the three times anything: what elapses here is process
+//! creation, so on a busy machine a clock reports the machine rather than the
+//! code.
 //!
 //! **The pane outlives the engine.** The command ends `; exec bash`, so a
 //! one-shot engine that finishes its turn leaves a live session behind. The
@@ -1245,6 +1251,9 @@ mod tests {
         }
 
         fn tmux_session(&self, session: &str) -> Result<Option<ObservedSession>> {
+            self.calls
+                .borrow_mut()
+                .push(format!("tmux observe {session}"));
             Ok(self.sessions.borrow().get(session).cloned())
         }
 
@@ -1283,10 +1292,16 @@ mod tests {
         }
 
         fn path_exists(&self, path: &Path) -> bool {
+            self.calls
+                .borrow_mut()
+                .push(format!("exists {}", path.display()));
             self.worktrees.borrow().contains_key(path) || self.strays.borrow().contains(path)
         }
 
         fn canonical_path(&self, path: &Path) -> Result<PathBuf> {
+            self.calls
+                .borrow_mut()
+                .push(format!("resolve {}", path.display()));
             Ok(self
                 .canonical_paths
                 .borrow()
@@ -1549,6 +1564,241 @@ mod tests {
         }
         // Nothing is typed at the session, and nothing waits for it to boot.
         assert!(!host.called("send-keys"));
+    }
+
+    /// A dispatch asks the world a fixed set of questions and never asks again.
+    ///
+    /// A wait is an observation made again in the hope of a different answer,
+    /// so the two are the same claim seen from either end. What a leader can
+    /// observe about whether a dispatch waited is exactly which questions went
+    /// out and how many times, and every question this path puts to the world
+    /// goes through the host — so the log below is that observation, not a note
+    /// about a double's internals. A loop that waited for the engine to come up
+    /// — sleeping between looks or spinning — would appear here as another
+    /// observation, and would appear whatever else the machine was doing.
+    ///
+    /// This is the dispatch's half. `Host` runs no code here, so what the real
+    /// commands do once they leave is checked where they really run, in
+    /// `tests/spawn_host.rs`.
+    #[test]
+    fn the_dispatch_asks_the_world_a_fixed_set_of_questions_and_never_asks_again() {
+        let host = Fake::new();
+        spawn(&host, "al-1", tier("luna").unwrap(), None).unwrap();
+        let calls = host.calls();
+
+        let asked = |question: &str| {
+            calls
+                .iter()
+                .filter(|call| call.starts_with(question))
+                .count()
+        };
+        for (question, times) in [
+            // The brief, and whether an attempt is already open.
+            ("alder show al-1", 1),
+            ("alder status --section in_flight", 1),
+            // The session is looked at once, before the decision that uses it.
+            // Nothing looks a second time to see whether an engine came up.
+            ("tmux observe alder-work-al-1", 1),
+            // Two different questions about one path — is there residue to
+            // sweep, and is the worktree already cut — not one asked twice.
+            ("exists /projects/alder-work-al-1", 2),
+            ("git rev-parse --verify", 1),
+            ("git rev-parse --path-format", 1),
+        ] {
+            assert_eq!(
+                asked(question),
+                times,
+                "`{question}` is no longer asked exactly {times} time(s), and \
+                 an observation repeated is a wait: {calls:#?}"
+            );
+        }
+
+        // The same claim over the whole log, so that a wait built on some other
+        // observation is caught too. Effects that change the world are left out
+        // deliberately: writing one more file into a worktree is not a wait,
+        // and should not have to edit a test about waiting.
+        let observations: Vec<&String> = calls
+            .iter()
+            .filter(|call| {
+                OBSERVING_EFFECTS
+                    .iter()
+                    .any(|prefix| call.starts_with(prefix))
+            })
+            .collect();
+        assert_eq!(
+            observations.len(),
+            7,
+            "the dispatch observes the world a different number of times: {observations:#?}"
+        );
+    }
+
+    /// This module itself cannot wait in process, whatever it is asked to do.
+    ///
+    /// The counts above are about the questions that reach the world. A
+    /// `thread::sleep` here reaches nothing and so shows in no ledger, and
+    /// elapsed time cannot show it either: this path's cost is process
+    /// creation — `alder`, `git`, `tmux` — so on a loaded machine a clock
+    /// reports the machine rather than the code. What no load can make untrue
+    /// is the source. Waiting in process needs a duration or a clock to wait
+    /// on, and this module's dispatch half names neither, nor the thread
+    /// facilities that would wait on one.
+    ///
+    /// Only this module, and deliberately. A bounded timeout on a command that
+    /// can hang is a limit rather than a wait, and AGENTS.md says so; but it is
+    /// a limit on a *command*, and nothing here runs one. Every command goes
+    /// out through `effects::Host`, which is where such a timeout would belong
+    /// and where this test would be wrong to forbid it. The host is read by the
+    /// test after this one, which allows it exactly that and nothing else; what
+    /// the host's commands do once they leave is checked where they really run,
+    /// in `tests/spawn_host.rs`.
+    #[test]
+    fn this_modules_dispatch_half_can_name_no_clock_and_no_sleep() {
+        let code = without_comments(before_the_tests(include_str!("spawn.rs")));
+        for waiting in [
+            "Duration",
+            "Instant",
+            "SystemTime",
+            "thread",
+            "sleep",
+            "park",
+            "yield_now",
+            "spin_loop",
+            "recv_timeout",
+            "elapsed",
+        ] {
+            assert!(
+                !code.contains(waiting),
+                "spawn's own half of spawn.rs names `{waiting}`. Nothing here may \
+                 wait for an engine, and code that cannot name a duration or a \
+                 clock cannot wait on one in process. If this is a bounded timeout \
+                 on a command that can hang, it belongs on the command, in \
+                 `effects::Host`, not here."
+            );
+        }
+    }
+
+    /// The host the dispatch runs in cannot wait for an engine either.
+    ///
+    /// The test above reads this module; this one reads the other half of the
+    /// same path, `effects::Host` — its inherent block, where every command is
+    /// built and run, and its `SpawnHost` block, the only host code a dispatch
+    /// reaches. A readiness sleep put there would reach no tmux command, so it
+    /// would show in no ledger and in no call list; the source is again what no
+    /// load can make untrue.
+    ///
+    /// `Duration` is permitted here and banned above, and that difference is
+    /// the whole point of scanning the two halves separately. This half runs
+    /// commands, so a bounded timeout on one that can hang is a limit AGENTS.md
+    /// allows, and a limit needs a duration. What a limit does not need is a
+    /// way to stand still, a clock to stand still by, or another thread to
+    /// stand still until — so two families are refused. Standing still:
+    /// `sleep`, `park`, `yield_now`, `spin_loop`, and the `Instant`/`elapsed`
+    /// pair a hand-rolled deadline reads. Standing still until another thread
+    /// says when: `recv` in every spelling, `Condvar`, `Barrier`.
+    ///
+    /// One of those overlaps the exception, and it is worth knowing which. The
+    /// usual std-only way to bound a command is a watchdog thread and
+    /// `recv_timeout`, so a legitimate limit written that way would fail this.
+    /// That is deliberate: a bounded limit and a bounded readiness wait are the
+    /// same text, and a limit has spellings that name no banned word — a
+    /// `Duration`-taking API such as `Child::wait_timeout`, or a command run
+    /// under one. If that day comes the failure is a decision to make, not a
+    /// bug to route around.
+    ///
+    /// Both halves are read in one place on purpose: narrowing either without
+    /// the other in view is how the host lost its coverage once already.
+    ///
+    /// The scan is lexical and block-scoped, which is its limit: it holds for
+    /// the code these two blocks contain, not for something they call out to.
+    /// Being block-scoped is also what leaves `Effects::sleep` out of it — the
+    /// driving loop's own pacing, which is legitimate, and which is the third
+    /// block of that file rather than either of these two.
+    #[test]
+    fn the_hosts_spawn_facing_halves_can_name_no_sleep_and_no_clock() {
+        let source = include_str!("effects.rs");
+        for (half, runs_commands) in [
+            ("impl Host {", "fn run("),
+            ("impl SpawnHost for Host {", "fn tmux_new_session("),
+        ] {
+            let code = without_comments(impl_block(source, half));
+            assert!(
+                code.contains(runs_commands),
+                "`{runs_commands}` has left `{half}` in effects.rs, so this scan \
+                 now covers less of the host than it was written to cover"
+            );
+            for waiting in [
+                // Standing still, and the clock a hand-rolled deadline reads.
+                "sleep",
+                "park",
+                "yield_now",
+                "spin_loop",
+                "Instant",
+                "elapsed",
+                // Standing still until another thread says when. `recv` takes
+                // `recv_timeout` and `try_recv` with it, which is the point: a
+                // bounded receive and a polled one are both waits.
+                "recv",
+                "Condvar",
+                "Barrier",
+            ] {
+                assert!(
+                    !code.contains(waiting),
+                    "`{half}` in effects.rs names `{waiting}`, and standing still \
+                     is the one thing a dispatch may not do: it types nothing at a \
+                     session and waits for no engine to boot. A bounded timeout on \
+                     a command that can hang is a limit rather than a wait — spell \
+                     it with a `Duration`, which this test allows, and with an API \
+                     that takes one, not with a word that can only mean waiting."
+                );
+            }
+        }
+    }
+
+    /// The host effects a dispatch only reads the world with. A wait has to
+    /// repeat one of these; the ones that change the world it has no use for.
+    const OBSERVING_EFFECTS: [&str; 7] = [
+        "alder show",
+        "alder status",
+        "tmux observe",
+        "exists ",
+        "resolve ",
+        "git rev-parse",
+        "git worktree list",
+    ];
+
+    /// Everything in a module ahead of its own tests.
+    fn before_the_tests(source: &str) -> &str {
+        source
+            .split_once("\n#[cfg(test)]\n")
+            .expect("a module under test keeps its tests at the end")
+            .0
+    }
+
+    /// The body of one top-level `impl` block, its header line excluded.
+    ///
+    /// A rustfmt'd block is the text between its header and the first line that
+    /// closes at column zero. Both ends are required to be there, so renaming
+    /// or reshaping a block fails this loudly rather than quietly scanning an
+    /// empty string.
+    fn impl_block<'a>(source: &'a str, header: &str) -> &'a str {
+        let opened = source
+            .split_once(&format!("\n{header}\n"))
+            .unwrap_or_else(|| panic!("`{header}` is no longer a block of its own"))
+            .1;
+        opened
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("`{header}` no longer closes at column zero"))
+            .0
+    }
+
+    /// Source with its whole-line comments dropped, so that prose about
+    /// waiting is not mistaken for code that waits.
+    fn without_comments(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]

@@ -249,7 +249,6 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     );
 
     let host = Host::for_command(root.clone(), "alder".to_owned());
-    let started = Instant::now();
     let spawned = spawn::spawn(
         &host,
         WORK,
@@ -257,17 +256,78 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
         Some(&stub.display().to_string()),
     )
     .expect("the spawn succeeds");
-    let elapsed = started.elapsed();
 
     assert_eq!(spawned.session, session);
     assert_eq!(spawned.branch, format!("work/{WORK}"));
     assert_eq!(spawned.worktree, work.join(format!("alder-work-{WORK}")));
     assert!(!spawned.adopted);
 
-    // Nothing on this path sleeps or waits for an engine to boot.
+    // Nothing on this path waits for the engine to boot — the half only the
+    // real host can answer, and the reason this is not a stopwatch.
+    //
+    // It was one: an upper bound on the elapsed time of the spawn above. What
+    // elapses here is process creation, so on a loaded machine the bound
+    // reported the machine, and the gate went red for reasons no branch had
+    // caused. What a dispatch may run is the honest observation, and the shim
+    // has been logging it all along. `Host` reaches the world by running
+    // `alder`, `git` and `tmux`, and of those only tmux can see a pane at all,
+    // so a wait for the engine has to be a tmux call however it is spelled —
+    // `wait-for` on a channel the pane signals, a blocking flag, a second look
+    // in a loop. This is the whole list, in order, and both of its entries
+    // return as soon as the server has answered.
+    //
+    // Whole lines rather than each line's first word. tmux takes several
+    // commands in one invocation, separated by `;`, so `new-session … ';'
+    // wait-for ready` is a wait that keeps `new-session` as its first word and
+    // would pass any check that read only that. Everything either line may
+    // contain is pinned below except the goal, which is not this assertion's to
+    // pin — it is checked just after, as the one argv element the engine
+    // received.
+    //
+    // Taken here rather than later because from this line on the test drives
+    // tmux itself. The pane cannot have added to it: its command runs the
+    // stamp script, which touches no tmux, and then the engine, which is still
+    // holding.
+    //
+    // One wait this cannot catch, said plainly rather than left to be
+    // discovered: a wait that never returns hangs the suite instead of failing
+    // it, because the dispatch never reaches this line. Telling a five-second
+    // block from a slow machine needs a clock, and a clock on this path is the
+    // defect the assertion above it replaced.
+    let dispatch_ran = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
+    let ran: Vec<&str> = dispatch_ran.lines().collect();
+    let new_session = format!(
+        "new-session -d -s {session} -c {worktree} -e ALDER_ATTEMPT={WORK}-attempt-1 \
+         -e ALDER_ENGINE=running ",
+        worktree = work.join(format!("alder-work-{WORK}")).display()
+    );
+    assert_eq!(
+        ran.len(),
+        2,
+        "the dispatch ran tmux commands beyond the two it needs, and a wait for \
+         the engine would be among them: {dispatch_ran}"
+    );
+    assert_eq!(
+        ran[0],
+        format!("has-session -t {session}"),
+        "the first tmux call is no longer just the existence question: {dispatch_ran}"
+    );
+    let pane_command = ran[1].strip_prefix(&new_session).unwrap_or_else(|| {
+        panic!("the session is no longer created by that exact call: {dispatch_ran}")
+    });
     assert!(
-        elapsed < Duration::from_secs(3),
-        "the spawn took {elapsed:?}: something on the path is waiting"
+        pane_command.starts_with(&format!(
+            ".alder/stamp-codex-session; '{}' '",
+            stub.display()
+        )),
+        "something precedes the engine in the pane command: {dispatch_ran}"
+    );
+    assert!(
+        pane_command.ends_with(&format!(
+            "'; tmux set-environment -t '={session}' ALDER_ENGINE exited; exec bash"
+        )),
+        "something follows the pane command, and a tmux command appended after \
+         it is a wait for the engine however it is spelled: {dispatch_ran}"
     );
 
     // The goal arrives as exactly one argument, and it is the whole brief.
