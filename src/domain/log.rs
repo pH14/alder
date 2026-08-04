@@ -855,16 +855,35 @@ mod tests {
         );
     }
 
-    /// The pass schema is decode-only, and so is every other legacy variant.
     /// Every mutation reaches the store through one append call, and that call
-    /// refuses a legacy payload before anything is staged — so no append path
-    /// in the workspace can produce a pass event.
+    /// refuses a legacy payload before anything is staged. All five legacy
+    /// variants are pushed through it here — so no append path in the
+    /// workspace can produce a pass or handoff event.
     #[test]
     fn no_append_path_can_produce_a_pass_or_other_legacy_event() {
         let log = ProjectLog::new(MemoryStore::new(), "hm", "alderd");
         let legacy = [
             EventPayload::LegacyPassStarted(json!({"pass": {"id": "hm-pass-1"}})),
             EventPayload::LegacyPassEnded(json!({"pass_id": "hm-pass-1", "outcome": "ok"})),
+            EventPayload::LegacyHandoffSubmitted {
+                handoff: crate::domain::LegacyHandoffDefinition {
+                    id: "hm-handoff-1".to_owned(),
+                    title: "handoff".to_owned(),
+                    artifact_ref: "ref".to_owned(),
+                    note: None,
+                },
+            },
+            EventPayload::LegacyHandoffIntegrated {
+                handoff_id: "hm-handoff-1".to_owned(),
+                work: WorkDefinition {
+                    id: "hm-1".to_owned(),
+                    title: "work".to_owned(),
+                    spec: None,
+                    priority: 0,
+                    requires: Vec::new(),
+                    checks: Vec::new(),
+                },
+            },
             EventPayload::LegacyHandoffWithdrawn {
                 handoff_id: "hm-handoff-1".to_owned(),
                 why: "reason".to_owned(),

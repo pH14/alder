@@ -29,11 +29,16 @@ struct World {
     engine: Option<String>,
     rotate_requested_seq: Option<u64>,
     nudge_requested_seq: Option<u64>,
-    review_at: Option<DateTime<Utc>>,
+    review_deadlines: Vec<DateTime<Utc>>,
     session: Option<String>,
     attached: bool,
-    /// What `alder refresh` reports about the observation sweep.
+    /// One pending observation change: the next `alder refresh` reports it,
+    /// and — like the real sweep, which appends observation events — moves
+    /// the head as it does.
     refresh_changed: bool,
+    /// Whether injections fail, standing in for a torn `send-keys` whose
+    /// Enter never landed.
+    injection_fails: bool,
     /// The body of the pass document the driver hashes.
     pass_doc: String,
     /// Paths passed to the hash reader, in order.
@@ -99,10 +104,21 @@ impl Effects for Fake {
                     "engine": world.engine,
                     "rotate_requested_seq": world.rotate_requested_seq,
                     "nudge_requested_seq": world.nudge_requested_seq,
-                    "review_at": world.review_at,
+                    "review_at": world.review_deadlines.iter().min(),
+                    "review_deadlines": world.review_deadlines,
                 }
             })),
-            ["refresh"] => Ok(json!({"changed": world.refresh_changed})),
+            ["refresh"] => {
+                // A changed sweep appends observation events, so reporting a
+                // change moves the head — the coupling the driver must absorb
+                // without waking twice for its own sweep.
+                let changed = world.refresh_changed;
+                if changed {
+                    world.head += 1;
+                    world.refresh_changed = false;
+                }
+                Ok(json!({"changed": changed}))
+            }
             // The driver's complete read surface. Anything else — above all a
             // mutation — is a contract violation, not a stub to add.
             other => Err(DriverError::new(format!(
@@ -134,10 +150,11 @@ impl Effects for Fake {
     }
 
     fn tmux_send_keys(&self, session: &str, text: &str) -> Result<()> {
-        self.world
-            .borrow_mut()
-            .calls
-            .push(format!("tmux send {session} {text}"));
+        let mut world = self.world.borrow_mut();
+        if world.injection_fails {
+            return Err(DriverError::new("tmux send-keys Enter failed: torn"));
+        }
+        world.calls.push(format!("tmux send {session} {text}"));
         Ok(())
     }
 
@@ -592,8 +609,9 @@ fn only_a_store_outage_counts_toward_the_outage_notice() {
 
 #[test]
 fn an_observation_change_wakes_the_leader_on_its_own() {
-    // Nothing was appended and no deadline has passed: the refresh sweep is
-    // the only reason to run, and it is reason enough.
+    // No one else appended and no deadline has passed: the refresh sweep is
+    // the reason to run, and it is reason enough. The sweep's own appends
+    // move the head, so the log trigger honestly rides along.
     let mut observed = settled("claude");
     observed.refresh_changed = true;
     let mut driver = Driver::new(Fake::new(observed), config());
@@ -604,40 +622,56 @@ fn an_observation_change_wakes_the_leader_on_its_own() {
     assert!(
         calls
             .iter()
-            .any(|call| call.starts_with("tmux send") && call.contains("(triggers: observations)")),
+            .any(|call| call.starts_with("tmux send")
+                && call.contains("(triggers: log,observations)")),
         "{calls:?}"
     );
 }
 
 #[test]
-fn a_deferral_deadline_wakes_the_leader_once_at_its_instant() {
-    let mut deferred = settled("claude");
-    deferred.review_at = Some(DateTime::from_timestamp(1_800_000_000 + 600, 0).unwrap());
-    let mut driver = Driver::new(Fake::new(deferred), config());
-
-    // Before the instant, nothing.
-    driver.poll_once().unwrap();
-    assert!(
-        !driver
+fn one_observation_change_produces_exactly_one_wake() {
+    // The sweep appends, so the head the driver read before refreshing is
+    // stale by the time it fires. The status is re-read before noting, and
+    // the next poll finds nothing new — not the driver's own sweep.
+    let mut observed = settled("claude");
+    observed.refresh_changed = true;
+    let mut driver = Driver::new(Fake::new(observed), config());
+    let sends = |driver: &Driver<Fake>| {
+        driver
             .effects()
             .calls()
             .iter()
-            .any(|call| call.starts_with("tmux send"))
-    );
+            .filter(|call| call.starts_with("tmux send"))
+            .count()
+    };
 
-    // At the instant, one wake with `due` provenance.
-    driver.effects().advance(600);
     driver.poll_once().unwrap();
-    let calls = driver.effects().calls();
+    assert_eq!(sends(&driver), 1);
+
+    driver.poll_once().unwrap();
+    assert_eq!(
+        sends(&driver),
+        1,
+        "the head moved by the driver's own sweep must not wake again"
+    );
+}
+
+#[test]
+fn a_torn_injection_is_not_noted_and_the_next_poll_retries_delivery() {
+    let mut torn = selected("claude");
+    torn.injection_fails = true;
+    let mut driver = Driver::new(Fake::new(torn), config());
+
+    // The Enter never lands: the poll fails and the notes do not advance,
+    // because noting an undelivered wake would silence it until the ceiling.
+    assert!(driver.poll_once().is_err());
     assert!(
-        calls
-            .iter()
-            .any(|call| call.starts_with("tmux send") && call.contains("(triggers: due)")),
-        "{calls:?}"
+        driver.effects().world.borrow().notes_file.is_none(),
+        "a failed delivery must not advance the notes"
     );
 
-    // The leader did not touch the item; the deadline does not fire again —
-    // the ceiling, not a per-poll retry, is the backstop.
+    // The next poll retries the same delivery, and only then notes it.
+    driver.effects().world.borrow_mut().injection_fails = false;
     driver.poll_once().unwrap();
     assert_eq!(
         driver
@@ -648,6 +682,56 @@ fn a_deferral_deadline_wakes_the_leader_once_at_its_instant() {
             .count(),
         1
     );
+    assert!(driver.effects().world.borrow().notes_file.is_some());
+}
+
+#[test]
+fn a_deferral_deadline_wakes_the_leader_once_at_its_instant() {
+    let mut deferred = settled("claude");
+    deferred.review_deadlines = vec![
+        DateTime::from_timestamp(1_800_000_000 + 600, 0).unwrap(),
+        DateTime::from_timestamp(1_800_000_000 + 1_200, 0).unwrap(),
+    ];
+    let mut driver = Driver::new(Fake::new(deferred), config());
+    let sends = |driver: &Driver<Fake>| {
+        driver
+            .effects()
+            .calls()
+            .iter()
+            .filter(|call| call.starts_with("tmux send"))
+            .count()
+    };
+
+    // Before the first instant, nothing.
+    driver.poll_once().unwrap();
+    assert_eq!(sends(&driver), 0);
+
+    // At the first instant, one wake with `due` provenance.
+    driver.effects().advance(600);
+    driver.poll_once().unwrap();
+    let calls = driver.effects().calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("tmux send") && call.contains("(triggers: due)")),
+        "{calls:?}"
+    );
+
+    // The leader did not touch the item; that deadline does not fire again —
+    // the ceiling, not a per-poll retry, is the backstop.
+    driver.poll_once().unwrap();
+    assert_eq!(sends(&driver), 1);
+
+    // The second deadline still earns its own wake at its own instant, with
+    // nothing else having happened: the wake for the first must not have
+    // consumed it.
+    driver.effects().advance(600);
+    driver.poll_once().unwrap();
+    assert_eq!(sends(&driver), 2, "{:?}", driver.effects().calls());
+
+    // And it, too, fires only once.
+    driver.poll_once().unwrap();
+    assert_eq!(sends(&driver), 2);
 }
 
 #[test]

@@ -102,7 +102,10 @@ pub fn triggers(config: &Config, state: &LoopState, notes: &Notes, poll: &Poll) 
     if nudge_pending(state, notes) {
         triggers.push(Trigger::Manual);
     }
-    if state.head > notes.last_head {
+    // "Differs", not "moved past": a rebuilt or truncated log ref moves the
+    // head backwards, and waking once then re-noting self-heals, while
+    // suppressing until the ceiling does not.
+    if state.head != notes.last_head {
         triggers.push(Trigger::Log);
     }
     if poll.refresh_changed {
@@ -117,11 +120,15 @@ pub fn triggers(config: &Config, state: &LoopState, notes: &Notes, poll: &Poll) 
 /// A deferral's deadline has arrived and this driver has not woken the leader
 /// since it passed. One wake per deadline: a leader that reviews the item
 /// moves the deadline or removes it, and a leader that does not is caught by
-/// the max-interval ceiling rather than woken every poll.
+/// the max-interval ceiling rather than woken every poll. Every blocked
+/// item's deadline is checked, not just the earliest: an item that stays
+/// blocked past its own deadline must not swallow the wake a later deadline
+/// is owed.
 fn review_due(state: &LoopState, notes: &Notes, now: DateTime<Utc>) -> bool {
-    state.review_at.is_some_and(|review_at| {
-        now >= review_at && notes.last_wake_at.is_none_or(|woke| woke < review_at)
-    })
+    state
+        .review_deadlines
+        .iter()
+        .any(|&deadline| now >= deadline && notes.last_wake_at.is_none_or(|woke| woke < deadline))
 }
 
 /// The leader has not been woken for longer than the configured ceiling. A
@@ -420,7 +427,7 @@ mod tests {
 
         // A deferral deadline is a due trigger once, at its instant.
         let mut deferred = settled_state();
-        deferred.review_at = Some(at(20));
+        deferred.review_deadlines = vec![at(20)];
         assert!(triggers(&config, &deferred, &acted(0), &poll(19)).is_empty());
         assert_eq!(
             triggers(&config, &deferred, &acted(0), &poll(20)),
@@ -429,6 +436,15 @@ mod tests {
         // A wake delivered after the deadline consumes it; the ceiling is the
         // backstop for a leader that never reviews the item.
         assert!(triggers(&config, &deferred, &acted(21), &poll(22)).is_empty());
+
+        // A head behind the note is still a difference: a rebuilt or
+        // truncated log ref wakes the leader once, and re-noting self-heals.
+        let mut rebuilt = settled_state();
+        rebuilt.head = 39;
+        assert_eq!(
+            triggers(&config, &rebuilt, &acted(0), &poll(1)),
+            vec![Trigger::Log]
+        );
 
         // The ceiling is 1800 seconds by default.
         assert_eq!(
@@ -471,6 +487,30 @@ mod tests {
         assert_eq!(Trigger::Log.as_str(), "log");
         assert_eq!(Trigger::Observations.as_str(), "observations");
         assert_eq!(Trigger::Due.as_str(), "due");
+    }
+
+    #[test]
+    fn each_deadline_earns_its_own_wake() {
+        let config = config_for(&[("claude", "claude")]);
+        let mut deferred = settled_state();
+        deferred.review_deadlines = vec![at(10), at(20)];
+
+        // The first deadline fires at its instant.
+        assert!(triggers(&config, &deferred, &acted(0), &poll(9)).is_empty());
+        assert_eq!(
+            triggers(&config, &deferred, &acted(0), &poll(10)),
+            vec![Trigger::Due]
+        );
+        // The wake for the first deadline does not consume the second: the
+        // item behind the first stays blocked, and the second deadline still
+        // earns its wake at its own instant, with no other trigger holding.
+        assert!(triggers(&config, &deferred, &acted(10), &poll(19)).is_empty());
+        assert_eq!(
+            triggers(&config, &deferred, &acted(10), &poll(20)),
+            vec![Trigger::Due]
+        );
+        // And a wake past the second consumes both.
+        assert!(triggers(&config, &deferred, &acted(21), &poll(22)).is_empty());
     }
 
     #[test]

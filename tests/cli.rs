@@ -1557,9 +1557,56 @@ fn a_deferral_is_a_statement_on_the_work_item_and_expires_into_review() {
     assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
 
     // Re-blocking without a deadline clears it: the latest statement wins.
+    // The key is present and explicitly null, not merely absent.
     project.success(&["work", "block", &overdue, "--why", "paused indefinitely"]);
     let shown = project.success(&["show", &overdue]);
+    assert!(
+        shown["current"]
+            .as_object()
+            .unwrap()
+            .contains_key("block_until")
+    );
     assert!(shown["current"]["block_until"].is_null());
+}
+
+#[test]
+fn finish_drop_and_reopen_each_clear_the_deferral_deadline() {
+    let project = TestProject::new();
+    let until = "2099-01-02T15:00:00Z";
+    let block_until =
+        |work: &str| project.success(&["show", work])["current"]["block_until"].clone();
+
+    // Finishing deferred work (externally: blocked work may only be finished
+    // with evidence) clears its deadline with it.
+    let finished = string(
+        &project.success(&["work", "add", "--title", "Deferred then finished"]),
+        "work_id",
+    );
+    project.success(&[
+        "work", "block", &finished, "--why", "wait", "--until", until,
+    ]);
+    project.success(&[
+        "work",
+        "finish",
+        &finished,
+        "--external",
+        "--evidence",
+        "done upstream",
+    ]);
+    assert!(block_until(&finished).is_null());
+
+    // Dropping deferred work clears it too.
+    let dropped = string(
+        &project.success(&["work", "add", "--title", "Deferred then dropped"]),
+        "work_id",
+    );
+    project.success(&["work", "block", &dropped, "--why", "wait", "--until", until]);
+    project.success(&["work", "drop", &dropped, "--why", "requirement withdrawn"]);
+    assert!(block_until(&dropped).is_null());
+
+    // And a reopened item carries no stale deadline from its blocked past.
+    project.success(&["work", "reopen", &finished, "--why", "not actually done"]);
+    assert!(block_until(&finished).is_null());
 }
 
 #[test]

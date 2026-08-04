@@ -929,6 +929,17 @@ fn selected_status_sections(
 /// last head it acted on, kept in that driver's machine-local notes.
 pub fn loop_section(state: &ProjectState) -> Value {
     let control = &state.loop_control;
+    // Every blocked item's deadline, sorted, alongside `review_at` (the
+    // earliest, kept for the human status line and existing consumers). The
+    // driver checks each one, so an item still blocked past its own deadline
+    // does not swallow the wake a later deadline is owed.
+    let mut review_deadlines: Vec<DateTime<Utc>> = state
+        .work
+        .values()
+        .filter(|work| work.state == crate::domain::WorkState::Blocked)
+        .filter_map(|work| work.block_until)
+        .collect();
+    review_deadlines.sort_unstable();
     json!({
         "paused": control.paused,
         "pause_reason": control.pause_reason,
@@ -936,6 +947,7 @@ pub fn loop_section(state: &ProjectState) -> Value {
         "rotate_requested_seq": control.rotate_requested_seq,
         "nudge_requested_seq": control.nudge_requested_seq,
         "review_at": state.next_review_at(),
+        "review_deadlines": review_deadlines,
     })
 }
 
@@ -2301,6 +2313,7 @@ mod tests {
         assert!(empty["rotate_requested_seq"].is_null());
         assert!(empty["nudge_requested_seq"].is_null());
         assert!(empty["review_at"].is_null());
+        assert_eq!(empty["review_deadlines"], json!([]));
         assert!(loop_lines(&state).is_empty());
 
         state.loop_control.paused = true;
@@ -2330,6 +2343,11 @@ mod tests {
         );
         let deferred = loop_section(&state);
         assert_eq!(deferred["review_at"], "2026-08-04T12:00:00Z");
+        // Every deadline is served, sorted, not just the earliest.
+        assert_eq!(
+            deferred["review_deadlines"],
+            json!(["2026-08-04T12:00:00Z", "2026-08-04T15:00:00Z"])
+        );
         assert_eq!(
             loop_lines(&state)[1],
             "next review 2026-08-04T12:00:00+00:00"

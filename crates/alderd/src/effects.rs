@@ -203,7 +203,13 @@ impl Effects for Host {
                 String::from_utf8_lossy(&typed.stderr).trim()
             )));
         }
-        self.run("tmux", &["send-keys", "-t", session, "Enter"])?;
+        let entered = self.run("tmux", &["send-keys", "-t", session, "Enter"])?;
+        if !entered.status.success() {
+            return Err(DriverError::new(format!(
+                "tmux send-keys Enter failed: {}",
+                String::from_utf8_lossy(&entered.stderr).trim()
+            )));
+        }
         Ok(())
     }
 

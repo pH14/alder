@@ -189,6 +189,19 @@ properties of the box, not durable project facts.
 | `notify` | none | Shell command invoked with one message argument, on an unknown engine name and a repeated store outage. A standing condition is reported once, not once per poll. |
 | `alder` | `alder` | Path to the `alder` binary. |
 
+**Migrating an older config.** `driver.json` rejects unknown fields, so a
+config written before session rotation replaced pass counting must delete
+`passTimeoutSeconds` and `maxPassesPerSession`, and may set
+`maxSessionAgeSeconds` (default 21600). Until then the daemon refuses to
+start with:
+
+```text
+invalid driver config `.alder/driver.json`: unknown field `passTimeoutSeconds`,
+expected one of `engines`, `passDoc`, `tmuxSession`, `pollSeconds`,
+`hintPollSeconds`, `debounceSeconds`, `maxIntervalSeconds`,
+`maxSessionAgeSeconds`, `notify`, `alder` at line 4 column 22
+```
+
 ## What one poll does
 
 1. Read the head and the loop fold. A `store_unavailable` result is retried
@@ -198,9 +211,9 @@ properties of the box, not durable project facts.
    `manual` (a nudge request is later in the log than the noted head),
    `log` (the head moved past the noted head),
    `observations` (refresh reported a change), and
-   `due` (a deferral deadline — the loop section's `review_at` — arrived and
-   no wake has been delivered since it passed, or `maxIntervalSeconds`
-   elapsed since the last wake).
+   `due` (a deferral deadline — any entry in the loop section's
+   `review_deadlines` — arrived and no wake has been delivered since it
+   passed, or `maxIntervalSeconds` elapsed since the last wake).
 4. Decide: idle if nothing holds, hold if the injection should wait, fire
    otherwise.
 

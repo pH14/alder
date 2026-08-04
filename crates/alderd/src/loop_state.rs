@@ -37,9 +37,14 @@ pub struct LoopState {
     #[serde(default)]
     pub nudge_requested_seq: Option<u64>,
     /// The earliest `work block --until` deadline any blocked item carries:
-    /// the loop's next review rendezvous.
+    /// the loop's next review rendezvous, kept for the human status line.
     #[serde(default)]
     pub review_at: Option<DateTime<Utc>>,
+    /// Every blocked item's `work block --until` deadline, sorted. The due
+    /// trigger checks each one: an item still blocked past its own deadline
+    /// must not swallow the wake a later deadline is owed.
+    #[serde(default)]
+    pub review_deadlines: Vec<DateTime<Utc>>,
 }
 
 impl LoopState {
@@ -77,7 +82,8 @@ mod tests {
                 "engine": "codex",
                 "rotate_requested_seq": 17,
                 "nudge_requested_seq": 41,
-                "review_at": "2026-08-04T15:00:00Z"
+                "review_at": "2026-08-04T15:00:00Z",
+                "review_deadlines": ["2026-08-04T15:00:00Z", "2026-08-05T09:00:00Z"]
             }
         });
         let state = LoopState::from_status(&status).unwrap();
@@ -91,16 +97,25 @@ mod tests {
             state.review_at.unwrap().to_rfc3339(),
             "2026-08-04T15:00:00+00:00"
         );
+        assert_eq!(
+            state
+                .review_deadlines
+                .iter()
+                .map(|deadline| deadline.to_rfc3339())
+                .collect::<Vec<_>>(),
+            ["2026-08-04T15:00:00+00:00", "2026-08-05T09:00:00+00:00"]
+        );
 
         let empty = LoopState::from_status(&json!({
             "head": 0,
             "loop": {"paused": false, "engine": null, "rotate_requested_seq": null,
-                     "nudge_requested_seq": null, "review_at": null}
+                     "nudge_requested_seq": null, "review_at": null, "review_deadlines": []}
         }))
         .unwrap();
         assert!(!empty.paused);
         assert!(empty.rotate_requested_seq.is_none());
         assert!(empty.review_at.is_none());
+        assert!(empty.review_deadlines.is_empty());
 
         assert!(LoopState::from_status(&json!({"head": 1})).is_err());
         assert!(LoopState::from_status(&json!({"loop": 7})).is_err());

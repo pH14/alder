@@ -133,22 +133,7 @@ impl<E: Effects> Driver<E> {
 
     /// One complete poll. Public so a caller can drive it step by step.
     pub fn poll_once(&mut self) -> Result<()> {
-        let state = match self.loop_state() {
-            Ok(state) => {
-                self.outages = 0;
-                state
-            }
-            Err(error) if error.is("store_unavailable") => {
-                self.outages = self.outages.saturating_add(1);
-                if self.outages == OUTAGE_NOTICE_AFTER {
-                    self.effects.notify(&format!(
-                        "the Alder store has been unavailable for {OUTAGE_NOTICE_AFTER} polls"
-                    ));
-                }
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
+        let state = self.observed_state()?;
 
         if state.paused {
             self.pending_since = None;
@@ -156,9 +141,26 @@ impl<E: Effects> Driver<E> {
             return Ok(());
         }
 
+        let refresh_changed = self.refresh_changed();
+        // A changed sweep appended observation events, so the head just read
+        // is already stale. Deciding on it would note a head one sweep behind
+        // and deliver a second wake next poll for this driver's own appends,
+        // so the status is read once more before deciding.
+        let state = if refresh_changed {
+            let state = self.observed_state()?;
+            if state.paused {
+                self.pending_since = None;
+                self.effects.log("idle: the loop is paused");
+                return Ok(());
+            }
+            state
+        } else {
+            state
+        };
+
         let poll = Poll {
             now: self.effects.now(),
-            refresh_changed: self.refresh_changed(),
+            refresh_changed,
             pending_since: self.pending_since,
             attached_client: self.attached_client(),
         };
@@ -183,6 +185,27 @@ impl<E: Effects> Driver<E> {
 
     fn loop_state(&self) -> Result<LoopState> {
         LoopState::from_status(&self.effects.alder(&["status"])?)
+    }
+
+    /// Read the loop state, counting consecutive store outages so a standing
+    /// outage is announced once rather than every poll.
+    fn observed_state(&mut self) -> Result<LoopState> {
+        match self.loop_state() {
+            Ok(state) => {
+                self.outages = 0;
+                Ok(state)
+            }
+            Err(error) if error.is("store_unavailable") => {
+                self.outages = self.outages.saturating_add(1);
+                if self.outages == OUTAGE_NOTICE_AFTER {
+                    self.effects.notify(&format!(
+                        "the Alder store has been unavailable for {OUTAGE_NOTICE_AFTER} polls"
+                    ));
+                }
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// The observation sweep. A failed refresh is not a trigger; it is simply

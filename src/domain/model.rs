@@ -383,7 +383,8 @@ pub struct Work {
     pub state: WorkState,
     pub block_reason: Option<String>,
     /// The review deadline carried by the latest block, if it stated one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Serialized as an explicit null so the key is always present.
+    #[serde(default)]
     pub block_until: Option<DateTime<Utc>>,
     pub outcome: Option<String>,
     pub opened_seq: u64,

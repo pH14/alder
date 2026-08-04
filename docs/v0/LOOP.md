@@ -106,9 +106,10 @@ Three more conditions wake without a head movement, each read from the same
 status document or the driver's own observation:
 
 - **observations**: `alder refresh` reported a semantic change;
-- **due**: a deferral deadline (the loop section's `review_at`) has arrived
-  and no wake has been delivered since it passed, or `maxIntervalSeconds`
-  elapsed since the last wake — the ceiling that keeps a quiet loop honest;
+- **due**: a deferral deadline (any entry in the loop section's
+  `review_deadlines`) has arrived and no wake has been delivered since it
+  passed, or `maxIntervalSeconds` elapsed since the last wake — the ceiling
+  that keeps a quiet loop honest;
 - **manual**: a nudge request is later in the log than the noted head.
 
 ### The delivery
@@ -164,8 +165,9 @@ moves the note past it) consumes it. Two drivers with separate notes each
 honor the request once, which is the harmless direction.
 
 **Deferral.** `work block --until <RFC3339>` stores a review deadline on the
-work item. The fold derives one scalar from it: `review_at`, the earliest
-deadline over all blocked work, served in the loop section. The fold is a
+work item. The loop section serves every blocked item's deadline, sorted, as
+`review_deadlines`, plus `review_at`, the earliest, for the human status
+line. The fold is a
 pure function of the log and cannot read a clock, so nothing unblocks by
 itself — when the deadline passes, `alder status` surfaces the item as a
 `block_expired` attention finding, and the driver's `due` trigger wakes the
