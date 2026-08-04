@@ -1,11 +1,11 @@
 # alder-model
 
 A [stateright](https://docs.rs/stateright) model of Alder's protocol core.
-It checks the loop protocol under **every interleaving**
-of a small cast — the shared CAS log, the daemon's decide loop, the leader
-engine, and an optional second writer (a phone session) — including crash
-transitions. It is a dev-only crate: nothing depends on it, and it ships
-nothing.
+It checks the wake protocol under **every interleaving** of a small cast —
+the shared log, the daemon's decide loop with its machine-local notes, the
+leader engine, and an optional second writer (a phone session) — including
+crash transitions. It is a dev-only crate: nothing depends on it, and it
+ships nothing.
 
 Run it:
 
@@ -22,145 +22,98 @@ new behavior with no edits here.
 | Concern | Source of truth |
 | ------- | --------------- |
 | Records, drafts, heads | `alder_log::{Record, RecordDraft, Head}` |
-| CAS append, idempotency, head conflicts | `alder_log::MemoryLog` (states replay through its public `append`) |
+| Append semantics | `alder_log::MemoryLog` (states replay through its public `append`) |
 | Event payloads and codec | `alder::domain::{EventPayload, encode_draft, decode_record}` |
 | Log interpretation | `alder::domain::ProjectState::fold` on every state |
 | The daemon's read | `alder::app::loop_section` + `alderd::loop_state::LoopState::from_status` |
-| The daemon's judgment | `alderd::decide::{decide, resolve_engine, session_action, observable_session}` |
-| The safety predicates | `alder::domain::invariants` — the same four the crash simulator asserts |
+| The daemon's judgment | `alderd::decide::{decide, resolve_engine, session_action, rotate_pending}` over real `Notes` |
+| The safety predicates | `alder::domain::invariants` — the same sentences the crash simulator asserts |
 | **Modeled by hand (the drift surface)** | each actor's atomic steps: where a process can be interrupted between reading and writing, and what a crash erases |
 
 The safety predicates are shared on purpose. Two harnesses check this
 protocol from opposite directions — this model explores every interleaving of
 a small cast, the simulator tears every effect every way its footprint allows
-— and they check the same four things about a log and the state it folds to.
+— and they check the same things about a log and the state it folds to.
 Stated twice they drift invisibly, both green while meaning different things
-by "correct"; stated once in `alder::domain::invariants`, both assert the same
-sentence. One compares the log against a fact no log can hold — a crash that
-really happened — so the caller passes that witness in. Here the witness is
-the model's own injected session deaths.
+by "correct"; stated once in `alder::domain::invariants`, both assert the
+same sentence.
 
-Liveness, the `sometimes` properties, and one audit of the model's own ghost
-bookkeeping stay local, and that is deliberate rather than an omission: they
-are claims about reachability across a state space, and only a model checker
-has one.
-
-Two production changes were made for this crate: `alder::app::loop_section`
-became `pub`, so the model reads the loop through the same projection the
-daemon does, and `PassTrigger` gained `Hash`, so a recorded trigger list can
-live in a model state that stateright hashes.
-
-Trigger kinds reach the log the way the driver sends them, not by a mapping
-copied into this crate: `alderd`'s `Trigger::as_str` is what the driver puts
-on `alder loop wake --trigger`, so the model parses that string with the
-CLI's own `TriggerKind` and converts with `alder`'s own `From`. If the two
-enums ever diverge, this panics rather than quietly recording a trigger kind
-the contract does not have.
+The central claim is stated by the shape of the model itself: **the daemon
+has no append step, because it appends nothing.** A wake is an injection
+plus a machine-local notes write, both outside the log. The log carries
+statements about work, never about its own readers, and the property that
+pins it — the shared `mentions_no_readers`, plus "no record carries the
+daemon's actor" — holds in every reachable state of every scenario.
 
 ## The actors and their atomic steps
 
-- **The log** is the shared state: a `Vec<Record>` replayed through a real
-  `MemoryLog` on every transition. Appends are the linearization points.
-- **The daemon** takes four steps per wake, mirroring `alderd`'s driver:
-  poll-decide-reconcile (session restarted *before* the wake, as the driver
-  comments insist), then the wake CLI's own snapshot (which concedes to an
-  open pass — the `pass_open` path), then the CAS push against the pinned
-  head (which can lose the race — the `HeadConflict` path), then
-  `tmux_send_keys` — the injection, which is a separate step because the
-  durable wake deliberately precedes it. The engine and trigger kinds the
-  decision produced ride along from the first step to the third, because
-  those are what the wake records. It repairs a pass it *found* open by the
-  stale-pass rule: `crashed` when the pass's handle is an observable tmux
-  session it can see is gone, `timeout` otherwise.
-- **The leader** ends the open pass `ok`, optionally with `rotate: true`,
-  or crashes (the tmux session dies).
-- **The phone** optionally races a wake, requests a rotation, or pauses the
-  loop with a stated reason.
-- **Crashes**: the daemon process can die (forgetting its session memory),
-  and the leader session can die, each under a scenario budget.
+- **The log** is the shared durable state: a `Vec<Record>` replayed through
+  a real `MemoryLog` on every transition.
+- **The notes** are one machine's durable state about itself: the last head
+  the daemon acted on, and when. They survive a daemon crash; a scenario may
+  erase them (`NotesLost`), which is the "machine lost `.alder/`" fault.
+- **The daemon** takes three steps per wake, mirroring `alderd`'s driver:
+  poll-decide-reconcile (session restarted *before* anything else, so a
+  crash re-rotates rather than losing a rotation), then the injection
+  (`tmux_send_keys`), then the notes write. The order of the last two is the
+  duplicate-wake window: a crash between them leaves a delivered wake that
+  nothing anywhere records, so the restarted daemon delivers it again.
+- **The leader**, when woken, reads the fold and acts: appends one work
+  statement (budget-bounded), or finds nothing demanding and idles. Or its
+  session dies.
+- **The phone** optionally requests a rotation, pauses the loop with a
+  stated reason, or appends a work statement of its own — every append is
+  the wake rule firing from a second writer.
 
-Time is not a modeled dimension: every event carries the same instant, and
-the two places the protocol genuinely waits are offered as explicit steps
-rather than pretended away — "the max-interval ceiling eventually elapses"
-(`DaemonCeilingFires`) and "the pass budget eventually elapses"
-(`DaemonResolveTimeout`). That is the fairness assumption made honest. What
-it costs is that both are always available rather than only after a delay,
-so the model explores a daemon that times out a live pass; that is legal
-under the stale-pass rule, just pessimistic about when.
-
-### The window between intent and effect
-
-`LOOP.md` names two crash windows around a wake and says the first is
-repairable. The model represents it: `DaemonCtl::Recorded` is the state
-where the CAS append has committed and nothing has been typed at the leader
-yet. A daemon crash there strands a pass that the log shows open and that no
-engine was ever told to run.
-
-The bit that makes this window real is `leader_injected`. A live tmux
-session is not a running pass — the driver reconciles the session *before*
-the wake, so after a crash in this window the session is perfectly healthy
-and perfectly idle. Without that bit the leader could end a pass it was
-never handed, which is precisely what would make a broken window look
-repaired.
-
-The repair is `timeout`, and it has to be: `crashed` requires a session
-observably gone, and this one is alive. That is the stale-pass rule's "time
-is the only fact it has" clause, and it is why modelling the window at all
-required modelling the timeout verdict.
-
-A crash *during* the CAS push is the other window, and it stays out of
-scope: the daemon cannot know whether its append landed, and telling that
-era apart from a pass still running needs real time rather than a fairness
-step. The crash injection stops short of `DaemonCtl::Appending` for that
-reason and no other.
+Time is not a modeled dimension: every event carries the same instant, so
+the daemon's time triggers reduce to their untimed cases — fresh notes fire
+immediately, and nothing else is ever "due". Deferral deadlines
+(`review_at`) are therefore out of this model's scope; the CLI suite and the
+driver tests cover them.
 
 ## Core properties
 
-1. **At most one open pass** under concurrent wake attempts, with the loser
-   conceding rather than ending the winner's pass. Encoded as `always`
-   invariants — the shared `log_folds_cleanly` and `at_most_one_open_pass`,
-   the latter asserting both harnesses' spellings of "open" and that they
-   still agree pass by pass — plus `sometimes` coverage that both concede
-   paths are actually reached. Checked in
-   `concurrent_wakes_leave_at_most_one_open_pass`.
-2. **A pending rotation is consumed exactly once, and a crashed pass never
-   silently consumes one.** The shared
-   `rotate_pending_mirrors_the_request_log` holds the fold's sequence
-   arithmetic against a straight scan of the history in log order, in every
-   state; the shared `crashed_verdicts_follow_real_crashes` holds the log's
-   crash attributions against the deaths this run actually injected; and —
-   with a single waker — a rotation the daemon consumes was always performed
-   (a fresh session) first, whatever crashed in between. Checked in
-   `crashes_never_silently_consume_a_rotation` with a daemon crash and a
-   session crash injected at every point.
-3. **Liveness under fairness: from any crash state the system reaches
-   progressing, or blocked-and-named.** Encoded as safety over the bounded
-   graph: every *terminal* state (no action enabled) has no open pass —
-   in particular none stranded by a crash, so every crashed pass got its
-   `pass.ended crashed` attribution — and is either free to run the next
-   trigger or paused with a stated reason. Because every transition either
-   grows the log or advances a monotone counter/latch, the state graph is
-   acyclic and finite, so "all maximal paths end recovered" is exactly
-   "every fair execution eventually recovers" within the bounds. (This
-   sidesteps stateright's documented caveat that `eventually` properties
-   are unsound on cyclic graphs.)
+1. **The log never mentions its own readers.** No reachable history holds a
+   pass event or a daemon-actor record, whatever crashes or duplicate wakes
+   occur. Asserted in every state of every scenario.
+2. **Missed and duplicated wakes are harmless.** The daemon, the session,
+   and the notes file each fail at every point. A crash between the
+   injection and the notes write strands a delivered wake nothing recorded
+   (`sometimes`, so the window is actually entered); the same head is then
+   woken twice (`sometimes`); and every `always` property holds through
+   both, because a wake carries no work of its own — the leader reads the
+   fold either way. Checked in
+   `crashes_cost_duplicate_wakes_and_nothing_else`.
+3. **A consumed rotation was performed first.** The driver reconciles the
+   session before it notes the head, so a rotation request is only ever
+   consumed (noted past) after a restart answered it; a crash between the
+   two merely re-rotates, and a notes loss re-pends an already-honored
+   request as a redundant — harmless — second rotation. The fold-side
+   derivation is held against a ghost mirror, and the mirror is itself
+   audited against the fold in every state. The old concurrent-writer
+   swallow is gone by construction: a wake is not an append, so there is no
+   racing wake to consume a request by log order.
+4. **Liveness: every terminal state is progressing or blocked-and-named.**
+   Because every transition either grows the log or advances a monotone
+   counter or latch, the state graph is acyclic and finite, so "all maximal
+   paths end recovered" is exactly "every fair execution eventually
+   recovers" within the bounds. Recovered now means: the log folds, and a
+   paused loop states its reason. There is no "stranded open run" clause
+   left, because nothing durable can be open — which is the design.
 
 ## State-space bounds
 
-Budgets bound the space: total passes (`max_passes`, ±1 under a lost wake
-race), one phone wake, one rotation request per source, one pause, and
-per-scenario crash counts. The log length is bounded by
-2·passes + 4 control events. Counts from `cargo test -- --nocapture`:
+Budgets bound the space: one leader statement, one phone statement, one
+rotation request, one pause, and per-scenario fault counts. Counts from
+`cargo test -- --nocapture`:
 
 | Scenario (test) | Faults and writers | Unique states |
 | --------------- | ------------------ | ------------- |
-| codex engine | none, one pass, Codex-configured | 7 |
-| lone daemon | none | 19 |
-| wake race | phone wake | 152 |
-| rotation race | phone wake + phone rotation | 1,393 |
-| rotation under crashes | rotate + pause + 1 daemon crash + 1 session crash | 8,826 |
+| lone daemon | none | 13 |
+| phone writer | phone statement + rotation + pause | 1,191 |
+| faults everywhere | rotation + 1 daemon crash + 1 session crash + 1 notes loss | 4,506 |
 
-Complete exploration of all five scenarios takes about five seconds.
+Complete exploration of all three scenarios takes about a second.
 
 Each test asserts its own number exactly, so this table and the suite are one
 claim rather than two: a count that moves fails a test, and the number here is
@@ -168,130 +121,47 @@ meant to be changed in the same commit that explains why. That assertion is
 load-bearing rather than decorative. A property catches a model that *reaches*
 a bad state; nothing but the size of the space catches a model that quietly
 stopped reaching a good one, or started reaching states its budgets say it
-cannot — a fairness step offered one pass too late, a fault injected past its
-budget, a counter that stopped counting so two eras hash alike. Each of those
-leaves every property green and the space a different size.
+cannot — a fault injected past its budget, a counter that stopped counting so
+two states hash alike. Each of those leaves every property green and the
+space a different size.
 
-The baseline is no longer the single linear chain it was before the
-injection step and the timeout verdict existed. It is now arm, snapshot,
-append, inject, end, twice over, with the timeout branch available at each
-of the two open passes — 19 states. Growth beyond that still means the model
-gained transitions, and still wants investigating before it is accepted.
+## Checking the checker
 
-## Findings
-
-**A racing wake can swallow a rotation request.** Reachable, kept visible
-as an asserted discovery in `a_racing_wake_can_swallow_a_rotation`, in two
-shapes:
-
-- *Daemon-side*: the request lands in the window between the driver's
-  poll/reconcile and its wake's CAS append. The wake was armed before the
-  request existed, so nothing was restarted, yet the append consumes the
-  request by log order. Shortest trace: `DaemonPollFires,
-  PhoneRotationRequest, DaemonWakeSnapshot, DaemonWakeAppend` — the
-  rotation is consumed, no restart ever happens.
-- *Phone-side*: a phone wake wins while a rotation is pending; the phone
-  restarts nothing, and by the daemon's next fire `rotate_pending` is
-  already false, so the old session is reused.
-
-The crash-ordering guarantee the driver documents (rotate first, wake
-second, so a crash between them merely re-rotates) **does hold** — that is
-property 2. The swallow is a concurrency wart, not a crash wart: consumed
-means "a wake is later in the log than the request", not "somebody
-rotated". If it is worth fixing, the natural shapes are (a) the wake
-carries the rotation state it acted on, so a consuming wake that performed
-no rotation is detectable, or (b) `rotate_pending` stays derived but the
-daemon re-checks it between its own wake's snapshot and push.
-
-**Mutation checks.** The properties bite. Two mutations of the protocol
-itself: reverting the driver's rotate-before-wake order (treating the
-rotation restart as a reuse) is caught by property 2 with a 16-step
-counterexample; ignoring the pinned head in the daemon's wake append (blind
-append instead of CAS) is caught by the shared `log_folds_cleanly` with a
-10-step counterexample ending in a log the real fold rejects as a duplicate
-pass.
-
-Two more confirm the shared predicates did not go vacuous when the closures
-started delegating to them, each mutation aimed at one sentence: making the
-fold's `rotate_pending` ignore the consuming wake is caught by
-`rotate_pending_mirrors_the_request_log`; writing a clean pass end as a
-`crashed` verdict is caught by `crashed_verdicts_follow_real_crashes` in
-every scenario, including the fault-free one.
-
-Three more hold the wake's recorded content and the crash window in place —
-each of these mutations restores a defect this model once had:
-
-- Hard-coding `engine: "claude"` again passes every other scenario in the
-  file and fails only `a_codex_configured_loop_records_codex`, on "a daemon
-  wake records a configured engine". A literal that matches the only engine
-  anybody configured is invisible until somebody configures another one,
-  which is why that scenario exists.
-- Removing `DaemonResolveTimeout` fails **liveness** — "every terminal state
-  is progressing or blocked-and-named" — with a 16-step counterexample: the
-  pass stranded by a crash between the wake and the injection has no repair,
-  so exploration ends with it still open. Removing the injection gate as
-  well does not restore the green; it fails "a stranded pass is repaired by
-  timeout" instead. That pair is the point of the window: before it existed
-  the model could not enter the state at all, and liveness stayed green by
-  never being asked.
-
-`at_most_one_open_pass` has no such mutation here, and that is a fact about
-the fold rather than a gap: every way of reaching two open passes in this
-model produces a history the real fold rejects outright, so
-`log_folds_cleanly` fires first. The predicate is exercised directly against
-those shapes in the shared module's own tests.
-
-**Mutating the checker itself.** This crate is in the workspace mutation
-sweep with no exclusion, which asks a sharper question than "do the properties
-bite": *who checks the checker?* A checker has two failure modes an ordinary
-suite does not, and both stay green under exploration, because a check that is
-never made has no counterexample to find.
+This crate is in the workspace mutation sweep with no exclusion, which asks a
+sharper question than "do the properties bite": *who checks the checker?* A
+checker has two failure modes an ordinary suite does not, and both stay green
+under exploration, because a check that is never made has no counterexample
+to find.
 
 - **A question nobody asks.** The flags decide which properties a scenario
   registers, and an unregistered `sometimes` cannot fail — a gate that stops
   registering one makes the run go green *faster*. So
   `each_scenario_registers_exactly_the_properties_its_flags_ask_for` pins the
-  set, in order, for all five scenarios.
+  set, in order, for all three scenarios.
 - **A question that answers itself.** A `sometimes` property claims the model
   can *reach* something, and one that already holds in the initial state
   claims nothing: it is witnessed by the empty log, and it stays witnessed
-  however the protocol breaks. `crashed_verdicts(state) >= 0` and
-  `crashes_left <= daemon_crashes` are both true before the model moves, and
-  both read as coverage. So
+  however the protocol breaks. So
   `no_sometimes_property_is_witnessed_before_the_model_moves` evaluates every
   registered `sometimes` against the initial state and requires it false.
+- **A helper that answers too readily.** `recovered` is consulted by exactly
+  one property, and a wrong answer makes that property vacuous rather than
+  false — saying yes too readily leaves liveness green over a silently
+  stopped loop. Its sentences are pinned by unit tests in `lib.rs` beside it.
 
-The state counts above close the third gap: the model's own sequencing —
-budgets, guards, and the monotone counters that keep two eras from hashing
-alike — is checked by the size of the space, not by any property. The two
-helpers a property reads *through* rather than states, `recovered` and
-`crashed_verdicts`, are the one thing neither mechanism reaches, since a wrong
-answer there makes its property vacuous rather than false; they are pinned by
-unit tests in `lib.rs` beside them.
-
-One equivalent mutant was removed by clearer code rather than by a test.
-`late_observation` used to step to one second *past* the max-interval ceiling;
-`max_interval_elapsed` asks `now >= ended_at + ceiling`, so every instant at
-or past the boundary explores exactly the same space and the margin's
-arithmetic was a claim no scenario could refute. The step now lands on the
-boundary itself, which is also the more useful spelling: it makes the counts a
-check on the daemon's own definition of "elapsed".
+The state counts above close the remaining gap: the model's own sequencing —
+budgets, guards, and the monotone counters that keep two states from hashing
+alike — is checked by the size of the space, not by any property.
 
 ## Abstractions, so nobody over-reads the green
 
-- The timeout *verdict* is modeled; the timeout *deadline* is not. The
-  budget elapsing is a fairness step available whenever a pass is open, so
-  the model explores a daemon that times out a live pass — legal under the
-  stale-pass rule, pessimistic about when. Crash attribution is modeled only
-  for observable tmux handles, which is the driver's own rule. The phone
-  always ends its own pass.
-- The injection is assumed to land: `tmux_send_keys` failures are not
-  modeled, only the crash window before the call.
-- Injection, debounce, client-attachment, engine ambiguity, pass budgets
-  per session, and the SQLite projection are out of scope.
+- The injection is assumed to land when the session exists: `tmux_send_keys`
+  failures are not modeled, only the crash windows around the call and a
+  session that died before it.
+- Debounce, client-attachment, engine ambiguity, session age rotation,
+  deferral deadlines, and the SQLite projection are out of scope.
 - All events share one timestamp and record IDs are deterministic per
   actor; ULID collisions are assumed impossible rather than modeled.
-- `MemoryLog` heads are length-deterministic, so a pinned head is
-  recovered by replaying the prefix a writer saw. The model's log is
-  linear history — Git-level forks or lost pushes beyond a rejected CAS
-  are not modeled.
+- The model's log is linear history — Git-level forks or lost pushes are
+  not modeled, and no modeled writer has a read-write gap against the CAS,
+  because the one writer that used to race (the wake) no longer appends.
