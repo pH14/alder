@@ -79,11 +79,9 @@ The event types Alder may append are:
 - `question.asked`
 - `question.answered`
 
-The loop's types are namespaced separately, because they record how the project
-is being driven rather than what the project owes:
+The loop's control types are namespaced separately, because they record how
+the project is to be driven rather than what the project owes:
 
-- `pass.started`
-- `pass.ended`
 - `loop.paused`
 - `loop.resumed`
 - `loop.engine_selected`
@@ -93,11 +91,21 @@ is being driven rather than what the project owes:
 These are storage types, not a requirement that every type become a separate
 user-facing concept.
 
-Historical logs may contain `handoff.submitted`, `handoff.integrated`, and
-`handoff.withdrawn`. The decoder retains those wire forms so history remains
-readable. Submission and withdrawal are inert history. Integration still adds
-its embedded work record, because later historical events and dependency edges
-can refer to work created that way; it creates no handoff-scoped live state.
+**The log never mentions its own readers.** Every type above is a statement
+about the project or a standing instruction to whoever drives it; none is a
+record of a process reading the log. Pass events were the last such machinery
+records, and they are gone from the live schema.
+
+Historical logs may contain `handoff.submitted`, `handoff.integrated`,
+`handoff.withdrawn`, `pass.started`, and `pass.ended`. The decoder retains
+those wire forms so history remains readable, and the append layer refuses
+every one of them, so no path in the workspace can write a new one. Handoff
+submission and withdrawal are inert history; integration still adds its
+embedded work record, because later historical events and dependency edges
+can refer to work created that way. Pass events are inert with one exception:
+a historical `pass.ended` that asked for rotation still reads as a rotation
+request, because that half of the event was a statement about the loop rather
+than about the pass.
 
 ## Identifiers
 
@@ -109,15 +117,11 @@ use `hm`, as a Harmony repository might:
 | Work | `<prefix>-<token>` | `hm-9a1` |
 | Attempt | `<work>-attempt-<ordinal>` | `hm-9a1-attempt-1` |
 | Question | `<work>-question-<ordinal>` | `hm-9a1-question-1` |
-| Pass | `<prefix>-pass-<ordinal>` | `hm-pass-19` |
 
 The prefix is chosen once for the repository and cannot change after its first
-object is appended. Generated tokens contain no hyphens, keeping the four
-forms unambiguous.
-
-A pass uses a repository-scoped ordinal rather than a token because passes
-belong to the singleton loop and are serialized: at most one is open, so the
-next ordinal is never contended.
+object is appended. Generated tokens contain no hyphens, keeping the three
+forms unambiguous. (Historical logs also hold `<prefix>-pass-<ordinal>` IDs;
+they name no live object.)
 
 Attempt and question ordinals start at one, increase independently within
 their work item, and are never reused. Every attempted launch consumes an
@@ -226,6 +230,14 @@ but Alder does not define or validate its schema.
   operations are `alder work block` and `alder work unblock`: `edit` never
   changes state, so the transition is a verb even though the storage is one
   operation shape.
+- A block may carry a review deadline, `work block --until <RFC3339>`, stored
+  on the item as `block_until`. The latest block's statement wins whole: a
+  re-block without a deadline clears the previous one, and unblocking,
+  finishing, dropping, or reopening clears it too. The fold is a pure
+  function of the log and reads no clock, so passing the instant changes no
+  state — an expired deadline surfaces as a `block_expired` attention finding
+  in `status`, and unblocking remains an explicit, reasoned act. "Check again
+  at 3pm" is thereby a statement on the work item, never on the loop.
 - Blocking work with an active attempt prevents a later attempt from starting
   but does not stop the existing external execution.
 - Work with an unanswered question cannot be unblocked.
@@ -504,65 +516,37 @@ harmless, and answers already support revision. `work drop` and `work finish`
 report the questions they strand, so a caller sees that consequence when
 deciding rather than discovering it afterwards.
 
-## Passes
-
-A pass is one run of the driving loop. Work is to an attempt what the loop is
-to a pass, and the same invariants follow from that: intent is recorded before
-effects, and at most one pass is open at a time.
-
-| Field | Meaning |
-| --- | --- |
-| `id` | Immutable pass ID |
-| `engine` | Opaque engine name supplied by the caller; never validated |
-| `handle` | Session handle, `<kind>:<value>`, such as `tmux:alder-leader` |
-| `triggers` | Why the loop was woken: `log`, `observations`, `due`, `manual` |
-| `state` | `open` or `ended` |
-| `outcome` | `ok`, `crashed`, or `timeout` |
-| `report` | Free-text iteration report |
-| `wake_at` | Absolute time the pass asked to be woken again |
-| `rotate` | Whether the pass requested a fresh session next time |
-| `why` | Explanation of a non-`ok` outcome |
-| `at_head` | The log head the wake was appended at |
-| `started_at`, `started_seq` | Intent recorded before the agent was prompted |
-| `ended_at`, `ended_seq` | Pass end |
-
-`pass.started` is rejected while another pass is open, and `pass.ended` is
-rejected against an already-ended pass. Pass ordinals start at one, increase by
-one, and are never reused.
-
-`at_head` records what the pass could have seen. Trigger kinds are provenance:
-they say why the wake happened and never limit what the pass must do.
-
-A pass ends `ok` only when the agent that ran it says so. `crashed` and
-`timeout` are what an external driver can honestly assert when the agent is not
-available to speak for itself. An open pass therefore blocks the next wake
-until someone records one of those, which makes the crash window a forced
-repair rather than an optional one.
-
 ## Loop controls
 
-The loop is a singleton, so its controls are folded fields rather than objects.
+The loop is a singleton, so its controls are folded fields rather than
+objects. They are the only loop state the log carries — the log never records
+its own readers, so there are no run records, no "open pass", and no account
+of when or whether any driver acted.
 
 | Field | Fold rule |
 | --- | --- |
 | `paused`, `pause_reason` | Last writer wins. `loop.paused` sets both; `loop.resumed` clears both. No count, nesting, or owner. |
 | `engine` | Last writer wins. `loop.engine_selected` replaces the desired name. The name is opaque and never validated. |
-| `rotate_pending` | Derived, never stored: true when the latest rotation request has a greater sequence than the latest `pass.started`, or when a rotation was requested and no wake has ever happened. |
-| `nudge_pending` | Derived the same way from the latest `loop.nudge_requested`. A nudge asks the driver to wake the loop now; the next wake consumes it. |
+| `rotate_requested_seq` | The sequence of the latest `loop.rotation_requested` (or of a historical `pass.ended` that asked to rotate). |
+| `nudge_requested_seq` | The sequence of the latest `loop.nudge_requested`. |
 
-A rotation request is a `loop.rotation_requested` event or a `pass.ended` whose
-`rotate` is set. The next wake consumes the request by being later in the log,
-so nothing clears a flag and two writers cannot disagree about whether a
-rotation has already been served. A nudge request follows the identical rule
-over its own event kind.
+The request sequences are deliberately raw. Whether a request has been acted
+on is each driver's machine-local knowledge — it compares the sequence with
+the last head it acted on — so the fold cannot and does not say "pending".
+Two drivers with separate notes each honor a request once, which is the
+harmless direction.
 
-Pause is desired state, not a lock. Alder still accepts `loop wake` while
-paused; enforcement belongs to whatever schedules the loop. Alder does not
-store which driver, host, or process owns the loop, for the same reason it
-stores no leader role.
+The loop section of `alder status` also serves `review_at`: the earliest
+`work block --until` deadline over all blocked work. It is derived from work
+items, not stored on the loop; it exists so a driver can wake the leader at
+the deferral's instant without reading work state.
 
-[LOOP.md](LOOP.md) states the driver's read surface and the crash-window
-reasoning in full.
+Pause is desired state, not a lock: enforcement belongs to whatever schedules
+the loop. Alder does not store which driver, host, or process owns the loop,
+for the same reason it stores no leader role.
+
+[LOOP.md](LOOP.md) states the driver's read surface and why a missed or
+duplicated wake is harmless.
 
 ## Concurrent writers
 
@@ -586,11 +570,11 @@ head; the caller must reread and decide again.
 Reapplying is not withheld out of caution. A mutation is validated against one
 projection and materialized at one sequence, so replaying it against a log
 that has moved would append a decision nobody made — and the decision is
-sometimes the whole payload, as with a `pass end` whose report describes the
-state the leader read. Because reconsideration is the caller's, a loss is
-reported as a fact about the command: nothing was appended, and this is the
-event that was not written. See [CLI.md](CLI.md) for how that reaches each
-output channel.
+sometimes the whole payload, as with an answer that rules on the state the
+answerer read. Because reconsideration is the caller's, a loss is reported as
+a fact about the command: nothing was appended, and this is the event that
+was not written. See [CLI.md](CLI.md) for how that reaches each output
+channel.
 
 The expected head is internal to the command. There is no public `--if-head`
 option. A change committed before a command begins is part of the state
@@ -676,8 +660,6 @@ The initial SQLite projection exposes:
 - `in_flight`
 - `blocked`
 - `downstream`
-- `passes`
-- `pass_open`
 - `loop_control`
 
 `alder status` is built from these projections. Raw SQL is diagnostic; agents

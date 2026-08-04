@@ -37,11 +37,9 @@ documents intentionally leave open.
 - A check result is recorded as `--satisfied <check>` or `--failed <check>`,
   each repeatable and each requiring `--evidence`. `pending` is the state every
   check starts in, so there is no flag that sets it.
-- `pass end --wake <duration>` accepts `270s`, `20m`, `1h`, or `2d` and stores
-  an absolute timestamp. A reader of the event never needs to know when the
-  pass ended to know when it asked to be woken.
-- Trigger kinds fold into a canonical order and are deduplicated, so two wakes
-  citing the same reasons produce identical records.
+- `work block --until` accepts an RFC 3339 instant and stores it verbatim.
+  An absolute time means a reader of the event never needs to know when the
+  block was recorded to know when review is due.
 - The driver lives in the separate `alderd` crate and reaches the log only by
   running the `alder` CLI. It links no Alder code, so a change to Alder's
   internals cannot silently change the driver's behaviour, and the coupling
@@ -53,15 +51,10 @@ documents intentionally leave open.
   mutations are removed through clearer code or narrowly documented
   exclusions rather than broad file or module skips.
 - The loop is mutation-tested as one surface, because its two halves are only
-  correct together: the fold's pass and loop arms, `open_pass`,
-  `last_ended_pass`, `LoopControl`'s pending rules and the `loop` section
-  `status` reports, in the `alder` crate; `decide`, `loop_state`, and `driver`
-  in `alderd`. Both halves run with no survivors and no exclusions. What that
-  buys is specific: a decision the driver reaches by a path no test walks —
-  a diagnostic nobody reads, a match guard that catches more than it names, a
-  hash that varies without being FNV — is exactly what a mutation exposes and
-  an ordinary suite does not.
-- The driver's fake world refuses to answer more than a bounded number of
-  `alder show` polls for one pass. A driver that stopped waiting between polls
-  would otherwise hang the suite instead of failing it, which reports as a
-  timeout rather than as the caught mutation it is.
+  correct together: the fold's loop-control arms, `next_review_at`, and the
+  `loop` section `status` reports, in the `alder` crate; `decide`,
+  `loop_state`, and `driver` in `alderd`. Both halves run with no survivors
+  and no exclusions. What that buys is specific: a decision the driver
+  reaches by a path no test walks — a diagnostic nobody reads, a match guard
+  that catches more than it names, a hash that varies without being FNV — is
+  exactly what a mutation exposes and an ordinary suite does not.

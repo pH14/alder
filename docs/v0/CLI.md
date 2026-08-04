@@ -14,17 +14,15 @@ answer per noun. `status`, `next`, `show`, `observations`, `refresh`, and
 `reconcile` take no noun.
 
 **Mutations name their noun.** Every command that appends starts with the thing
-it changes: `alder work start`, `alder attempt end`, `alder loop wake`.
+it changes: `alder work start`, `alder attempt end`, `alder loop pause`.
 
 **The noun is the ID type.** `alder work drop <id>` takes a work ID; `alder
-attempt end <id>` takes an attempt ID; `alder pass end <id>` takes a pass ID.
-Alder never infers the resource from an ID's shape, even though the shapes
-differ.
+attempt end <id>` takes an attempt ID. Alder never infers the resource from an
+ID's shape, even though the shapes differ.
 
 **Parents create; records answer for themselves.** Work creates attempts
-(`work start`) and the loop creates passes (`loop wake`), because the parent
-knows whether another one is allowed. A record that already exists closes
-itself: `attempt end`, `pass end`.
+(`work start`), because the parent knows whether another one is allowed. A
+record that already exists closes itself: `attempt end`.
 
 **`edit` never changes state; verbs transition.** `work edit` changes fields,
 dependencies, and checks. Blocking is `work block`, unblocking is
@@ -33,17 +31,17 @@ transcript never requires checking which flags an `edit` carried.
 
 The complete surface:
 
-| Global | Work | Attempt | Question | Observation | Loop | Pass |
-| --- | --- | --- | --- | --- | --- | --- |
-| `init` | `add` | `edit` | `answer` | `report` | `wake` | `end` |
-| `status` | `edit` | `end` | | `retire` | `pause` | |
-| `next` | `start` | | | | `resume` | |
-| `show` | `finish` | | | | `use` | |
-| `observations` | `drop` | | | | `rotate` | |
-| `refresh` | `reopen` | | | | `nudge` | |
-| `reconcile` | `block` | | | | | |
-| `debug` | `unblock` | | | | | |
-| | `ask` | | | | | |
+| Global | Work | Attempt | Question | Observation | Loop |
+| --- | --- | --- | --- | --- | --- |
+| `init` | `add` | `edit` | `answer` | `report` | `pause` |
+| `status` | `edit` | `end` | | `retire` | `resume` |
+| `next` | `start` | | | | `use` |
+| `show` | `finish` | | | | `rotate` |
+| `observations` | `drop` | | | | `nudge` |
+| `refresh` | `reopen` | | | | |
+| `reconcile` | `block` | | | | |
+| `debug` | `unblock` | | | | |
+| | `ask` | | | | |
 
 ## Output
 
@@ -79,8 +77,7 @@ Examples below illustrate intent; detailed JSON schemas remain to be frozen by
 paper replay.
 
 The examples assume the repository prefix `hm`. Work IDs use that prefix;
-attempt and question IDs extend their work ID, while pass IDs extend only the
-repository prefix because they belong to the singleton loop.
+attempt and question IDs extend their work ID.
 
 ## Initialization
 
@@ -125,9 +122,9 @@ Because the caller is the one that has to reconsider, losing says so in terms
 of the command rather than of the log. A head conflict reports that nothing
 was appended, names the event that was not written, and carries
 `"appended": false`; the JSON envelope carries `"ok": false`. Nothing on the
-loser's output has the shape of a receipt, in either channel. That matters
-most for `pass end`, where a loss read as success leaves the pass open and its
-report unwritten.
+loser's output has the shape of a receipt, in either channel: a loss read as
+success would leave a caller believing a decision was recorded when nothing
+was.
 
 The head comes from the configured remote ref, not a local branch or
 remote-tracking ref. Every ordinary read and mutation contacts that remote;
@@ -158,7 +155,6 @@ head 4211
 
 loop
   engine claude
-  open hm-pass-19  claude  tmux:alder-leader  started 2026-07-27T09:41:02Z
 
 counts
   attention  2
@@ -179,8 +175,8 @@ object at the top level, present on every call regardless of `--full` or
 
 Counts are full current state, just summarized — level-triggered like the
 rest of Alder, never a delta. A nonzero count is not itself the detail; a
-caller that needs to act on one still fetches the section before treating the
-pass as done.
+caller that needs to act on one still fetches the section before treating its
+sync as done.
 
 `--section <name>` expands exactly one of the five sections back to its full
 list, alongside the counts:
@@ -191,7 +187,6 @@ head 4211
 
 loop
   engine claude
-  open hm-pass-19  claude  tmux:alder-leader  started 2026-07-27T09:41:02Z
 
 counts
   attention  2
@@ -202,7 +197,7 @@ counts
 
 attention
   hm-2b7  attempt hm-2b7-attempt-1 absent; last progress 3h ago
-  hm-8c3  question hm-8c3-question-1 answered; still blocked
+  -  `hm-8c3` was deferred until 2026-07-27T15:00:00+00:00 and that time has passed — review it
 ```
 
 In `--json`, that adds a matching top-level key — here, `attention` — holding
@@ -230,15 +225,16 @@ regardless of `--full` or `--section`, carries every question with a derived
 `stranded` field.
 
 The `loop` section is not one of the five counted sections and is never
-gated: it reports the loop's desired state and its two interesting passes —
-whether it is paused and why, the desired engine, whether a rotation is
-pending, the open pass, and the last ended pass with its outcome, the first
-line of its report, any wake time it requested, and the head it ended at.
-Comparing that `ended_seq` with the document's own `head` tells a reader
-whether anything has been appended since the loop last ran, without the reader
-remembering anything. It is omitted from human output when the loop has nothing
-to say. In `--json` it is always present under the `loop` key. See
-[LOOP.md](LOOP.md).
+gated: it reports the loop's durable desired state — whether it is paused and
+why, the desired engine, the raw sequences of the latest rotation and nudge
+requests, and `review_at`, the earliest `work block --until` deadline over
+all blocked work. It carries no run records: the log never mentions its own
+readers, so whether a driver has acted on a request is that driver's
+machine-local knowledge, not something `status` can report. `attention`
+additionally surfaces every blocked item whose `--until` deadline has passed,
+as a `block_expired` finding with its suggested `work unblock`. The loop
+section is omitted from human output when the loop has nothing to say; in
+`--json` it is always present under the `loop` key. See [LOOP.md](LOOP.md).
 
 With a structured graph change:
 
@@ -284,8 +280,8 @@ head. `--with` also composes with `--json`.
 
 ### `alder show <id>`
 
-Show current state and compact history for a work item, attempt, question, or
-pass. `show` is global because a reader with an ID in hand should
+Show current state and compact history for a work item, attempt, or
+question. `show` is global because a reader with an ID in hand should
 not have to know which kind it is.
 
 ## Admission and editing
@@ -402,7 +398,7 @@ Dependency or check changes to work with an active attempt reject the entire
 document. The atomic boundary covers Alder state only; it cannot stop or
 rewrite external executions.
 
-### `alder work block <work> --why <reason>`
+### `alder work block <work> --why <reason> [--until <RFC3339>]`
 
 Block work on something that is not another Alder work item:
 
@@ -412,6 +408,21 @@ $ alder work block hm-9a1 --why "release credentials are not available"
 
 There is no separate block object or condition language. If another Alder
 work item is the prerequisite, use `work edit --add-requires` instead.
+
+`--until` adds a review deadline — "come back to this at …":
+
+```text
+$ alder work block hm-9a1 --why "vendor outage" --until 2026-07-30T09:00:00Z
+hm-9a1  blocked until 2026-07-30T09:00:00+00:00
+```
+
+The deadline is stored on the work item as `block_until`, and the latest
+block's statement wins whole: re-blocking without `--until` clears it. The
+earliest deadline over all blocked work is served as `review_at` in the
+`status` loop section, which is what wakes the driving loop at that instant.
+Nothing unblocks by itself — when the deadline passes, the item surfaces
+under `attention` as a `block_expired` finding, and unblocking stays an
+explicit, reasoned act.
 
 Blocking work with an active attempt prevents a later start but does not stop
 the existing external execution. The repository skill may leave that
@@ -628,51 +639,10 @@ alongside the question's full history.
 
 ## The loop
 
-The loop is a singleton per log and passes are its run records: work is to an
-attempt what the loop is to a pass. [LOOP.md](LOOP.md) defines the design.
-
-### `alder loop wake --engine <name> --handle <kind>:<value> [--trigger <kind>]...`
-
-The loop is the parent, so the loop opens the pass:
-
-```text
-$ alder loop wake --engine claude --handle tmux:alder-leader \
-    --trigger log --trigger due
-hm-pass-19
-```
-
-The engine name is an opaque string. Alder stores it and never validates it.
-Trigger kinds are `log`, `observations`, `due`, and `manual`; they are
-informational provenance and never limit what the pass must do. A wake with no
-stated trigger records `manual`, because it came from a person.
-
-The wake also records the head it was appended at, so a later reader knows what
-the pass saw.
-
-A wake is rejected with `pass_open` while a pass is open. This mirrors one
-active attempt per work item, and it is what makes two concurrent drivers
-harmless.
-
-### `alder pass end [<pass>] --outcome ok|crashed|timeout`
-
-The pass is the record that exists, so it closes itself. Omitting the ID ends
-the open pass; with no open pass the command returns `no_open_pass`.
-
-```text
-$ alder pass end --outcome ok \
-    --report "Added follow-up work; started hm-9a1; ARM lane still blocked." \
-    --wake 20m
-hm-pass-19  ended ok
-```
-
-- `--report` is the iteration report, free text. `status` shows its first line.
-- `--wake <duration>` requests the next wake at a point in the future. It
-  accepts `270s`, `20m`, `1h`, or `2d` and is stored as an absolute time, so a
-  reader never has to know when the pass ended.
-- `--rotate` asks the next wake to start on a fresh session.
-- `--why` explains a non-`ok` outcome.
-
-Ending an already-ended pass returns `pass_ended`.
+The loop is a singleton per log, and its commands are standing instructions
+to whoever drives it — never records of a run. The log never mentions its own
+readers: there is no `loop wake`, no pass noun, and nothing durable that says
+the loop ran. [LOOP.md](LOOP.md) defines the design.
 
 ### `alder loop pause [--why <reason>]` and `alder loop resume`
 
@@ -685,9 +655,8 @@ $ alder loop resume
 loop resumed
 ```
 
-Pause is advisory to the driver, not an Alder-enforced lock: `loop wake` is
-still accepted while paused, so a human can run one deliberate pass without
-first resuming.
+Pause is advisory to the driver, not an Alder-enforced lock: enforcement
+belongs to whatever schedules the loop.
 
 ### `alder loop use <engine>`
 
@@ -707,9 +676,11 @@ $ alder loop rotate --why "engine upgraded"
 rotation requested
 ```
 
-A one-shot request that the next wake start on a fresh session. Rotation is
-pending exactly when a rotation request is later in the log than the most
-recent wake, so the next wake consumes it. There is no flag to clear.
+A request that the driver's next wake start on a fresh session. The fold
+records only the sequence the request was asked at; each driver treats a
+request later in the log than the last head it acted on as outstanding, and
+acting consumes it. There is no flag to clear, and nothing in the log says
+whether any driver has served it — the log does not record its readers.
 
 ### `alder loop nudge [--why <reason>]`
 
@@ -718,13 +689,12 @@ $ alder loop nudge --why "answered the release question"
 nudge requested
 ```
 
-A one-shot request that the driver wake the loop now rather than at the next
-scheduled trigger. A nudge follows the identical pending rule as rotation —
-pending exactly when its request is later in the log than the most recent
-wake, consumed by the next wake, no flag to clear. The driver reports a
-pending nudge as the `manual` trigger and fires through its own deferrals; it
-does not override `loop pause`, and it cannot open a second pass while one is
-open.
+A request that the driver wake the leader now rather than at the next
+scheduled trigger. A nudge follows the identical rule as rotation — the fold
+records its sequence, and each driver treats one later than its noted head as
+outstanding. The driver reports it as the `manual` trigger and fires through
+its own deferrals; it does not override `loop pause`. A nudge changes *when*
+the leader is next woken, never *what* it does.
 
 ## Observations
 
@@ -872,12 +842,9 @@ $ alder status
 That loop is the center of Alder. New commands should be judged by whether
 they make it more reliable.
 
-When a driver runs that iteration on a schedule, it brackets the same commands
-with a pass:
-
-```text
-$ alder loop wake --engine claude --handle tmux:alder-leader --trigger log
-hm-pass-19
-# ... the iteration above ...
-$ alder pass end --outcome ok --report "Started hm-9a1." --wake 20m
-```
+When a driver wakes an agent to run that iteration, the commands are the
+whole record of it: decisions land on the items they concern, and the log
+says nothing about the run itself. A conclusion like "held off because the
+vendor is down until Thursday" is a statement on the item —
+`alder work block <id> --why "vendor outage" --until 2026-07-30T09:00:00Z` —
+never a report about the iteration.

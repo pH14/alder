@@ -419,96 +419,90 @@ If the shared Git head cannot be read, an ordinary read or mutation fails with
 `store_unavailable`; Alder does not present cached SQLite data as current. A
 failed observation command instead appends no replacement level.
 
-### A27. Crashed pass
+### A27. Crash anywhere in the wake path
 
-Wake the loop, then destroy the engine session without recording a pass end.
+Kill the driver at any point around a wake — before the injection, between
+the injection and its notes write, after both — and destroy the engine
+session at any of the same points.
 
-- the pass must remain `open` and visible in `alder status`;
-- a second `alder loop wake` must be rejected with `pass_open` and must name
-  the open pass, exactly as a second `work start` names the active attempt;
-- ending it as `crashed` must require no privileged tool: `alder pass end <id>
-  --outcome crashed --why <reason>` from any terminal must work;
-- after that end, the next wake must succeed and must take the next ordinal;
-- the ordinal must never be reused, including for a pass that produced no
-  report.
+- the log must be identical to a run with no crash, except for statements the
+  leader itself made: no wake record, no crash verdict, no driver diagnostic
+  ever appears — the log never mentions its own readers;
+- the restarted driver must deliver at most one redundant wake, and a leader
+  handed a redundant wake must find nothing new demanded and idle;
+- losing `.alder/alderd-notes.json` must cost exactly one redundant wake and
+  nothing else.
 
-Repeat with a pass that outlived its time budget. The honest outcome is
-`timeout`; nothing in Alder decides that threshold, and a driver that ends the
-pass must supply the outcome itself.
+This is the invariant the crash simulator and the model checker both pin:
+passes are idempotent, and a missed or duplicated wake is harmless because
+nothing durable records one.
 
-### A28. Driver restart mid-pass
+### A28. Driver restart
 
-Stop and restart the driver while a pass is open.
+Stop and restart the driver at an arbitrary moment.
 
-- the restarted driver must adopt the open pass rather than opening another;
 - it must not append a wake, a report, or any record of its own restart;
-- when the leader ends the pass normally, the outcome must be `ok` with the
-  leader's report, unaffected by the restart;
-- the driver's own state — which session it launched, which head it last saw —
-  may be lost, and losing it must only cause a session restart, never a second
-  pass.
+- the driver's own state — which session it launched, which head it last
+  acted on — may be lost, and losing it must only cause a session restart
+  and at most one redundant wake, never corrupted project state.
 
-### A29. Engine swap while a pass is open
+### A29. Engine swap
 
-Run `alder loop use <other-engine>` while a pass is open.
+Run `alder loop use <other-engine>` while a leader session is running.
 
-- the change must be accepted immediately and must fold as the desired engine;
-- the open pass must keep the engine it recorded at wake; a desired-state
-  change must not rewrite history;
-- the running pass must not be interrupted, ended, or invalidated;
-- the next wake must record the new engine, and the driver must replace the
-  session rather than injecting into one running the old engine.
+- the change must be accepted immediately and must fold as the desired
+  engine;
+- the running session must not be interrupted mid-act by Alder itself;
+  the driver replaces it at its next wake rather than injecting into one
+  running the old engine.
 
 ### A30. Rotate and pause interleaving
 
 Exercise these in order, checking the fold after each step:
 
-1. `loop rotate` — rotation pending;
-2. `loop pause` — still pending; pausing does not consume a rotation;
-3. `loop resume`, then `loop wake` — rotation consumed, no longer pending;
-4. `pass end --rotate` — pending again;
-5. `loop rotate` twice, then one wake — pending, then not; two requests do not
-   require two wakes;
-6. `loop pause` twice, then `loop resume` once — the loop is running. Pause is
-   last-writer-wins, not a counter.
+1. `loop rotate` — the request's sequence is recorded;
+2. `loop pause` — the recorded sequence is unchanged; pausing does not
+   consume a rotation;
+3. `loop resume`; a driver that then acts past the request's sequence
+   restarts the session first — a crash between the restart and its notes
+   write merely re-rotates;
+4. `loop rotate` twice — one recorded sequence, the latest; two requests do
+   not require two rotations;
+5. `loop pause` twice, then `loop resume` once — the loop is running. Pause
+   is last-writer-wins, not a counter.
 
-No step may write a flag that a later step must clear. Rotation must remain
-derivable from event order alone, so replaying the log from empty must produce
-the same answer at every point.
+No step may write a flag that a later step must clear. The fold must record
+request sequences only — whether a request has been served is each driver's
+machine-local knowledge, so replaying the log from empty must produce the
+same recorded sequences at every point and must say nothing about
+consumption.
 
-### A31. Wake head conflict
+### A31. Two drivers
 
-Have two drivers read the same head and attempt `loop wake` concurrently.
+Point two drivers, each with its own machine-local notes, at one log.
 
-- exactly one wake may advance the head;
-- the loser must receive a structured head conflict and change nothing;
-- after rereading, the loser must see the winner's pass and its own next wake
-  must be rejected with `pass_open`;
-- neither driver may retry automatically into a second pass. A wake is an
-  ordinary mutation and follows the ordinary reconsider-on-conflict rule.
+- neither appends anything, so the log cannot record a conflict between
+  them: at worst the leader receives duplicate wakes, which must be no-ops;
+- a rotation request must be honored by each driver at most once — one
+  redundant rotation total, never a rotation storm.
 
-The same must hold when one driver wakes while a human is running commands: the
-loop needs no lease, because one open pass is the whole exclusion mechanism.
+The loop needs no lease, because wakes have no durable effect to exclude.
 
-### A32. Pass end concurrent with an ordinary mutation
+### A32. Deferral
 
-While a pass is open, have the leader run `pass end` at the same moment another
-writer appends an ordinary mutation such as `work finish`.
+Block a work item with `work block --until <instant>`, once in the future
+and once in the past.
 
-- one append wins and the other receives a head conflict;
-- a losing `pass end` must report that nothing was appended and name
-  `pass.ended` as the event it did not write, in whichever output channel was
-  asked for. A caller that reads only the command's output must not be able to
-  take the loss for a receipt;
-- if `pass end` loses, rerunning it after rereading must succeed and must
-  produce exactly one `pass.ended`;
-- if `pass end` wins, the other writer's reread must show the ended pass and
-  must be able to proceed;
-- a `pass end` against an already-ended pass must be rejected with
-  `pass_ended`, so a retry after an unknown append outcome cannot record a
-  second ending or overwrite the first report.
-
-Resolving an unknown push outcome by event ID must not duplicate the pass end.
+- the deadline must be stored on the item and rendered by `status` and
+  `show`;
+- the earliest deadline over all blocked work must be served as `review_at`
+  in the status loop section, and a driver must wake the leader once when it
+  arrives;
+- an expired deadline must surface as a `block_expired` attention finding
+  with its suggested `work unblock`, and must not unblock the item by
+  itself: the fold reads no clock, and review is an explicit, reasoned act;
+- re-blocking without `--until` must clear the deadline, and unblock,
+  finish, drop, and reopen must clear it too.
 
 ### A33. Refresh change detection
 
@@ -534,8 +528,8 @@ Before freezing event bodies or SQLite tables, replay:
 4. one case where external reality contradicted recorded state;
 5. one case with a large number of agent-proposed follow-ups;
 6. one turn that atomically adds and rewires substantial work;
-7. one unattended day of the loop, including at least one crashed pass and one
-   engine rotation.
+7. one unattended day of the loop, including at least one leader-session
+   crash and one engine rotation.
 
 For every real action, record:
 
