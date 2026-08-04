@@ -32,9 +32,13 @@ looks today.
 Every decision is made from current state, freshly read. Flag anything that
 remembers what it saw last time and acts on the difference: a count read as a
 delta, a "changed since" cursor driving behaviour, a cached section reused
-instead of refetched, or a flag that must be cleared by whoever served it —
-pending-ness here is derived by comparing sequences, which is exactly why two
-writers cannot disagree about whether a request was already served.
+instead of refetched, or a flag that must be cleared by whoever served it.
+The one sanctioned cursor is the daemon's machine-local notes — the last head
+it acted on — and its licence is exactly that losing it is harmless: it
+gates only *when* the leader is woken, never what anyone decides, and a
+request in the log is served by comparing its sequence with that note rather
+than by a flag someone must clear. Flag any second cursor, and flag anything
+that makes this one load-bearing for a decision.
 
 The test: a fresh agent with no memory of any earlier session must reach the
 same decision from the same log.

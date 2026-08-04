@@ -1871,7 +1871,7 @@ fn a_mutation_that_loses_the_race_says_it_wrote_nothing() {
         })
     );
 
-    // A33: rereading and rerunning settles it, and records exactly one block.
+    // A2: rereading and rerunning settles it, and records exactly one block.
     let blocked = project.success(&["work", "block", &work, "--why", "paused for the worker"]);
     assert_eq!(blocked["work_id"], json!(work.clone()));
     let shown = project.success(&["show", &work]);
