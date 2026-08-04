@@ -48,7 +48,7 @@
 //! `reconcile` reasons about attempts and handles and knows nothing about
 //! directories. [`Simulator::stray_paths`] and [`Simulator::clean_strays`] are
 //! this harness standing in for a leader-side sweep production does not have
-//! yet — tracked as work `al-vpzdqw`. Fixing that is not this branch's job;
+//! yet — tracked as work `al-3pph8m` (formerly handoff al-handoff-vpzdqw). Fixing that is not this branch's job;
 //! naming it is, so the convergence property below stays honest rather than
 //! quietly excluding the subsets that expose it.
 //!
@@ -1040,7 +1040,7 @@ impl Simulator {
     /// `worktree add` or a torn removal — a directory or a file under no
     /// registered worktree at all — is residue git will not clean up and no
     /// production code path removes today, and a respawn onto that path fails
-    /// its pre-flight forever. That gap is work `al-vpzdqw`.
+    /// its pre-flight forever. That gap is work `al-3pph8m` (formerly handoff al-handoff-vpzdqw).
     /// Modelling the sweep here keeps the convergence property meaningful and
     /// keeps the missing production step visible instead of silently excluded.
     fn clean_strays(&self) -> Result<bool> {
