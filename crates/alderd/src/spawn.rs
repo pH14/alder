@@ -1698,9 +1698,9 @@ mod tests {
     ///
     /// The scan is lexical and block-scoped, which is its limit: it holds for
     /// the code these two blocks contain, not for something they call out to.
-    /// The blocks are also where `Effects::sleep` — the driving loop's own
-    /// pacing, which is legitimate and lives in the third block of that file —
-    /// is kept out of scope.
+    /// Being block-scoped is also what leaves `Effects::sleep` out of it — the
+    /// driving loop's own pacing, which is legitimate, and which is the third
+    /// block of that file rather than either of these two.
     #[test]
     fn the_hosts_spawn_facing_halves_can_name_no_sleep_and_no_clock() {
         let source = include_str!("effects.rs");
