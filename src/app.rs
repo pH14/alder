@@ -753,8 +753,34 @@ fn status(
     let observations: Vec<_> = state.observations.values().cloned().collect();
     let handles = observed_handles(&state, &BTreeSet::new());
     let runs: Vec<crate::projection::ObservationRun> = Vec::new();
-    // The log fold, never SQLite, is the current observation picture.
-    let findings: Vec<observer::ReconcileFinding> = Vec::new();
+    // The log fold, never SQLite, is the current observation picture, and
+    // attention derives from it alone: only findings the fold can decide.
+    // Not-yet-observed stays quiet — a reader learns absence from an explicit
+    // level, never from silence — so kinds needing a local observer run
+    // (unconfigured, unspawned, observation_unknown) never appear here.
+    let configured: BTreeSet<String> = state
+        .attempts
+        .values()
+        .filter(|attempt| {
+            matches!(
+                attempt.state,
+                crate::domain::AttemptState::Starting | crate::domain::AttemptState::Active
+            )
+        })
+        .filter_map(|attempt| attempt.handle.as_deref())
+        .filter_map(|handle| handle.split_once(':'))
+        .map(|(kind, _)| kind.to_owned())
+        .collect();
+    let findings: Vec<observer::ReconcileFinding> =
+        observer::reconcile(&state, &handles, &configured, &BTreeSet::new())
+            .into_iter()
+            .filter(|finding| {
+                matches!(
+                    finding.kind.as_str(),
+                    "missing" | "orphan" | "identity_mismatch" | "bindable"
+                )
+            })
+            .collect();
     let mut handoffs: Vec<_> = state
         .handoffs
         .values()
@@ -1399,17 +1425,39 @@ fn apply_refresh(context: &Context) -> Result<RefreshApplication> {
         // A successful script is a complete level snapshot for its observer.
         // Its omissions are an explicit retirement of keys the same observer
         // previously established, so the folded picture never serves ghosts.
-        let existing: Vec<_> = context
-            .log
-            .snapshot()?
-            .state
+        // One exception: a liveness key whose handle is bound to an active
+        // attempt becomes an explicit `absent` level instead of retiring. A
+        // dead worker is a statement the fold must carry — a reader with no
+        // observer of its own can only learn the death from a level, never
+        // from silence. The key retires once its attempt ends.
+        let state = context.log.snapshot()?.state;
+        let active_handles: BTreeSet<String> = state
+            .attempts
+            .values()
+            .filter(|attempt| {
+                matches!(
+                    attempt.state,
+                    crate::domain::AttemptState::Starting | crate::domain::AttemptState::Active
+                )
+            })
+            .filter_map(|attempt| attempt.handle.clone())
+            .collect();
+        let existing: Vec<_> = state
             .observations
             .keys()
             .filter(|key| key.observer == run.kind && !reported.contains(*key))
             .cloned()
             .collect();
         for key in existing {
-            if matches!(
+            let handle = format!("{}:{}", key.observer, key.subject);
+            if key.field == "liveness" && active_handles.contains(&handle) {
+                if matches!(
+                    context.log.report_observation(key, "absent".to_owned())?,
+                    ObservationAppend::Appended(_)
+                ) {
+                    appended += 1;
+                }
+            } else if matches!(
                 context.log.retire_observation(key)?,
                 ObservationAppend::Appended(_)
             ) {

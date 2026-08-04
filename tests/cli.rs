@@ -1844,6 +1844,74 @@ fn refresh_applies_complete_level_snapshots_through_the_quiet_append_path() {
     );
 }
 
+/// A dead worker is a statement, not a silence. While its attempt is active,
+/// an omitted liveness key becomes an explicit `absent` level rather than a
+/// retirement, so any reader of the fold — with no observer of its own — sees
+/// the death in `status` attention with the repair. The key retires only once
+/// the attempt has ended.
+#[test]
+fn a_dead_workers_liveness_stays_absent_until_its_attempt_ends() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&["work", "add", "--title", "Doomed work"]),
+        "work_id",
+    );
+    let attempt = string(&project.success(&["work", "start", &work]), "attempt_id");
+    project.success(&["attempt", "edit", &attempt, "--handle", "tmux:worker"]);
+
+    project.config(json!([{
+        "observer": "tmux",
+        "list": format!(
+            "printf '%s\\n' '[{{\"subject\":\"worker\",\"field\":\"liveness\",\"level\":\"present\"}},{{\"subject\":\"worker\",\"field\":\"attempt-id\",\"level\":\"{attempt}\"}}]'"
+        )
+    }]));
+    let first = project.success(&["refresh"]);
+    assert_eq!(first["result"]["appended"], 2, "{first}");
+    assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
+
+    // The session vanishes while the attempt is still active. The liveness
+    // key flips to absent (one append); the attempt-id key retires (another).
+    project.config(json!([{"observer": "tmux", "list": "printf '[]'"}]));
+    let died = project.success(&["refresh"]);
+    assert_eq!(died["result"]["appended"], 2);
+    assert_eq!(died["result"]["retired"], 1);
+    assert_eq!(
+        project.success(&["observations"])["observations"][0]["level"],
+        "absent"
+    );
+
+    // The fold alone carries the death: attention shows the missing worker.
+    let status = project.success(&["status", "--full"]);
+    assert_eq!(status["counts"]["attention"], 1);
+    assert_eq!(status["attention"][0]["kind"], "missing");
+    assert_eq!(status["attention"][0]["attempt_id"], attempt);
+
+    // Saying it again changes nothing.
+    let repeated = project.success(&["refresh"]);
+    assert_eq!(repeated["result"]["appended"], 0);
+
+    // Once the attempt ends, the next refresh retires the key and the
+    // picture is quiet again.
+    project.success(&[
+        "attempt",
+        "end",
+        &attempt,
+        "--outcome",
+        "lost",
+        "--why",
+        "observed absent",
+    ]);
+    let after_end = project.success(&["refresh"]);
+    assert_eq!(after_end["result"]["retired"], 1);
+    assert!(
+        project.success(&["observations"])["observations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
+}
+
 /// The live incident of al-pass-64, reproduced and pinned exactly as it
 /// behaves today: the leader ran `pass end` while a worker was appending its
 /// own milestones and lost the compare-and-append.

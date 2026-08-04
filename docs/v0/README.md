@@ -334,6 +334,12 @@ The observation snapshot is a fold of durable `observation.*` events. A
 successful `refresh` appends only levels that change that picture; an unchanged
 run leaves both the log and SQLite projection untouched.
 
+An observer name has one writer. A successful run is a complete snapshot for
+that observer, and its omissions retire keys — so two machines running the
+same observer name would retire each other's keys on every refresh. Multi-host
+observation needs distinct observer names; nothing else about the retirement
+rule is host-aware.
+
 An ordinary read or mutation must establish the current shared-log head. If it
 cannot, Alder returns `store_unavailable`; it never silently presents the
 local projection as current. An unavailable observation command instead
@@ -355,7 +361,6 @@ V0 does not include:
 - durable leader roles, generations, or leases;
 - generic storage backends;
 - committed SQLite projections or snapshots;
-- observations in the durable log;
 - engine validation, or any driver diagnostic as a durable event.
 
 An attempt may record an external handle and open-ended metadata. They provide
