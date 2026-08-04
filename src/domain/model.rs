@@ -88,6 +88,9 @@ pub enum EventPayload {
     #[serde(rename = "attempt.updated")]
     AttemptUpdated {
         attempt_id: String,
+        /// A new rung name for the attempt; omitted when unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tier: Option<String>,
         metadata: BTreeMap<String, Value>,
         note: Option<String>,
         checks: Vec<CheckUpdate>,
@@ -403,6 +406,11 @@ pub struct CheckDefinition {
 pub struct AttemptDefinition {
     pub id: String,
     pub work_id: String,
+    /// The runner's rung name for this execution, opaque to Alder. Serialized
+    /// as an explicit null so the key is always present; absent in events
+    /// written before tiers existed.
+    #[serde(default)]
+    pub tier: Option<String>,
     pub metadata: BTreeMap<String, Value>,
 }
 
@@ -436,6 +444,14 @@ pub struct Attempt {
     pub work_id: String,
     pub state: AttemptState,
     pub outcome: Option<AttemptOutcome>,
+    /// The runner's rung name, stored so a later reader can say "retry this
+    /// at a higher rung" from the log alone. Its meaning lives outside the
+    /// log: any non-empty name is legal and none is validated against a
+    /// table. Serialized as an explicit null so the key is always present.
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// An opaque foreign name for the execution, bound once. Alder stores it
+    /// and compares it for equality; it never parses it.
     pub handle: Option<String>,
     pub metadata: BTreeMap<String, Value>,
     pub note: Option<String>,
@@ -638,6 +654,7 @@ mod tests {
                     attempt: AttemptDefinition {
                         id: "attempt".to_owned(),
                         work_id: "work".to_owned(),
+                        tier: Some("terra".to_owned()),
                         metadata: BTreeMap::new(),
                     },
                 },
@@ -656,6 +673,7 @@ mod tests {
             (
                 EventPayload::AttemptUpdated {
                     attempt_id: "attempt".to_owned(),
+                    tier: None,
                     metadata: BTreeMap::new(),
                     note: None,
                     checks: Vec::new(),

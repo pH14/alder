@@ -214,11 +214,11 @@ fn work(context: &Context, command: &WorkCommand) -> Result<Output> {
         WorkCommand::Edit(args) => work_edit(context, args),
         WorkCommand::Start(args) => {
             let metadata = parse_metadata(&args.meta)?;
-            let (result, id) = context.log.start(&args.work, metadata)?;
+            let (result, id) = context.log.start(&args.work, args.tier.clone(), metadata)?;
             Ok(mutation_output(
                 "alder.work.start.v0",
                 &result,
-                json!({"work_id": args.work, "attempt_id": id}),
+                json!({"work_id": args.work, "attempt_id": id, "tier": args.tier}),
                 id,
             ))
         }
@@ -583,14 +583,15 @@ fn attempt_edit(context: &Context, args: &AttemptEditArgs) -> Result<Output> {
         args.note_file.as_deref(),
         "--note-file",
     )?;
-    if metadata.is_empty() && checks.is_empty() && note.is_none() {
+    if args.tier.is_none() && metadata.is_empty() && checks.is_empty() && note.is_none() {
         return Err(AlderError::validation(
-            "attempt edit requires a handle, metadata, note, or check result",
+            "attempt edit requires a handle, tier, metadata, note, or check result",
         ));
     }
-    let result = context
-        .log
-        .update_attempt(&args.attempt, metadata, note, checks)?;
+    let result =
+        context
+            .log
+            .update_attempt(&args.attempt, args.tier.clone(), metadata, note, checks)?;
     Ok(mutation_output(
         "alder.attempt.edit.v0",
         &result,
@@ -600,7 +601,8 @@ fn attempt_edit(context: &Context, args: &AttemptEditArgs) -> Result<Output> {
 }
 
 fn handle_edit_has_progress_fields(args: &AttemptEditArgs) -> bool {
-    !args.satisfied.is_empty()
+    args.tier.is_some()
+        || !args.satisfied.is_empty()
         || !args.failed.is_empty()
         || args.evidence.is_some()
         || args.evidence_file.is_some()
@@ -667,35 +669,15 @@ fn status(
 ) -> Result<Output> {
     let (state, hypothetical, source) = overlay_state(context, changes)?;
     let observations: Vec<_> = state.observations.values().cloned().collect();
-    let handles = observed_handles(&state, &BTreeSet::new());
-    let runs: Vec<crate::projection::ObservationRun> = Vec::new();
     // The log fold, never SQLite, is the current observation picture, and
     // attention derives from it alone: only findings the fold can decide.
     // Not-yet-observed stays quiet — a reader learns absence from an explicit
     // level, never from silence — so kinds needing a local observer run
-    // (unconfigured, unspawned, observation_unknown) never appear here.
-    let configured: BTreeSet<String> = state
-        .attempts
-        .values()
-        .filter(|attempt| {
-            matches!(
-                attempt.state,
-                crate::domain::AttemptState::Starting | crate::domain::AttemptState::Active
-            )
-        })
-        .filter_map(|attempt| attempt.handle.as_deref())
-        .filter_map(|handle| handle.split_once(':'))
-        .map(|(kind, _)| kind.to_owned())
-        .collect();
+    // (unspawned, observation_unknown) never appear here.
     let mut findings: Vec<observer::ReconcileFinding> =
-        observer::reconcile(&state, &handles, &configured, &BTreeSet::new())
+        observer::reconcile(&state, &BTreeSet::new(), &BTreeSet::new())
             .into_iter()
-            .filter(|finding| {
-                matches!(
-                    finding.kind.as_str(),
-                    "missing" | "orphan" | "identity_mismatch" | "bindable"
-                )
-            })
+            .filter(|finding| matches!(finding.kind.as_str(), "missing" | "orphan"))
             .collect();
     // A deferral whose deadline has passed demands review. Nothing unblocks by
     // itself — the fold is a pure function of the log and cannot read a clock —
@@ -749,14 +731,7 @@ fn status(
         source.as_deref(),
     );
     let object = json.as_object_mut().expect("status json is an object");
-    object.insert(
-        "observations".to_owned(),
-        json!({
-            "runs": runs,
-            "handles": handles,
-            "snapshot": observations,
-        }),
-    );
+    object.insert("observations".to_owned(), json!({"snapshot": observations}));
     object.insert("questions".to_owned(), json!(rendered_questions));
     object.insert("counts".to_owned(), counts);
     if full {
@@ -813,11 +788,7 @@ fn status(
     };
     let in_flight_lines = || {
         in_flight.iter().map(|attempt| {
-            let status = attempt
-                .handle
-                .as_deref()
-                .and_then(|handle| observation_level(&state, handle))
-                .unwrap_or("unknown");
+            let status = liveness_level(&state, &attempt.id).unwrap_or("unknown");
             format!(
                 "{}  {}  {}  {}",
                 attempt.work_id,
@@ -1292,76 +1263,30 @@ fn apply_refresh(context: &Context) -> Result<RefreshApplication> {
         if !run.success {
             continue;
         }
-        let mut reported = BTreeSet::new();
-        for object in &run.normalized {
-            let key = ObservationKey {
-                observer: run.kind.clone(),
-                subject: object.subject.clone(),
-                field: object.field.clone(),
-            };
-            reported.insert(key.clone());
-            if matches!(
-                context.log.report_observation(key, object.level.clone())?,
-                ObservationAppend::Appended(_)
-            ) {
-                appended += 1;
-            }
-            if let Some(attempt_id) = object.attempt_id.as_deref() {
-                let key = ObservationKey {
-                    observer: run.kind.clone(),
-                    subject: object.subject.clone(),
-                    field: "attempt-id".to_owned(),
-                };
-                reported.insert(key.clone());
-                if matches!(
-                    context.log.report_observation(key, attempt_id.to_owned())?,
-                    ObservationAppend::Appended(_)
-                ) {
-                    appended += 1;
-                }
-            }
-        }
-        // A successful script is a complete level snapshot for its observer.
-        // Its omissions are an explicit retirement of keys the same observer
-        // previously established, so the folded picture never serves ghosts.
-        // One exception: a liveness key whose handle is bound to an active
-        // attempt becomes an explicit `absent` level instead of retiring. A
-        // dead worker is a statement the fold must carry — a reader with no
-        // observer of its own can only learn the death from a level, never
-        // from silence. The key retires once its attempt ends.
+        // The observer subsystem finds open attempts and their handles by
+        // reading the fold, checks each handle against what the script
+        // listed, and reports per attempt; the planning itself is a pure
+        // function shared with the harnesses.
         let state = context.log.snapshot()?.state;
-        let active_handles: BTreeSet<String> = state
-            .attempts
-            .values()
-            .filter(|attempt| {
-                matches!(
-                    attempt.state,
-                    crate::domain::AttemptState::Starting | crate::domain::AttemptState::Active
-                )
-            })
-            .filter_map(|attempt| attempt.handle.clone())
-            .collect();
-        let existing: Vec<_> = state
-            .observations
-            .keys()
-            .filter(|key| key.observer == run.kind && !reported.contains(*key))
-            .cloned()
-            .collect();
-        for key in existing {
-            let handle = format!("{}:{}", key.observer, key.subject);
-            if key.field == "liveness" && active_handles.contains(&handle) {
-                if matches!(
-                    context.log.report_observation(key, "absent".to_owned())?,
-                    ObservationAppend::Appended(_)
-                ) {
-                    appended += 1;
+        for change in observer::plan_observer_run(&state, &run.kind, &run.normalized) {
+            match change.level {
+                Some(level) => {
+                    if matches!(
+                        context.log.report_observation(change.key, level)?,
+                        ObservationAppend::Appended(_)
+                    ) {
+                        appended += 1;
+                    }
                 }
-            } else if matches!(
-                context.log.retire_observation(key)?,
-                ObservationAppend::Appended(_)
-            ) {
-                appended += 1;
-                retired += 1;
+                None => {
+                    if matches!(
+                        context.log.retire_observation(change.key)?,
+                        ObservationAppend::Appended(_)
+                    ) {
+                        appended += 1;
+                        retired += 1;
+                    }
+                }
             }
         }
     }
@@ -1397,8 +1322,7 @@ fn reconcile(context: &Context, refresh_first: bool) -> Result<Output> {
                 .collect()
         })
         .unwrap_or_default();
-    let observations = observed_handles(&snapshot.state, &known);
-    let findings = observer::reconcile(&snapshot.state, &observations, &configured, &known);
+    let findings = observer::reconcile(&snapshot.state, &configured, &known);
     let findings_human = if findings.is_empty() {
         "no reconciliation findings".to_owned()
     } else {
@@ -1440,74 +1364,18 @@ fn reconcile(context: &Context, refresh_first: bool) -> Result<Output> {
     ))
 }
 
-fn observed_handles(
-    state: &ProjectState,
-    known: &BTreeSet<String>,
-) -> Vec<crate::projection::ObservedHandle> {
-    let mut handles: BTreeMap<_, _> = state
+/// The newest current liveness level recorded about one attempt, whichever
+/// observer reported it. The key's subject is the attempt ID, so this is a
+/// direct fold lookup with no handle parsing.
+fn liveness_level<'a>(state: &'a ProjectState, attempt_id: &str) -> Option<&'a str> {
+    state
         .observations
         .values()
-        .filter(|observation| observation.key.field == "liveness")
-        .map(|observation| {
-            let status = match observation.level.as_str() {
-                "present" => crate::projection::ObservationStatus::Present,
-                "absent" => crate::projection::ObservationStatus::Absent,
-                _ => crate::projection::ObservationStatus::Unknown,
-            };
-            let handle = format!("{}:{}", observation.key.observer, observation.key.subject);
-            (
-                handle.clone(),
-                crate::projection::ObservedHandle {
-                    handle,
-                    attempt_id: None,
-                    status,
-                    metadata: json!({}),
-                    observed_at: observation.reported_seq.to_string(),
-                    detail: None,
-                },
-            )
+        .filter(|observation| {
+            observation.key.field == "liveness" && observation.key.subject == attempt_id
         })
-        .collect();
-    for observation in state
-        .observations
-        .values()
-        .filter(|observation| observation.key.field == "attempt-id")
-    {
-        let handle = format!("{}:{}", observation.key.observer, observation.key.subject);
-        if let Some(handle) = handles.get_mut(&handle) {
-            handle.attempt_id = Some(observation.level.clone());
-        }
-    }
-    // A successful complete snapshot establishes that an active handle of
-    // that kind is absent when its liveness key is not current. The local run
-    // record is diagnostic evidence for completeness; the level itself still
-    // comes only from the durable fold.
-    for attempt in state.attempts.values().filter(|attempt| {
-        matches!(
-            attempt.state,
-            crate::domain::AttemptState::Starting | crate::domain::AttemptState::Active
-        )
-    }) {
-        let Some(handle) = attempt.handle.as_ref() else {
-            continue;
-        };
-        let Some((kind, _)) = handle.split_once(':') else {
-            continue;
-        };
-        if known.contains(kind) {
-            handles
-                .entry(handle.clone())
-                .or_insert_with(|| crate::projection::ObservedHandle {
-                    handle: handle.clone(),
-                    attempt_id: None,
-                    status: crate::projection::ObservationStatus::Absent,
-                    metadata: json!({}),
-                    observed_at: String::new(),
-                    detail: None,
-                });
-        }
-    }
-    handles.into_values().collect()
+        .max_by_key(|observation| observation.reported_seq)
+        .map(|observation| observation.level.as_str())
 }
 
 fn debug(context: &Context, command: &DebugCommand) -> Result<Output> {
@@ -1679,18 +1547,11 @@ fn debug_observations(
         .cloned()
         .collect();
     let configured = configured_kinds(context);
-    let referenced: BTreeSet<_> = context
-        .snapshot
-        .state
-        .attempts
-        .values()
-        .filter_map(|attempt| attempt.handle.as_deref())
-        .filter_map(|handle| handle.split_once(':').map(|(kind, _)| kind.to_owned()))
-        .chain(
-            observations
-                .iter()
-                .map(|observation| observation.key.observer.clone()),
-        )
+    // A handle is opaque, so nothing is inferred from it; the durably
+    // referenced kinds are exactly the observer names in the folded picture.
+    let referenced: BTreeSet<_> = observations
+        .iter()
+        .map(|observation| observation.key.observer.clone())
         .collect();
     let kinds: BTreeSet<_> = configured
         .iter()
@@ -1744,18 +1605,6 @@ fn configured_kinds(context: &Context) -> BTreeSet<String> {
         .iter()
         .map(|observer| observer.observer.clone())
         .collect()
-}
-
-fn observation_level<'a>(state: &'a ProjectState, handle: &str) -> Option<&'a str> {
-    let (observer, subject) = handle.split_once(':')?;
-    state
-        .observations
-        .get(&ObservationKey {
-            observer: observer.to_owned(),
-            subject: subject.to_owned(),
-            field: "liveness".to_owned(),
-        })
-        .map(|observation| observation.level.as_str())
 }
 
 /// The common document envelope emitted by every successful mutation.
@@ -2126,6 +1975,7 @@ mod tests {
         let mut args = AttemptEditArgs {
             attempt: "hm-1-attempt-1".to_owned(),
             handle: Some("tmux:worker".to_owned()),
+            tier: None,
             meta: Vec::new(),
             satisfied: Vec::new(),
             failed: Vec::new(),
@@ -2166,6 +2016,7 @@ mod tests {
             state.attempts.insert(
                 id.to_owned(),
                 Attempt {
+                    tier: None,
                     id: id.to_owned(),
                     work_id: "hm-1".to_owned(),
                     state: state_value,

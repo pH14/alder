@@ -248,6 +248,7 @@ impl<S: Log> ProjectLog<S> {
     pub fn start(
         &self,
         work_id: &str,
+        tier: Option<String>,
         metadata: BTreeMap<String, Value>,
     ) -> Result<(AppendResult, String)> {
         let snapshot = self.snapshot()?;
@@ -296,6 +297,7 @@ impl<S: Log> ProjectLog<S> {
                 attempt: AttemptDefinition {
                     id: id.clone(),
                     work_id: work_id.to_owned(),
+                    tier,
                     metadata,
                 },
             },
@@ -323,6 +325,7 @@ impl<S: Log> ProjectLog<S> {
     pub fn update_attempt(
         &self,
         attempt_id: &str,
+        tier: Option<String>,
         metadata: BTreeMap<String, Value>,
         note: Option<String>,
         checks: Vec<CheckUpdate>,
@@ -332,6 +335,7 @@ impl<S: Log> ProjectLog<S> {
             &snapshot,
             EventPayload::AttemptUpdated {
                 attempt_id: attempt_id.to_owned(),
+                tier,
                 metadata,
                 note,
                 checks,
@@ -660,17 +664,23 @@ mod tests {
         let (_, work) = log
             .add_work("work".to_owned(), None, 0, vec![], vec![])
             .unwrap();
-        let (_, first) = log.start(&work, BTreeMap::new()).unwrap();
+        let (_, first) = log.start(&work, None, BTreeMap::new()).unwrap();
         log.end_attempt(
             &first,
             AttemptOutcome::NotStarted,
             "launch failed".to_owned(),
         )
         .unwrap();
-        let (_, second) = log.start(&work, BTreeMap::new()).unwrap();
+        let (_, second) = log.start(&work, None, BTreeMap::new()).unwrap();
         assert!(second.ends_with("-attempt-2"));
         let error = log
-            .update_attempt(&first, BTreeMap::new(), Some("late".to_owned()), vec![])
+            .update_attempt(
+                &first,
+                None,
+                BTreeMap::new(),
+                Some("late".to_owned()),
+                vec![],
+            )
             .unwrap_err();
         assert_eq!(error.code, "attempt_ended");
     }
@@ -712,10 +722,10 @@ mod tests {
                 ],
             )
             .unwrap();
-        let (_, first) = log.start(&work, BTreeMap::new()).unwrap();
+        let (_, first) = log.start(&work, None, BTreeMap::new()).unwrap();
         log.end_attempt(&first, AttemptOutcome::Failed, "failed".to_owned())
             .unwrap();
-        let (_, second) = log.start(&work, BTreeMap::new()).unwrap();
+        let (_, second) = log.start(&work, None, BTreeMap::new()).unwrap();
         let snapshot = log.snapshot().unwrap();
         assert_eq!(snapshot.state.attempts[&second].checks.len(), 2);
         assert!(
@@ -732,13 +742,13 @@ mod tests {
         let (_, prerequisite) = log
             .add_work("A".to_owned(), None, 0, vec![], vec![])
             .unwrap();
-        let (_, first_attempt) = log.start(&prerequisite, BTreeMap::new()).unwrap();
+        let (_, first_attempt) = log.start(&prerequisite, None, BTreeMap::new()).unwrap();
         log.finish(&prerequisite, Some(first_attempt), false, None)
             .unwrap();
         let (_, downstream) = log
             .add_work("B".to_owned(), None, 0, vec![prerequisite.clone()], vec![])
             .unwrap();
-        let (_, downstream_attempt) = log.start(&downstream, BTreeMap::new()).unwrap();
+        let (_, downstream_attempt) = log.start(&downstream, None, BTreeMap::new()).unwrap();
         let error = log
             .reopen(&prerequisite, "regressed".to_owned())
             .unwrap_err();
@@ -755,7 +765,7 @@ mod tests {
         let (_, work) = log
             .add_work("work".to_owned(), None, 0, vec![], vec![])
             .unwrap();
-        let (_, attempt) = log.start(&work, BTreeMap::new()).unwrap();
+        let (_, attempt) = log.start(&work, None, BTreeMap::new()).unwrap();
         log.drop_work(
             &work,
             Some(attempt.clone()),
@@ -834,7 +844,7 @@ mod tests {
             )
             .unwrap();
 
-        let error = log.start(&dependent, BTreeMap::new()).unwrap_err();
+        let error = log.start(&dependent, None, BTreeMap::new()).unwrap_err();
         assert_eq!(error.code, "work_not_ready");
         assert_eq!(
             error.context["unmet_dependencies"],
@@ -1005,8 +1015,8 @@ mod tests {
         let idle = add("idle");
         let asked = add("asked");
         let finished = add("finished");
-        let (_, attempt) = log.start(&work, BTreeMap::new()).unwrap();
-        let (_, done_attempt) = log.start(&finished, BTreeMap::new()).unwrap();
+        let (_, attempt) = log.start(&work, None, BTreeMap::new()).unwrap();
+        let (_, done_attempt) = log.start(&finished, None, BTreeMap::new()).unwrap();
         log.finish(&finished, Some(done_attempt), false, None)
             .unwrap();
         let (_, question) = log.ask(&asked, "which path?".to_owned()).unwrap();
@@ -1077,7 +1087,10 @@ mod tests {
             ),
             (
                 "attempt.started",
-                Box::new(|| log.start(&idle, BTreeMap::new()).map(|(result, _)| result)),
+                Box::new(|| {
+                    log.start(&idle, None, BTreeMap::new())
+                        .map(|(result, _)| result)
+                }),
             ),
             (
                 "attempt.bound",
@@ -1086,7 +1099,13 @@ mod tests {
             (
                 "attempt.updated",
                 Box::new(|| {
-                    log.update_attempt(&attempt, BTreeMap::new(), Some("raced".to_owned()), vec![])
+                    log.update_attempt(
+                        &attempt,
+                        None,
+                        BTreeMap::new(),
+                        Some("raced".to_owned()),
+                        vec![],
+                    )
                 }),
             ),
             (
