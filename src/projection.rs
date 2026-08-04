@@ -684,6 +684,75 @@ mod tests {
         );
     }
 
+    /// Observations are part of no live-state table on purpose: status is
+    /// never served from SQLite. Every command refolds the decoded log —
+    /// `ProjectLog::snapshot` — and the projection is a derived query
+    /// surface, so there is no cached `ProjectState` round-trip that could
+    /// drop `observations` and cost a cache-served status its dead-worker
+    /// attention. What the projection does serialize is the event stream
+    /// itself; this pins the round-trip that could actually lose the
+    /// picture: the projected events refold to the same observations,
+    /// including a level held for an ended attempt (the orphan watch).
+    #[test]
+    fn projected_events_refold_to_the_same_observation_picture() {
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "tester");
+        let (_, work_id) = log
+            .add_work("Build".to_owned(), None, 0, Vec::new(), Vec::new())
+            .unwrap();
+        let (_, attempt_id) = log.start(&work_id, None, BTreeMap::new()).unwrap();
+        log.bind_attempt(&attempt_id, "tmux:one".to_owned(), BTreeMap::new())
+            .unwrap();
+        log.report_observation(
+            crate::domain::ObservationKey {
+                observer: "tmux".to_owned(),
+                subject: attempt_id.clone(),
+                field: "liveness".to_owned(),
+            },
+            "present".to_owned(),
+        )
+        .unwrap();
+        log.end_attempt(
+            &attempt_id,
+            AttemptOutcome::Cancelled,
+            "fixture over".to_owned(),
+        )
+        .unwrap();
+        let snapshot = log.snapshot().unwrap();
+        assert_eq!(snapshot.state.observations.len(), 1);
+
+        let temporary = TempDir::new().unwrap();
+        let projection = Projection::new(temporary.path().join("state.db"));
+        projection
+            .sync(&snapshot.head, &snapshot.events, &snapshot.state)
+            .unwrap();
+        assert_eq!(
+            projection.verify(&snapshot.head, &snapshot.state).unwrap()["valid"],
+            true
+        );
+
+        let rows = projection
+            .raw_query("SELECT seq, id, at, actor, body_json FROM events ORDER BY seq")
+            .unwrap();
+        let reloaded: Vec<crate::domain::Event> = rows["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| crate::domain::Event {
+                id: row["id"].as_str().unwrap().to_owned(),
+                seq: row["seq"].as_u64().unwrap(),
+                at: row["at"].as_str().unwrap().parse().unwrap(),
+                actor: row["actor"].as_str().unwrap().to_owned(),
+                payload: serde_json::from_str(row["body_json"].as_str().unwrap()).unwrap(),
+                schema: "alder.event.v0".to_owned(),
+            })
+            .collect();
+        let refolded = ProjectState::fold(&reloaded).unwrap();
+        assert_eq!(refolded.observations, snapshot.state.observations);
+        let key = refolded.observations.keys().next().unwrap();
+        assert_eq!(key.subject, attempt_id);
+        assert_eq!(key.field, "liveness");
+    }
+
     #[test]
     fn verification_detects_each_projection_mismatch() {
         let log = ProjectLog::new(MemoryStore::new(), "hm", "tester");

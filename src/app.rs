@@ -1256,19 +1256,35 @@ fn refresh_result_value(result: &RefreshApplication) -> Value {
 }
 
 fn apply_refresh(context: &Context) -> Result<RefreshApplication> {
-    let runs = observer::observe(&context.project.config.observers)?;
+    // The fold supplies each probe observer's targets: live attempts'
+    // handles, plus ended attempts' handles whose liveness key is still
+    // current — the orphan watch.
+    let state = context.log.snapshot()?.state;
+    let runs = observer::observe(&context.project.config.observers, &state)?;
     let mut appended = 0;
     let mut retired = 0;
     for run in &runs {
         if !run.success {
             continue;
         }
-        // The observer subsystem finds open attempts and their handles by
-        // reading the fold, checks each handle against what the script
-        // listed, and reports per attempt; the planning itself is a pure
-        // function shared with the harnesses.
+        let probe = context
+            .project
+            .config
+            .observers
+            .iter()
+            .any(|observer| observer.observer == run.kind && observer.probe.is_some());
+        // The observer subsystem reads open attempts and their handles from
+        // the fold and reports per attempt; the planning itself is a pure
+        // function shared with the harnesses. Probe answers and list
+        // snapshots carry different completeness semantics, so each plans
+        // through its own derivation.
         let state = context.log.snapshot()?.state;
-        for change in observer::plan_observer_run(&state, &run.kind, &run.normalized) {
+        let changes = if probe {
+            observer::plan_probe_run(&state, &run.kind, &run.normalized)
+        } else {
+            observer::plan_observer_run(&state, &run.kind, &run.normalized)
+        };
+        for change in changes {
             match change.level {
                 Some(level) => {
                     if matches!(
@@ -1523,13 +1539,14 @@ fn debug_observations(
                     json!({"kind": kind}),
                 )
             })?;
-        let result = observer::diagnose(observer_config)?;
+        let result = observer::diagnose(observer_config, &context.snapshot.state)?;
         return Ok(Output::new(
             json!({
                 "schema": "alder.debug.observations.v0",
                 "kind": kind,
                 "configured": true,
-                "command": observer_config.list,
+                "mode": observer_config.mode(),
+                "command": observer_config.command(),
                 "shell": "/bin/bash -o pipefail -c",
                 "timeout_seconds": 20,
                 "max_executions": 4,
@@ -1576,7 +1593,8 @@ fn debug_observations(
             json!({
                 "kind": kind,
                 "configured": observer.is_some(),
-                "command": observer.map(|observer| observer.list.clone()),
+                "mode": observer.map(|observer| observer.mode()),
+                "command": observer.map(|observer| observer.command().to_owned()),
                 "shell": observer.map(|_| "/bin/bash -o pipefail -c"),
                 "timeout_seconds": observer.map(|_| 20),
                 "max_executions": observer.map(|_| 4),

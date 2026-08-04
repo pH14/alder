@@ -1,28 +1,32 @@
 #!/usr/bin/env bash
-# Normalized tmux observation for alder: one current liveness level per
-# worker session.
+# Per-handle liveness probe for alder's tmux runner.
 #
-# Lists only `alder-work-*` sessions — the leader's own session is loop
-# machinery, not an attempt handle, and would read as noise. Each subject is
-# the opaque handle exactly as the runner bound it (`tmux:<session>`); alder
-# matches it against attempt records by equality and never parses it. The
-# script reports nothing else: no attempt stamp, no session metadata — the
-# runner stores nothing of alder's, and alder reads nothing of the runner's
-# beyond the handles it was given.
+# alder invokes the configured probe once per relevant handle with the handle
+# as `$1` and reads back exactly one word:
 #
-# Session names are runner-generated slugs, so no JSON escaping is needed.
+#   present  the execution this handle names is running
+#   absent   the handle is one of this runner's names and nothing runs under it
+#   unknown  not a name this runner recognizes; alder writes nothing
+#
+# The handle stays opaque to alder — it is matched by equality and never
+# parsed there. Recognition of `tmux:<session>` names lives here, on the
+# runner's side, which is what keeps alder free of any handle grammar.
+#
+# A missing tmux server or tmux binary means no session can be running, so a
+# recognized `tmux:*` name answers `absent` rather than failing the probe.
 set -euo pipefail
 
-first=1
-printf '['
-# No tmux server means no workers, which is an empty inventory, not an error.
-while IFS= read -r session; do
-  case "$session" in
-  alder-work-*) ;;
-  *) continue ;;
-  esac
-  [ "$first" -eq 1 ] || printf ','
-  first=0
-  printf '{"subject":"tmux:%s","field":"liveness","level":"present"}' "$session"
-done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
-printf ']\n'
+case "${1-}" in
+tmux:*)
+  session="${1#tmux:}"
+  # `=` pins the exact session name; without it tmux prefix-matches.
+  if tmux has-session -t "=$session" 2>/dev/null; then
+    echo present
+  else
+    echo absent
+  fi
+  ;;
+*)
+  echo unknown
+  ;;
+esac

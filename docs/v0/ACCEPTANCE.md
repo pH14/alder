@@ -57,11 +57,14 @@ allowing the attempt to end as `not_started`.
 Record `attempt.started`, create an external worker, then crash before
 recording its handle binding.
 
-Nothing of Alder's is stamped into the worker, so the log cannot attribute
-the execution: reconciliation reports the attempt as `unspawned` while its
-work is live. The runner — which named the execution — either binds the
-handle it created with `attempt edit` or replaces the execution; the
-unattributed leftover is the runner's residue to sweep.
+At the schema level no Alder mechanism requires a mark inside the worker, so
+the log cannot attribute the execution: reconciliation reports the attempt as
+`unspawned` while its work is live. The runner — which named the execution —
+either binds the handle it created with `attempt edit` or replaces the
+execution; the unattributed leftover is the runner's residue to sweep.
+(Transitionally, the in-tree alderd runner still stamps `ALDER_ATTEMPT` into
+its own sessions to adopt across this crash window; that private convention
+leaves with the runner extraction and is no part of the criterion.)
 
 ### A5. Unknown append outcome
 
@@ -207,11 +210,16 @@ Exercise each disagreement:
 - active attempt whose handle is observed absent;
 - ended attempt, still-running external handle.
 
-Each must be visible and repairable through normal commands. None may require
-editing event history or the SQLite database. There is no attempt-identity
-stamp to mismatch: the handle on the attempt record is the only connection,
-and an external execution nothing claims is the runner's residue rather than
-a log finding.
+Each must surface through the DEFAULT refresh-first `alder reconcile`, with
+no manual observation plumbing: the never-observed dead worker becomes
+`missing` on the first sweep, and the ended attempt's still-running
+execution stays observed — its liveness key survives the attempt's end while
+the probe answers `present` — so `orphan` is reachable. Each must be visible
+and repairable through normal commands. None may require editing event
+history or the SQLite database. There is no attempt-identity stamp to
+mismatch: the handle on the attempt record is the only connection, and an
+external execution nothing claims is the runner's residue rather than a log
+finding.
 
 ### A17. Hypothetical introspection
 

@@ -376,13 +376,17 @@ The tier is the runner's rung name for the execution — `luna`, `terra`,
 non-empty; no table of valid tiers exists anywhere in Alder. It is stored so
 a later reader can say "retry this at a higher rung" from the log alone.
 
-The direction is deliberately asymmetric: **the log stores the runner's
-names; the runner stores nothing of Alder's.** Work must not know how it is
-executed —
+The direction is deliberately asymmetric, and it is a rule about the schema:
+**the log stores the runner's names; nothing in Alder's schema or protocol
+requires the runner to store anything of Alder's.** Work must not know how
+it is executed —
 the same item could be run by an agent in tmux, an agent in a web sandbox,
 or a deterministic script — so no engine name, session kind, or execution
-vocabulary appears in the work schema, and nothing of Alder's is planted in
-the execution environment.
+vocabulary appears in the work schema, and no Alder mechanism depends on a
+mark planted in the execution environment. (Transitionally, the in-tree
+alderd runner still stamps `ALDER_ATTEMPT` into the sessions it creates as
+its own crash-adoption bookkeeping; that is the runner's private convention,
+due to leave with the runner extraction, not part of this model.)
 
 V0 stores at most one primary handle on an attempt. Metadata is open-ended
 JSON. Alder stores and displays it but does not use its keys for readiness,
@@ -390,42 +394,51 @@ completion, conflict detection, or any other core transition. Repository
 skills define useful conventions — review provenance, consult records —
 and own their meaning.
 
-Handle validity does not depend on any observer currently listing it. A
-handle nothing observes remains replayable and visible; its attempt simply
+Handle validity does not depend on any observer currently answering for it.
+A handle nothing observes remains replayable and visible; its attempt simply
 has no fresh liveness level.
 
 V0 has no observer plugin system or provider-specific Rust adapter. The
-manifest's `observers` array supplies at most one `list` command for each
-observer name. The name is the first component of every observation key.
+manifest's `observers` array supplies exactly one command for each observer
+name: a `list` command for complete generic snapshots, or a `probe` command
+for per-handle execution liveness. The name is the first component of every
+observation key.
 
-The command defines its own scope through its arguments, environment, and
-native tool configuration. If several scopes contribute to one observer, the
-command must aggregate them into one complete result. Credentials remain in
-the native environment rather than Alder metadata.
+Each command defines its own scope through its arguments, environment, and
+native tool configuration. If several scopes contribute to one `list`
+observer, the command must aggregate them into one complete result.
+Credentials remain in the native environment rather than Alder metadata.
 
-On success, standard output contains exactly one JSON array. Each entry has:
+On success, a `list` command's standard output contains exactly one JSON
+array. Each entry has:
 
 | Field | Meaning |
 | --- | --- |
 | `subject` | The observed thing, opaque to Alder |
-| `field` | A stable lower-case field name, such as `liveness` or `ci` |
-| `level` | The current value for that key, such as `present` or `passing` |
+| `field` | A stable lower-case field name, such as `ci` |
+| `level` | The current value for that key, such as `passing` |
 
-Rows whose field is `liveness` are statements about execution: their subject
-is a handle exactly as a runner bound it. Refresh reads open attempts and
-their handles from the fold, matches each listed handle by equality, and
-records the level under the attempt's own ID, so the durable key is
-`(observer, attempt-id, liveness)`. A listed handle no live attempt claims
-appends nothing — an unclaimed session is the runner's residue, not a
-statement about work. Rows with any other field are generic observations
-keyed by their subject verbatim.
+Rows are generic observations keyed by their subject verbatim. `liveness` is
+not a `list` field — execution liveness flows only through probes — so a
+list row claiming it appends nothing.
+
+A `probe` command is invoked once per relevant handle with the handle as its
+single argument (`$1`) and prints exactly one word: `present`, `absent`, or
+`unknown`. `unknown` means "not a name I recognize; I cannot say" and writes
+nothing. The handle is passed verbatim and matched against attempt records
+by equality, so Alder stays fully opaque to handle contents — the
+runner-side script owns recognition of its own names. Answers are recorded
+under the attempt's own ID; the durable key is
+`(observer, attempt-id, liveness)`.
 
 Duplicate keys, surrounding prose, or any other schema violation invalidates
 the complete result; the retired handle-inventory shape (`value`,
-`attempt_id`, `metadata`) is no longer valid observer output.
+`attempt_id`, `metadata`) is no longer valid observer output, and a probe
+answer that is not exactly one of the three words is invalid.
 
-Observation configuration is executable trusted configuration. Alder does not
-interpolate event data or handle values into `list`. Launching remains the
+Observation configuration is executable trusted configuration. Alder does
+not interpolate event data or handle values into the command string; a
+probed handle rides in as a real process argument. Launching remains the
 runner's responsibility.
 
 ## Acceptance checks
@@ -594,22 +607,34 @@ snapshot has one entry per `(observer, subject, field)` key:
 removes it when the key no longer exists. A same-level report appends nothing:
 this is a belief log, not a sensor trace.
 
-For each configured kind, Alder runs `list` through a fixed shell wrapper with
-pipefail enabled. One execution may run for 20 seconds. A failed execution,
-timeout, malformed JSON, or invalid result set is retried up to three times
-after the initial execution, for at most four executions. The first valid
-complete snapshot wins.
+For each configured kind, Alder runs its command through a fixed shell
+wrapper with pipefail enabled. One execution may run for 20 seconds. A
+failed execution, timeout, malformed output, or invalid result is retried up
+to three times after the initial execution, for at most four executions per
+result. The first valid result wins: for `list`, the first valid complete
+snapshot; for `probe`, the first valid one-word answer per handle, and a
+sweep whose handles cannot all be answered fails whole.
 
 Failed standard output is discarded. After all executions fail, Alder retains
 bounded final-execution diagnostics but appends no replacement belief. A
 timeout terminates the complete shell pipeline, not only its parent shell.
 
-After a valid snapshot, each returned level is applied through the observation
-append path and every omitted prior key for that observer is retired — except
-a liveness key whose attempt is still active, which becomes an explicit
-`absent` level. A dead worker is a statement the fold must carry: a reader
-with no observer of its own can only learn the death from a level, never from
-silence. The key retires once its attempt ends.
+After a valid `list` snapshot, each returned level is applied through the
+observation append path and every omitted prior key for that observer is
+retired.
+
+A probe sweep asks about every live attempt's bound handle, plus every
+handle bound to an ended attempt whose liveness key is still current. An
+active attempt's answer is reported as its level — `absent` establishes the
+key even when none existed, because a dead worker is a statement the fold
+must carry: a reader with no observer of its own can only learn the death
+from a level, never from silence. An active attempt's `unknown` writes
+nothing. An ended attempt's key stays while the probe answers `present` —
+the execution is outliving its attempt — and retires on `absent` or
+`unknown`, because an ended attempt cannot be watched forever. When an ended
+and a live attempt hold the same handle string, the live one owns the
+answer and the ended key retires. Any other key under the probe observer's
+name is not a statement it can renew and retires.
 
 `alder refresh` performs this scheduled ingestion. `alder reconcile` normally
 refreshes first, then compares durable attempts with the attempt-keyed

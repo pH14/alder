@@ -489,8 +489,8 @@ $ alder attempt edit hm-9a1-attempt-1 \
 `--handle` attaches one external handle to the attempt. A handle is a
 non-empty opaque string — a foreign name the runner chose. Alder stores it
 verbatim and compares it for equality; it never parses it, and no part of it
-selects anything inside Alder. An observer that lists the same string is what
-connects it back to a liveness level.
+selects anything inside Alder. A probe observer asked about the same string
+is what connects it back to a liveness level.
 
 Attaching a handle is a one-way transition: the attempt must not already have
 one, and the handle cannot later be replaced or cleared. Alder records the
@@ -726,8 +726,11 @@ snapshot; it does not leave a second `absent` state behind.
 
 ### `alder refresh`
 
-Run configured observer scripts and apply their complete current snapshots.
-Each `list` command prints a JSON array of level reports:
+Run configured observers and apply what they report. An observer entry has
+exactly one command form: `list` for complete generic snapshots, or `probe`
+for per-handle execution liveness.
+
+A `list` command prints a JSON array of level reports:
 
 ```json
 [
@@ -742,20 +745,46 @@ The manifest entry supplies the first key part:
 {"observer":"github", "list":"ci list --json | jq '[.[] | {subject: .id, field: \"ci\", level: .state}]'"}
 ```
 
-Rows whose field is `liveness` are statements about execution: their subject
-is an opaque handle exactly as a runner bound it. Refresh reads the open
-attempts and their handles from the fold, matches each listed handle by
-equality, and records the level under the attempt's own ID — the durable key
-is `(observer, attempt-id, liveness)`. A listed handle no live attempt claims
-appends nothing. Rows with any other field are generic observations and keep
-their subject verbatim.
-
 An exit-zero valid array is complete for that observer: reported keys are
-updated through the append layer, and previously current keys omitted from the
-array are retired — except a liveness key whose attempt is still active, which
-becomes an explicit `absent` level until the attempt ends. A failure appends
-no belief. Alder runs the script through a fixed `bash -o pipefail` wrapper
-with a 20-second timeout and up to three retries; the first valid result wins.
+updated through the append layer, and previously current keys omitted from
+the array are retired. Rows keep their subject verbatim. `liveness` is not a
+`list` field — it flows only through probes — so a list row claiming it
+appends nothing.
+
+A `probe` command is invoked once per relevant handle, with the handle as its
+single argument (`$1`), and prints exactly one word: `present` (the
+execution this handle names is running), `absent` (the probe recognizes the
+name and nothing runs under it), or `unknown` (not a name the probe
+recognizes; Alder writes nothing).
+
+```json
+{"observer":"tmux", "probe":"scripts/observe-tmux.sh \"$1\""}
+```
+
+The handle stays fully opaque to Alder: it is passed verbatim and matched
+against attempt records by equality; recognition of a runner's names lives
+in the runner's script. Refresh probes every Starting/Active attempt's bound
+handle, plus every handle bound to an ended attempt whose liveness key is
+still current, and records each answer under the attempt's own ID — the
+durable key is `(observer, attempt-id, liveness)`:
+
+- active + `present` or `absent`: that level is reported — `absent`
+  establishes the key even on the first sweep, so a worker that died before
+  it was ever observed still becomes a durable statement;
+- active + `unknown`: nothing is written, and reconcile keeps saying
+  `observation_unknown`, which is honest;
+- ended + `present`: the level stays, so `reconcile` names the `orphan`;
+- ended + `absent` or `unknown`: the key retires — an ended attempt is not
+  watched forever once its execution is gone or unrecognizable.
+
+When an ended and a live attempt hold the same handle string (respawns reuse
+session names), the live attempt owns the probe answer and the ended
+attempt's key retires.
+
+A failure appends no belief. Alder runs each command through a fixed
+`bash -o pipefail` wrapper with a 20-second timeout and up to three retries
+per execution; the first valid result wins, and a probe sweep fails whole
+when any handle stays unanswerable.
 
 `refresh` returns `changed`, the number of appended changes, and retired-key
 count. It is the normal scheduled ingestion command for alderd or cron. A
@@ -774,6 +803,13 @@ hm-2b7-attempt-1  recorded active, observed absent
 hm-4c8-attempt-1  an open attempt has never been bound to a handle; no worker was launched
   suggested: alderd spawn hm-4c8
 ```
+
+An execution outliving its ended attempt surfaces the same way: the probe
+keeps the ended attempt's liveness key `present` while the execution runs,
+so the default refresh-first flow names the `orphan` and suggests the
+repair — killing the execution is the runner's act on its own name, so the
+suggestion names the handle verbatim rather than spelling a command Alder
+would have to parse the handle to build.
 
 Reconcile does not treat an unknown level as absent. It refreshes by default,
 so its observation changes are ordinary `observation.*` appends; it never

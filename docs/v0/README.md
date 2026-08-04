@@ -116,9 +116,11 @@ planning language.
 ### Record intent before effects
 
 An attempt is recorded before its worker is launched, then the worker's
-opaque handle is attached to the attempt with `alder attempt edit`. Nothing
-of Alder's is planted in the worker: the runner stores nothing of the log's,
-and the log stores the runner's names.
+opaque handle is attached to the attempt with `alder attempt edit`. The
+schema-level rule is one-directional: the log stores the runner's names, and
+nothing of Alder's requires a mark planted in the worker. (Transitionally,
+the in-tree alderd runner still stamps `ALDER_ATTEMPT` into its own sessions
+as private crash-adoption bookkeeping until the runner extraction.)
 
 This makes the crash window repairable: a recorded attempt with no bound
 handle is `unspawned` — launch a worker for it, or end the attempt as
@@ -208,22 +210,28 @@ provenance conventions. Alder stores and displays that metadata but never
 makes core state transitions depend on its keys.
 
 Observation commands are small shell pipelines over tools already present in
-the environment. Each command owns one observer name and prints a normalized
-JSON array of current levels keyed by subject and field. A `liveness` row's
-subject is a handle as the runner bound it; `alder refresh` reads open
-attempts from the fold, matches listed handles by equality, and records each
-level under the attempt's own ID, so execution liveness is keyed by attempt.
-Refresh appends only changed levels and retires omitted keys — keeping an
-active attempt's vanished worker as an explicit `absent` level until the
-attempt ends — so the shared log is the current observation picture.
-`alder reconcile` compares that picture with durable attempts and proposes
-repairs; it never acts on a provider.
+the environment. Each owns one observer name and takes exactly one of two
+forms. A `list` command prints a normalized JSON array of current levels
+keyed by subject and field — the generic contract for things like CI states;
+`alder refresh` applies the snapshot and retires whatever it no longer
+covers. A `probe` command answers for execution liveness one handle at a
+time: invoked with the handle as its single argument, it prints exactly
+`present`, `absent`, or `unknown`, where `unknown` means "not a name I
+recognize" and writes nothing — so the handle stays opaque to Alder and
+recognition lives in the runner's script. Refresh probes every live
+attempt's handle, plus every ended attempt's handle whose liveness key is
+still current, and records answers under the attempt's own ID: a vanished
+worker becomes an explicit `absent` level even on the first sweep, and an
+execution outliving its ended attempt stays `present` until it is really
+gone. The shared log is the current observation picture. `alder reconcile`
+compares that picture with durable attempts and proposes repairs — `missing`
+for the dead worker, `orphan` for the outliving execution; it never acts on
+a provider.
 
-Alder runs each command with fixed pipefail semantics, a 20-second timeout per
-execution, and up to three retries after the initial execution. Only an
-exit-zero, valid, complete result can report a current level. Exhausted
-failures, timeouts, malformed JSON, and invalid result sets append no new
-belief.
+Alder runs each command with fixed pipefail semantics, a 20-second timeout
+per execution, and up to three retries after the initial execution. Only an
+exit-zero, valid result can report a current level. Exhausted failures,
+timeouts, malformed output, and invalid results append no new belief.
 
 Finite capacity is initially enforced by the repository's allocator or the
 external platform. The cloud provider remains authoritative for what exists

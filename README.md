@@ -10,8 +10,10 @@ Events are appended to a shared log stored in a Git remote ref. The remote
 is authoritative, so independent writers coordinate through compare-and-append
 against it rather than through a server. Current state is a deterministic
 fold of those events into a local SQLite database, rebuildable from the log
-at any time. Observations of external systems are refreshed into separate
-local tables and never masquerade as log facts.
+at any time. Observations of external systems — generic `list` snapshots and
+per-handle liveness `probe` answers — are refreshed into durable observation
+levels in the same log, kept apart from the work-and-attempt facts they are
+beliefs about.
 
 The model: work items with dependencies and acceptance checks, attempts at
 that work and questions that park work on a human decision. Human-readable

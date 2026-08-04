@@ -398,6 +398,60 @@ fn a_daemon_restart_interleaves_with_an_interrupted_spawn() {
     );
 }
 
+/// An execution outliving its ended attempt — the leader ended the attempt,
+/// then died before killing the session — must surface as production's
+/// `orphan` finding through the ordinary observe-then-reconcile round, and
+/// the repair must kill exactly that session.
+///
+/// This test FAILS if `orphan` stops surfacing: the observation sweep must
+/// keep the ended attempt's liveness key `present` while the session lives
+/// (retiring it on attempt end was the regression), and the harness's stray
+/// sweep deliberately refuses to kill a session an ended attempt still
+/// accounts for, so nothing here converges around a silent `orphan` path.
+#[test]
+fn an_ended_attempts_live_session_surfaces_as_an_orphan_and_is_killed() {
+    let host = spawn_probe(13);
+    // The world has one live worker; make its liveness durable first, as any
+    // running loop would have.
+    assert!(host.observe_and_reconcile().is_empty());
+
+    // The attempt ends while its session is still running.
+    host.end_attempt(
+        "al-sim-attempt-1",
+        "cancelled",
+        "superseded; session left running",
+    );
+    assert!(host.session_exists("alder-work-al-sim"));
+
+    // The ordinary round: refresh keeps the key present, reconcile names the
+    // orphan, and the suggestion names the execution verbatim.
+    let findings = host.observe_and_reconcile();
+    let orphan: Vec<_> = findings
+        .iter()
+        .filter(|finding| finding.kind == "orphan")
+        .collect();
+    assert_eq!(orphan.len(), 1, "no orphan surfaced: {findings:#?}");
+    assert_eq!(orphan[0].attempt_id.as_deref(), Some("al-sim-attempt-1"));
+    assert_eq!(orphan[0].handle.as_deref(), Some("tmux:alder-work-al-sim"));
+    assert!(
+        orphan[0]
+            .suggested_command
+            .as_deref()
+            .is_some_and(|suggestion| suggestion.contains("kill")),
+        "{:?}",
+        orphan[0].suggested_command
+    );
+
+    // Acting on the finding kills the named session; the next round retires
+    // the key and reports nothing.
+    host.repair(&findings);
+    assert!(!host.session_exists("alder-work-al-sim"));
+    assert!(host.observe_and_reconcile().is_empty());
+    // The freed deterministic name is reusable: full recovery respawns the
+    // still-open work and reaches the ordinary fixpoint.
+    host.recover(true);
+}
+
 /// A worktree torn in half — the directory made, the admin entry not — is the
 /// residue that motivates the harness's own path sweep. Pinned as a case of
 /// its own so the interesting subset does not depend on proptest finding it.
