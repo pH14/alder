@@ -127,14 +127,14 @@ fn output_that_is_not_exactly_one_json_document_is_an_error() {
 #[test]
 fn a_failing_alder_carries_its_code_and_message_through() {
     let (_root, host) = project(
-        r#"printf '{"code": "pass_open", "message": "pass `hm-pass-1` is still open"}\n'"#,
+        r#"printf '{"code": "store_unavailable", "message": "the remote is unreachable"}\n'"#,
         1,
     );
     let error = host
-        .alder(&["loop", "wake"])
+        .alder(&["status"])
         .expect_err("a non-zero exit is a failure");
-    assert!(error.is("pass_open"), "{error}");
-    assert_eq!(error.message, "pass `hm-pass-1` is still open");
+    assert!(error.is("store_unavailable"), "{error}");
+    assert_eq!(error.message, "the remote is unreachable");
 }
 
 #[test]
