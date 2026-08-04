@@ -43,6 +43,17 @@ systems, is a deterministic fold of those events into a local SQLite database.
 Observer execution diagnostics remain local; an observer's reported level is
 durable only when it changes the folded picture.
 
+## Architecture
+
+The workspace is layered as three crates beneath the CLI: `alder-log`, the
+opaque compare-and-append record log; and two application crates,
+`alder-work` (work, dependencies, checks, attempts, questions) and
+`alder-observation` (observation keys and levels), each owning its own event
+schema, write checking, and fold. The layering is the design: the log knows
+nothing; each application checks its own writes and folds its own state; the
+CLI is presentation. The loop-control records live in neither application —
+they stay with the CLI until they are removed from the log entirely.
+
 The primary user is an agent driving a project. A repository skill may call
 that agent the leader, but Alder stores no leader, generation, lease, or
 writer role. The human operates Alder through an agent or another chat

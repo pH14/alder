@@ -129,10 +129,15 @@ history
   #7  "question.answered"  "2026-07-31T19:16:00.236487Z"
 ```
 
-The repository is a four-crate workspace: the `alder` CLI, the
-[`alderd` daemon](crates/alderd/README.md), `alder-log`, a reusable Git-backed
-append-only record log with no knowledge of Alder's domain, and the
-[`alder-model`](crates/alder-model/README.md) dev-only Stateright model checker.
+The repository is a six-crate workspace: `alder-log`, a reusable Git-backed
+append-only record log with no knowledge of Alder's domain; the two
+application crates above it, `alder-work` (work items, attempts, questions)
+and `alder-observation` (durable observation levels); the `alder` CLI, which
+composes the applications; the [`alderd` daemon](crates/alderd/README.md);
+and the [`alder-model`](crates/alder-model/README.md) dev-only Stateright
+model checker. The layering is the design: the log knows nothing; each
+application checks its own writes and folds its own state; the CLI is
+presentation.
 
 Design docs live in [docs/v0](docs/v0): purpose and boundaries, the state
 model, the CLI contract, the driving loop and its daemon, implementation
