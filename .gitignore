@@ -1,4 +1,9 @@
 /target/
+# A sweep writes its whole run under mutants.out/ — lock file, per-mutant logs
+# and diffs, the outcome lists — and moves the previous run to mutants.out.old/
+# beside it before it starts. Ignoring only the live directory is what let a
+# `git add -A` commit a rotated sweep onto a branch.
 /mutants.out/
+/mutants.out.old/
 .alder/
 .claude/settings.local.json
