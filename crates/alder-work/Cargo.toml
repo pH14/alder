@@ -1,0 +1,15 @@
+[package]
+name = "alder-work"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "The work application: work items, attempts, and questions"
+
+[dependencies]
+alder-log = { path = "../alder-log" }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

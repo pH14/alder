@@ -77,8 +77,9 @@ use std::{
 use alder::{
     domain::{
         AttemptDefinition, AttemptOutcome, AttemptState, CheckDefinition, EventDraft, EventPayload,
-        ObservationDefinition, ObservationKey, ProjectState, Snapshot, WorkDefinition,
-        WorkOperation, decode_record, encode_draft,
+        LoopEventPayload, ObservationDefinition, ObservationEventPayload, ObservationKey,
+        ProjectState, Snapshot, WorkDefinition, WorkEventPayload, WorkOperation, decode_record,
+        encode_draft,
     },
     observer::{NormalizedObject, ReconcileFinding, plan_probe_run, probe_targets, reconcile},
 };
@@ -457,7 +458,7 @@ impl Simulator {
                 world: RefCell::new(World::new(seed)),
             }),
         };
-        host.append_unfaulted(EventPayload::WorkChanged {
+        host.append_unfaulted(WorkEventPayload::WorkChanged {
             why: None,
             operations: vec![WorkOperation::Add {
                 work: WorkDefinition {
@@ -477,7 +478,7 @@ impl Simulator {
                 },
             }],
         });
-        host.append_unfaulted(EventPayload::LoopEngineSelected {
+        host.append_unfaulted(LoopEventPayload::LoopEngineSelected {
             engine: "stub".to_owned(),
         });
         host.schedule_faults(Vec::new());
@@ -557,11 +558,11 @@ impl Simulator {
         let expected = self.shared.log.head().expect("head");
         let one = self.draft(
             "cas-one".to_owned(),
-            EventPayload::LoopNudgeRequested { why: None },
+            LoopEventPayload::LoopNudgeRequested { why: None },
         );
         let two = self.draft(
             "cas-two".to_owned(),
-            EventPayload::LoopRotationRequested { why: None },
+            LoopEventPayload::LoopRotationRequested { why: None },
         );
         self.shared
             .log
@@ -576,7 +577,7 @@ impl Simulator {
     }
 
     pub fn nudge(&self) {
-        self.append_unfaulted(EventPayload::LoopNudgeRequested {
+        self.append_unfaulted(LoopEventPayload::LoopNudgeRequested {
             why: Some("scripted interleaving".to_owned()),
         });
     }
@@ -674,12 +675,12 @@ impl Simulator {
             .expect("the logical tick is a timestamp")
     }
 
-    fn draft(&self, id: String, payload: EventPayload) -> EventDraft {
+    fn draft(&self, id: String, payload: impl Into<EventPayload>) -> EventDraft {
         EventDraft {
             id,
             at: self.logical_now(),
             actor: "sim".to_owned(),
-            payload,
+            payload: payload.into(),
             schema: "alder.event.v0".to_owned(),
         }
     }
@@ -689,7 +690,7 @@ impl Simulator {
     ///
     /// Validation happens here, before any crash decision, so a rejected
     /// append is an ordinary error rather than a torn write.
-    fn stage(&self, payload: EventPayload) -> alder::error::Result<(Footprint, String)> {
+    fn stage(&self, payload: impl Into<EventPayload>) -> alder::error::Result<(Footprint, String)> {
         let snapshot = self.snapshot();
         let id = {
             let mut world = self.shared.world.borrow_mut();
@@ -712,7 +713,7 @@ impl Simulator {
 
     /// An append that sets a scenario up rather than exercising the system
     /// under test: it crosses no effect boundary and can never be interrupted.
-    fn append_unfaulted(&self, payload: EventPayload) {
+    fn append_unfaulted(&self, payload: impl Into<EventPayload>) {
         let (footprint, _) = self
             .stage(payload)
             .expect("the simulated event is a valid append");
@@ -933,7 +934,7 @@ impl Simulator {
                     if current.is_some_and(|observation| observation.level == level) {
                         continue;
                     }
-                    self.append_unfaulted(EventPayload::ObservationReported {
+                    self.append_unfaulted(ObservationEventPayload::ObservationReported {
                         observation: ObservationDefinition {
                             key: change.key,
                             level,
@@ -944,7 +945,9 @@ impl Simulator {
                     if current.is_none() {
                         continue;
                     }
-                    self.append_unfaulted(EventPayload::ObservationRetired { key: change.key });
+                    self.append_unfaulted(ObservationEventPayload::ObservationRetired {
+                        key: change.key,
+                    });
                 }
             }
         }
@@ -1531,14 +1534,15 @@ impl Simulator {
                     + 1;
                 let attempt_id = format!("{work_id}-attempt-{ordinal}");
                 Answer::Mutation {
-                    payload: EventPayload::AttemptStarted {
+                    payload: WorkEventPayload::AttemptStarted {
                         attempt: AttemptDefinition {
                             id: attempt_id.clone(),
                             work_id: (*work_id).to_owned(),
                             tier: None,
                             metadata: BTreeMap::new(),
                         },
-                    },
+                    }
+                    .into(),
                     schema: "alder.work.start.v0",
                     fields: json!({"work_id": work_id, "attempt_id": attempt_id}),
                 }
@@ -1556,11 +1560,12 @@ impl Simulator {
                     .map(|(key, value)| (key.to_owned(), json!(value)))
                     .collect();
                 Answer::Mutation {
-                    payload: EventPayload::AttemptBound {
+                    payload: WorkEventPayload::AttemptBound {
                         attempt_id: (*attempt_id).to_owned(),
                         handle: handle.to_owned(),
                         metadata,
-                    },
+                    }
+                    .into(),
                     schema: "alder.attempt.edit.v0",
                     fields: json!({
                         "attempt_id": attempt_id,
@@ -1582,13 +1587,14 @@ impl Simulator {
                     }
                 };
                 Answer::Mutation {
-                    payload: EventPayload::AttemptEnded {
+                    payload: WorkEventPayload::AttemptEnded {
                         attempt_id: (*attempt_id).to_owned(),
                         outcome,
                         why: value_after(rest, "--why")
                             .unwrap_or("simulated repair")
                             .to_owned(),
-                    },
+                    }
+                    .into(),
                     schema: "alder.attempt.end.v0",
                     fields: json!({"attempt_id": attempt_id, "outcome": requested}),
                 }

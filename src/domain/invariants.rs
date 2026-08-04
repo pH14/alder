@@ -28,7 +28,7 @@
 
 use alder_log::Record;
 
-use super::{Event, EventPayload, ProjectState, decode_record};
+use super::{Event, EventPayload, LoopEventPayload, ProjectState, decode_record};
 use crate::error::Result;
 
 /// The log folds cleanly: every record decodes to an Alder event, and the fold
@@ -70,7 +70,9 @@ pub fn mentions_no_readers(events: &[Event]) -> bool {
     events.iter().all(|event| {
         !matches!(
             event.payload,
-            EventPayload::LegacyPassStarted(_) | EventPayload::LegacyPassEnded(_)
+            EventPayload::Loop(
+                LoopEventPayload::LegacyPassStarted(_) | LoopEventPayload::LegacyPassEnded(_)
+            )
         )
     })
 }
@@ -98,8 +100,8 @@ fn latest_rotation_request(events: &[Event]) -> Option<u64> {
     events
         .iter()
         .fold(None, |latest, event| match &event.payload {
-            EventPayload::LoopRotationRequested { .. } => Some(event.seq),
-            EventPayload::LegacyPassEnded(body)
+            EventPayload::Loop(LoopEventPayload::LoopRotationRequested { .. }) => Some(event.seq),
+            EventPayload::Loop(LoopEventPayload::LegacyPassEnded(body))
                 if body.get("rotate").and_then(serde_json::Value::as_bool) == Some(true) =>
             {
                 Some(event.seq)
@@ -123,12 +125,12 @@ mod tests {
         DateTime::from_timestamp(1_800_000_000, 0).expect("a valid instant")
     }
 
-    fn draft(id: &str, payload: EventPayload) -> EventDraft {
+    fn draft(id: &str, payload: impl Into<EventPayload>) -> EventDraft {
         EventDraft {
             id: id.to_owned(),
             at: at(),
             actor: "tester".to_owned(),
-            payload,
+            payload: payload.into(),
             schema: SCHEMA.to_owned(),
         }
     }
@@ -161,13 +163,13 @@ mod tests {
     }
 
     fn rotation(id: &str) -> EventDraft {
-        draft(id, EventPayload::LoopRotationRequested { why: None })
+        draft(id, LoopEventPayload::LoopRotationRequested { why: None })
     }
 
     fn legacy_pass_end(id: &str, rotate: bool) -> EventDraft {
         draft(
             id,
-            EventPayload::LegacyPassEnded(json!({
+            LoopEventPayload::LegacyPassEnded(json!({
                 "pass_id": "al-pass-1", "outcome": "ok", "report": null,
                 "wake_at": null, "rotate": rotate, "why": null,
             })),
@@ -177,7 +179,7 @@ mod tests {
     #[test]
     fn an_ordinary_history_folds_cleanly() {
         let history = records(vec![
-            draft("pause-1", EventPayload::LoopPaused { why: None }),
+            draft("pause-1", LoopEventPayload::LoopPaused { why: None }),
             rotation("rotate-1"),
         ]);
         assert!(log_folds_cleanly(&history));
@@ -203,7 +205,7 @@ mod tests {
     #[test]
     fn a_history_free_of_pass_events_mentions_no_readers() {
         let history = events(vec![
-            draft("pause-1", EventPayload::LoopPaused { why: None }),
+            draft("pause-1", LoopEventPayload::LoopPaused { why: None }),
             rotation("rotate-1"),
         ]);
         assert!(mentions_no_readers(&history));
@@ -228,7 +230,7 @@ mod tests {
     fn a_history_that_never_asked_has_no_request_recorded() {
         let (history, state) = folded(vec![draft(
             "pause-1",
-            EventPayload::LoopPaused { why: None },
+            LoopEventPayload::LoopPaused { why: None },
         )]);
         assert!(state.loop_control.rotate_requested_seq.is_none());
         assert!(rotation_request_mirrors_the_log(&state, &history));

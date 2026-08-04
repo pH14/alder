@@ -33,8 +33,8 @@ use std::hash::{Hash, Hasher};
 
 use alder::app::loop_section;
 use alder::domain::{
-    Event, EventDraft, EventPayload, ProjectState, WorkDefinition, WorkOperation, decode_record,
-    encode_draft, invariants,
+    Event, EventDraft, EventPayload, LoopEventPayload, ProjectState, WorkDefinition,
+    WorkEventPayload, WorkOperation, decode_record, encode_draft, invariants,
 };
 use alder_log::{Log, MemoryLog, Record, RecordDraft};
 use alderd::config::Config;
@@ -294,12 +294,12 @@ fn observation() -> Poll {
     }
 }
 
-fn typed_draft(id: &str, actor: &str, payload: EventPayload) -> RecordDraft {
+fn typed_draft(id: &str, actor: &str, payload: impl Into<EventPayload>) -> RecordDraft {
     encode_draft(&EventDraft {
         id: id.to_owned(),
         at: epoch(),
         actor: actor.to_owned(),
-        payload,
+        payload: payload.into(),
         schema: SCHEMA.to_owned(),
     })
     .expect("a model draft encodes")
@@ -322,7 +322,7 @@ fn work_statement(id: &str, work_id: &str, actor: &str) -> RecordDraft {
     typed_draft(
         id,
         actor,
-        EventPayload::WorkChanged {
+        WorkEventPayload::WorkChanged {
             why: None,
             operations: vec![WorkOperation::Add {
                 work: WorkDefinition {
@@ -586,7 +586,7 @@ impl Model for Scenario {
                 let draft = typed_draft(
                     "phone-rotate-1",
                     PHONE_ACTOR,
-                    EventPayload::LoopRotationRequested { why: None },
+                    LoopEventPayload::LoopRotationRequested { why: None },
                 );
                 state.log = append_now(&state.log, &draft);
                 state.phone.rotation_left = false;
@@ -597,7 +597,7 @@ impl Model for Scenario {
                 let draft = typed_draft(
                     "phone-pause-1",
                     PHONE_ACTOR,
-                    EventPayload::LoopPaused {
+                    LoopEventPayload::LoopPaused {
                         why: Some("maintenance window".to_owned()),
                     },
                 );
@@ -734,7 +734,7 @@ mod tests {
         typed_draft(
             "pause-1",
             PHONE_ACTOR,
-            EventPayload::LoopPaused {
+            LoopEventPayload::LoopPaused {
                 why: why.map(str::to_owned),
             },
         )

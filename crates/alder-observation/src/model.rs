@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+/// The observation application's event schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "body")]
+pub enum ObservationEventPayload {
+    #[serde(rename = "observation.reported")]
+    ObservationReported { observation: ObservationDefinition },
+    #[serde(rename = "observation.retired")]
+    ObservationRetired { key: ObservationKey },
+}
+
+impl ObservationEventPayload {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::ObservationReported { .. } => "observation.reported",
+            Self::ObservationRetired { .. } => "observation.retired",
+        }
+    }
+}
+
 /// A key in the observation application. Its three parts are deliberately
 /// explicit in every event and snapshot; no caller has to parse a synthetic
 /// string to learn who reported what about which subject.

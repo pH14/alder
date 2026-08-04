@@ -9,9 +9,9 @@ use alder_log::{AppendReceipt, Log, LogError};
 
 use super::{
     AttemptDefinition, AttemptOutcome, CheckUpdate, Event, EventDraft, EventPayload,
-    GraphChangeDocument, Head, ObservationDefinition, ObservationKey, PreparedChange, ProjectState,
-    QuestionDefinition, WorkDefinition, WorkOperation, WorkState, WorkStateChange,
-    validate_observation_key,
+    GraphChangeDocument, Head, LoopEventPayload, ObservationKey, PreparedChange, ProjectState,
+    QuestionDefinition, WorkDefinition, WorkEventPayload, WorkOperation, WorkState,
+    WorkStateChange, validate_observation_key,
 };
 
 const ID_ALLOCATION_ATTEMPTS: usize = 16;
@@ -88,9 +88,9 @@ impl<S: Log> ProjectLog<S> {
     pub fn append_payload(
         &self,
         snapshot: &Snapshot,
-        payload: EventPayload,
+        payload: impl Into<EventPayload>,
     ) -> Result<AppendResult> {
-        self.append_payload_at(snapshot, Utc::now(), payload)
+        self.append_payload_at(snapshot, Utc::now(), payload.into())
     }
 
     /// Record a current level only when the folded picture would change.
@@ -127,24 +127,11 @@ impl<S: Log> ProjectLog<S> {
         for _ in 0..OBSERVATION_APPEND_ATTEMPTS {
             let snapshot = self.snapshot()?;
             let current = snapshot.state.observations.get(&key);
-            let payload = match (current, level.as_deref()) {
-                (Some(observation), Some(level)) if observation.level == level => {
-                    return Ok(ObservationAppend::Unchanged {
-                        head: snapshot.head,
-                    });
-                }
-                (None, None) => {
-                    return Ok(ObservationAppend::Unchanged {
-                        head: snapshot.head,
-                    });
-                }
-                (_, Some(level)) => EventPayload::ObservationReported {
-                    observation: ObservationDefinition {
-                        key: key.clone(),
-                        level: level.to_owned(),
-                    },
-                },
-                (Some(_), None) => EventPayload::ObservationRetired { key: key.clone() },
+            let Some(payload) = alder_observation::newness_check(current, &key, level.as_deref())
+            else {
+                return Ok(ObservationAppend::Unchanged {
+                    head: snapshot.head,
+                });
             };
             match self.append_payload(&snapshot, payload) {
                 Ok(result) => return Ok(ObservationAppend::Appended(Box::new(result))),
@@ -208,7 +195,7 @@ impl<S: Log> ProjectLog<S> {
     ) -> Result<AppendResult> {
         self.append_payload(
             snapshot,
-            EventPayload::WorkChanged {
+            WorkEventPayload::WorkChanged {
                 why: document.why.clone(),
                 operations: prepared.operations,
             },
@@ -237,7 +224,7 @@ impl<S: Log> ProjectLog<S> {
         };
         let result = self.append_payload(
             &snapshot,
-            EventPayload::WorkChanged {
+            WorkEventPayload::WorkChanged {
                 why: None,
                 operations: vec![operation],
             },
@@ -293,7 +280,7 @@ impl<S: Log> ProjectLog<S> {
         let id = format!("{work_id}-attempt-{ordinal}");
         let result = self.append_payload(
             &snapshot,
-            EventPayload::AttemptStarted {
+            WorkEventPayload::AttemptStarted {
                 attempt: AttemptDefinition {
                     id: id.clone(),
                     work_id: work_id.to_owned(),
@@ -314,7 +301,7 @@ impl<S: Log> ProjectLog<S> {
         let snapshot = self.snapshot()?;
         self.append_payload(
             &snapshot,
-            EventPayload::AttemptBound {
+            WorkEventPayload::AttemptBound {
                 attempt_id: attempt_id.to_owned(),
                 handle,
                 metadata,
@@ -333,7 +320,7 @@ impl<S: Log> ProjectLog<S> {
         let snapshot = self.snapshot()?;
         self.append_payload(
             &snapshot,
-            EventPayload::AttemptUpdated {
+            WorkEventPayload::AttemptUpdated {
                 attempt_id: attempt_id.to_owned(),
                 tier,
                 metadata,
@@ -352,7 +339,7 @@ impl<S: Log> ProjectLog<S> {
         let snapshot = self.snapshot()?;
         self.append_payload(
             &snapshot,
-            EventPayload::AttemptEnded {
+            WorkEventPayload::AttemptEnded {
                 attempt_id: attempt_id.to_owned(),
                 outcome,
                 why,
@@ -370,7 +357,7 @@ impl<S: Log> ProjectLog<S> {
         let snapshot = self.snapshot()?;
         self.append_payload(
             &snapshot,
-            EventPayload::WorkFinished {
+            WorkEventPayload::WorkFinished {
                 work_id: work_id.to_owned(),
                 attempt_id,
                 external,
@@ -389,7 +376,7 @@ impl<S: Log> ProjectLog<S> {
         let snapshot = self.snapshot()?;
         self.append_payload(
             &snapshot,
-            EventPayload::WorkDropped {
+            WorkEventPayload::WorkDropped {
                 work_id: work_id.to_owned(),
                 attempt_id,
                 outcome,
@@ -402,7 +389,7 @@ impl<S: Log> ProjectLog<S> {
         let snapshot = self.snapshot()?;
         self.append_payload(
             &snapshot,
-            EventPayload::WorkReopened {
+            WorkEventPayload::WorkReopened {
                 work_id: work_id.to_owned(),
                 why,
             },
@@ -424,7 +411,7 @@ impl<S: Log> ProjectLog<S> {
         let id = format!("{work_id}-question-{ordinal}");
         let result = self.append_payload(
             &snapshot,
-            EventPayload::QuestionAsked {
+            WorkEventPayload::QuestionAsked {
                 question: QuestionDefinition {
                     id: id.clone(),
                     work_id: work_id.to_owned(),
@@ -439,7 +426,7 @@ impl<S: Log> ProjectLog<S> {
         let snapshot = self.snapshot()?;
         self.append_payload(
             &snapshot,
-            EventPayload::QuestionAnswered {
+            WorkEventPayload::QuestionAnswered {
                 question_id: question_id.to_owned(),
                 answer,
             },
@@ -455,7 +442,7 @@ impl<S: Log> ProjectLog<S> {
         }
         self.append_payload(
             &snapshot,
-            EventPayload::WorkChanged {
+            WorkEventPayload::WorkChanged {
                 why: Some(match &change {
                     WorkStateChange::Block { reason, .. } | WorkStateChange::Unblock { reason } => {
                         reason.clone()
@@ -478,27 +465,27 @@ impl<S: Log> ProjectLog<S> {
 
     pub fn pause_loop(&self, why: Option<String>) -> Result<AppendResult> {
         let snapshot = self.snapshot()?;
-        self.append_payload(&snapshot, EventPayload::LoopPaused { why })
+        self.append_payload(&snapshot, LoopEventPayload::LoopPaused { why })
     }
 
     pub fn resume_loop(&self) -> Result<AppendResult> {
         let snapshot = self.snapshot()?;
-        self.append_payload(&snapshot, EventPayload::LoopResumed {})
+        self.append_payload(&snapshot, LoopEventPayload::LoopResumed {})
     }
 
     pub fn select_engine(&self, engine: String) -> Result<AppendResult> {
         let snapshot = self.snapshot()?;
-        self.append_payload(&snapshot, EventPayload::LoopEngineSelected { engine })
+        self.append_payload(&snapshot, LoopEventPayload::LoopEngineSelected { engine })
     }
 
     pub fn request_rotation(&self, why: Option<String>) -> Result<AppendResult> {
         let snapshot = self.snapshot()?;
-        self.append_payload(&snapshot, EventPayload::LoopRotationRequested { why })
+        self.append_payload(&snapshot, LoopEventPayload::LoopRotationRequested { why })
     }
 
     pub fn request_nudge(&self, why: Option<String>) -> Result<AppendResult> {
         let snapshot = self.snapshot()?;
-        self.append_payload(&snapshot, EventPayload::LoopNudgeRequested { why })
+        self.append_payload(&snapshot, LoopEventPayload::LoopNudgeRequested { why })
     }
 
     fn draft_at(&self, at: DateTime<Utc>, payload: EventPayload) -> EventDraft {
@@ -823,7 +810,9 @@ mod tests {
             .unwrap();
         let snapshot = log.snapshot().unwrap();
         match &snapshot.events.last().unwrap().payload {
-            EventPayload::WorkFinished { external, .. } => assert!(*external),
+            EventPayload::Work(WorkEventPayload::WorkFinished { external, .. }) => {
+                assert!(*external)
+            }
             _ => panic!("expected external work finish"),
         }
     }
@@ -873,17 +862,21 @@ mod tests {
     fn no_append_path_can_produce_a_pass_or_other_legacy_event() {
         let log = ProjectLog::new(MemoryStore::new(), "hm", "alderd");
         let legacy = [
-            EventPayload::LegacyPassStarted(json!({"pass": {"id": "hm-pass-1"}})),
-            EventPayload::LegacyPassEnded(json!({"pass_id": "hm-pass-1", "outcome": "ok"})),
-            EventPayload::LegacyHandoffSubmitted {
+            EventPayload::Loop(LoopEventPayload::LegacyPassStarted(
+                json!({"pass": {"id": "hm-pass-1"}}),
+            )),
+            EventPayload::Loop(LoopEventPayload::LegacyPassEnded(
+                json!({"pass_id": "hm-pass-1", "outcome": "ok"}),
+            )),
+            EventPayload::Work(WorkEventPayload::LegacyHandoffSubmitted {
                 handoff: crate::domain::LegacyHandoffDefinition {
                     id: "hm-handoff-1".to_owned(),
                     title: "handoff".to_owned(),
                     artifact_ref: "ref".to_owned(),
                     note: None,
                 },
-            },
-            EventPayload::LegacyHandoffIntegrated {
+            }),
+            EventPayload::Work(WorkEventPayload::LegacyHandoffIntegrated {
                 handoff_id: "hm-handoff-1".to_owned(),
                 work: WorkDefinition {
                     id: "hm-1".to_owned(),
@@ -893,11 +886,11 @@ mod tests {
                     requires: Vec::new(),
                     checks: Vec::new(),
                 },
-            },
-            EventPayload::LegacyHandoffWithdrawn {
+            }),
+            EventPayload::Work(WorkEventPayload::LegacyHandoffWithdrawn {
                 handoff_id: "hm-handoff-1".to_owned(),
                 why: "reason".to_owned(),
-            },
+            }),
         ];
         for payload in legacy {
             let name = payload.type_name();

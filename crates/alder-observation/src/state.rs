@@ -4,7 +4,7 @@ use serde_json::json;
 
 use alder_log::alder_error::{AlderError, Result};
 
-use super::{Observation, ObservationDefinition, ObservationKey};
+use super::{Observation, ObservationDefinition, ObservationEventPayload, ObservationKey};
 
 /// The serialized shape of the folded observation picture: an ordered list,
 /// never a synthetic string key.
@@ -45,6 +45,45 @@ pub mod observation_map {
             }
         }
         Ok(folded)
+    }
+}
+
+/// Fold one observation event, checking its legality against the picture.
+pub fn apply(
+    observations: &mut BTreeMap<ObservationKey, Observation>,
+    payload: &ObservationEventPayload,
+    seq: u64,
+) -> Result<()> {
+    match payload {
+        ObservationEventPayload::ObservationReported { observation } => {
+            report(observations, observation, seq)
+        }
+        ObservationEventPayload::ObservationRetired { key } => retire(observations, key),
+    }
+}
+
+/// The newness check: the observation event one report or retirement implies
+/// against the current picture, or `None` when the picture would not change.
+///
+/// Observers are deliberately dumb and may report the same level forever.
+/// The append layer asks this question after every reread, so two identical
+/// reports settle as one event instead of making scripts remember prior
+/// output, and retiring an already absent key is quiet for the same reason.
+pub fn newness_check(
+    current: Option<&Observation>,
+    key: &ObservationKey,
+    level: Option<&str>,
+) -> Option<ObservationEventPayload> {
+    match (current, level) {
+        (Some(observation), Some(level)) if observation.level == level => None,
+        (None, None) => None,
+        (_, Some(level)) => Some(ObservationEventPayload::ObservationReported {
+            observation: ObservationDefinition {
+                key: key.clone(),
+                level: level.to_owned(),
+            },
+        }),
+        (Some(_), None) => Some(ObservationEventPayload::ObservationRetired { key: key.clone() }),
     }
 }
 

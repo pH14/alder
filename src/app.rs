@@ -18,7 +18,7 @@ use crate::{
         AppendResult, Attempt, AttemptOutcome, ChangeMode, CheckDefinition, CheckStatus,
         CheckUpdate, Event, EventPayload, GraphChangeDocument, Head, NullableString,
         ObservationAppend, ObservationKey, ProjectLog, ProjectState, Question, Snapshot,
-        WorkStateChange, prepare_change,
+        WorkEventPayload, WorkStateChange, prepare_change,
     },
     error::{AlderError, Result},
     observer,
@@ -1038,10 +1038,10 @@ fn overlay_state(
         seq: context.snapshot.head.sequence().saturating_add(1),
         at: chrono::Utc::now(),
         actor: "hypothetical".to_owned(),
-        payload: EventPayload::WorkChanged {
+        payload: EventPayload::Work(WorkEventPayload::WorkChanged {
             why: document.why,
             operations: prepared.operations,
-        },
+        }),
         schema: "alder.event.v0".to_owned(),
     };
     state.apply(&event)?;

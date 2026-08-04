@@ -1,4 +1,3 @@
-mod change;
 mod codec;
 pub mod invariants;
 mod log;
@@ -7,9 +6,10 @@ mod state;
 
 pub use alder_log::Head;
 pub use alder_observation::{
-    Observation, ObservationDefinition, ObservationKey, valid_name, validate_observation_key,
+    Observation, ObservationDefinition, ObservationEventPayload, ObservationKey, valid_name,
+    validate_observation_key,
 };
-pub use change::*;
+pub use alder_work::*;
 pub use codec::*;
 pub use log::*;
 pub use model::*;
