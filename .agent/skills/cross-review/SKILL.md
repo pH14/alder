@@ -36,9 +36,14 @@ intents, or recovery state to avoid that cost.
 - **Round 1** is a full review.
 - **Round 2** verifies the fixes only. It does not open new findings, with one
   exception: a real defect introduced by a fix.
-- Still not clean after round 2 → `alder work ask <id>` listing the open
-  findings with a recommendation. There is no third round without the
-  operator's answer.
+- Still not clean after round 2, and you have a specific mechanical
+  instruction that answers every open finding → take one more round with that
+  instruction, without asking. Say what you did and why in the attempt
+  record. This discretion does not renew: if that round is not clean, ask.
+- Still not clean after round 2 otherwise — the choice is to abandon the
+  branch, reduce its ambition, or merge with a known defect → `alder work
+  ask <id>` listing the open findings with a recommendation. Those choices
+  are the operator's; there is no third round without an answer.
 
 A finding is evidence, not an order: the author may argue one down on the
 record. Until the check is satisfied or the operator rules, the branch does
