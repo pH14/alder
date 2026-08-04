@@ -2,9 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-use crate::error::{AlderError, Result};
+use alder_log::alder_error::{AlderError, Result};
 
-use super::{CheckDefinition, NullableString, ProjectState, WorkDefinition, WorkOperation};
+use super::{
+    CheckDefinition, NullableString, WorkAppState, WorkDefinition, WorkEventPayload, WorkOperation,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,7 +44,7 @@ pub struct EditWorkInput {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "super::model::nullable_string_change"
+        with = "crate::model::nullable_string_change"
     )]
     pub spec: Option<NullableString>,
     #[serde(default)]
@@ -71,7 +73,7 @@ pub struct PreparedChange {
 }
 
 pub fn prepare_change<F>(
-    state: &ProjectState,
+    state: &WorkAppState,
     document: &GraphChangeDocument,
     mode: ChangeMode,
     mut allocate: F,
@@ -195,20 +197,16 @@ where
     }
 
     let mut candidate = state.clone();
-    let event = super::Event {
-        id: "hypothetical".to_owned(),
-        seq: 1,
-        at: chrono::Utc::now(),
-        actor: "hypothetical".to_owned(),
-        payload: super::EventPayload::WorkChanged {
+    // The caller supplies the actual sequence during append. Graph validation
+    // does not depend on sequence values, so a nonzero placeholder is enough.
+    candidate.apply(
+        &WorkEventPayload::WorkChanged {
             why: document.why.clone(),
             operations: operations.clone(),
         },
-        schema: "alder.event.v0".to_owned(),
-    };
-    // The caller supplies the actual sequence during append. Graph validation
-    // does not depend on sequence values, so a nonzero placeholder is enough.
-    candidate.apply(&event)?;
+        1,
+        "hypothetical",
+    )?;
 
     Ok(PreparedChange {
         operations,
@@ -228,7 +226,7 @@ mod tests {
 
     fn prepare(value: serde_json::Value, mode: ChangeMode) -> Result<PreparedChange> {
         prepare_change(
-            &ProjectState::default(),
+            &WorkAppState::default(),
             &document(value),
             mode,
             |index, _| format!("hm-{index}"),

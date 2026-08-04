@@ -51,9 +51,9 @@ documents intentionally leave open.
   mutations are removed through clearer code or narrowly documented
   exclusions rather than broad file or module skips.
 - The loop is mutation-tested as one surface, because its two halves are only
-  correct together: the fold's loop-control arms, `next_review_at`, and the
-  `loop` section `status` reports, in the `alder` crate; `decide`,
-  `loop_state`, and `driver` in `alderd`. Both halves run with no survivors
+  correct together: the fold's loop-control arms and the `loop` section
+  `status` reports in the `alder` crate, with `next_review_at` in
+  `alder-work`; `decide`, `loop_state`, and `driver` in `alderd`. Both halves run with no survivors
   and no exclusions. What that buys is specific: a decision the driver
   reaches by a path no test walks — a diagnostic nobody reads, a match guard
   that catches more than it names, a hash that varies without being FNV — is

@@ -33,22 +33,52 @@ pub fn encode_draft(draft: &EventDraft) -> Result<RecordDraft> {
     )?)
 }
 
+/// Decode the composite payload by trying each application's schema in turn.
+///
+/// `EventPayload` is an untagged union, and serde's untagged decode collapses
+/// every sub-enum's error into "data did not match any variant" — useless for
+/// diagnosing a malformed event. The three sub-enums carry disjoint `type`
+/// tags, so trying them in sequence is equivalent; when one recognized the
+/// type but refused the body, its field-level error is the one worth
+/// surfacing. When none recognized the type, every error is an
+/// unknown-variant complaint and the three lists are concatenated.
+fn decode_payload(value: Value) -> std::result::Result<EventPayload, String> {
+    let mut unknown = Vec::new();
+    macro_rules! try_app {
+        ($ty:ty) => {
+            match serde_json::from_value::<$ty>(value.clone()) {
+                Ok(payload) => return Ok(EventPayload::from(payload)),
+                Err(error) => {
+                    let text = error.to_string();
+                    if !text.starts_with("unknown variant") {
+                        return Err(text);
+                    }
+                    unknown.push(text);
+                }
+            }
+        };
+    }
+    try_app!(super::WorkEventPayload);
+    try_app!(super::ObservationEventPayload);
+    try_app!(super::LoopEventPayload);
+    Err(unknown.join("; "))
+}
+
 /// Decode an opaque log record into Alder's typed work event.
 pub fn decode_record(record: &Record) -> Result<Event> {
     let mut object = Map::new();
     object.insert("type".to_owned(), json!(record.kind().as_str()));
     object.insert("body".to_owned(), record.body().clone());
-    let payload =
-        serde_json::from_value::<EventPayload>(Value::Object(object)).map_err(|error| {
-            AlderError::with_context(
-                "invalid_event",
-                format!(
-                    "unsupported or invalid Alder event `{}`: {error}",
-                    record.kind()
-                ),
-                json!({"type": record.kind().as_str()}),
-            )
-        })?;
+    let payload = decode_payload(Value::Object(object)).map_err(|error| {
+        AlderError::with_context(
+            "invalid_event",
+            format!(
+                "unsupported or invalid Alder event `{}`: {error}",
+                record.kind()
+            ),
+            json!({"type": record.kind().as_str()}),
+        )
+    })?;
     Ok(Event {
         id: record.id().as_str().to_owned(),
         seq: record.sequence(),
@@ -91,6 +121,43 @@ mod tests {
             .append(&Head::empty(), &encode_draft(&draft).unwrap())
             .unwrap();
         assert_eq!(serde_json::to_value(persisted.record).unwrap(), document);
+    }
+
+    /// The untagged union must not cost diagnostics: a malformed body on a
+    /// known type surfaces that application's field-level serde error, and an
+    /// unknown type names the variants each application would accept.
+    #[test]
+    fn decode_errors_name_the_field_or_the_known_variants() {
+        let record = |kind: &str, body: serde_json::Value| -> Record {
+            serde_json::from_value(json!({
+                "id": "event-bad",
+                "seq": 1,
+                "at": "2026-07-27T12:00:00Z",
+                "actor": "tester",
+                "type": kind,
+                "body": body,
+                "schema": "alder.event.v0"
+            }))
+            .unwrap()
+        };
+
+        let malformed = decode_record(&record("work.finished", json!({"work_id": 7})))
+            .unwrap_err()
+            .message;
+        assert!(
+            malformed.contains("work.finished") && malformed.contains("expected a string"),
+            "{malformed}"
+        );
+
+        let unknown = decode_record(&record("observation.snoozed", json!({})))
+            .unwrap_err()
+            .message;
+        assert!(
+            unknown.contains("unknown variant")
+                && unknown.contains("observation.reported")
+                && unknown.contains("work.changed"),
+            "{unknown}"
+        );
     }
 
     #[test]

@@ -14,6 +14,19 @@ use crate::{
     error::{AlderError, Result},
 };
 
+/// The one seam left by moving `AlderError` beneath this crate: a foreign
+/// `From<rusqlite::Error>` impl is no longer possible, so database results are
+/// mapped here with exactly the conversion that impl performed.
+trait Db<T> {
+    fn db(self) -> Result<T>;
+}
+
+impl<T> Db<T> for rusqlite::Result<T> {
+    fn db(self) -> Result<T> {
+        self.map_err(|error| AlderError::new("database_error", error.to_string()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Projection {
     path: PathBuf,
@@ -46,10 +59,12 @@ impl Projection {
     pub fn verify(&self, head: &Head, state: &ProjectState) -> Result<Value> {
         let connection = self.connection()?;
         let represented = represented_head(&connection)?;
-        let work_count: u64 =
-            connection.query_row("SELECT count(*) FROM work_current", [], |row| row.get(0))?;
-        let attempt_count: u64 =
-            connection.query_row("SELECT count(*) FROM attempts", [], |row| row.get(0))?;
+        let work_count: u64 = connection
+            .query_row("SELECT count(*) FROM work_current", [], |row| row.get(0))
+            .db()?;
+        let attempt_count: u64 = connection
+            .query_row("SELECT count(*) FROM attempts", [], |row| row.get(0))
+            .db()?;
         let valid = represented.as_ref() == Some(head)
             && work_count == state.work.len() as u64
             && attempt_count == state.attempts.len() as u64;
@@ -86,8 +101,9 @@ impl Projection {
         let connection = Connection::open_with_flags(
             &self.path,
             OpenFlags::SQLITE_OPEN_READ_ONLY.union(OpenFlags::SQLITE_OPEN_NO_MUTEX),
-        )?;
-        let mut statement = connection.prepare(sql)?;
+        )
+        .db()?;
+        let mut statement = connection.prepare(sql).db()?;
         if !statement.readonly() {
             return Err(AlderError::new(
                 "read_only_query",
@@ -99,12 +115,12 @@ impl Projection {
             .iter()
             .map(|name| name.to_string())
             .collect();
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query([]).db()?;
         let mut values = Vec::new();
-        while let Some(row) = rows.next()? {
+        while let Some(row) = rows.next().db()? {
             let mut object = serde_json::Map::new();
             for (index, name) in columns.iter().enumerate() {
-                object.insert(name.clone(), sql_value(row.get_ref(index)?));
+                object.insert(name.clone(), sql_value(row.get_ref(index).db()?));
             }
             values.push(Value::Object(object));
         }
@@ -115,20 +131,24 @@ impl Projection {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut connection = Connection::open(&self.path)?;
+        let mut connection = Connection::open(&self.path).db()?;
         // Foreign keys are a connection setting, so they are set outside the
         // transaction that follows.
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.pragma_update(None, "foreign_keys", "ON").db()?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .db()?;
         // Opening drops and recreates every view, so two processes opening at
         // once would otherwise interleave those statements and one would find
         // a view the other had already recreated. One writer at a time makes
         // the whole setup a single step; the busy timeout makes the second
         // wait for it rather than fail.
-        let setup = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let setup = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .db()?;
         reset_if_schema_changed(&setup)?;
         create_schema(&setup)?;
-        setup.commit()?;
+        setup.commit().db()?;
         Ok(connection)
     }
 }
@@ -140,12 +160,15 @@ impl Projection {
 const SCHEMA_VERSION: i64 = 6;
 
 fn reset_if_schema_changed(connection: &Connection) -> Result<()> {
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .db()?;
     if version == SCHEMA_VERSION {
         return Ok(());
     }
-    connection.execute_batch(
-        "
+    connection
+        .execute_batch(
+            "
         DROP TABLE IF EXISTS projection_meta;
         DROP VIEW IF EXISTS handoffs_submitted;
         DROP TABLE IF EXISTS events;
@@ -167,14 +190,18 @@ fn reset_if_schema_changed(connection: &Connection) -> Result<()> {
         DROP TABLE IF EXISTS observed_handles;
         DROP TABLE IF EXISTS observation_runs;
         ",
-    )?;
-    connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        )
+        .db()?;
+    connection
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .db()?;
     Ok(())
 }
 
 fn create_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(
-        "
+    connection
+        .execute_batch(
+            "
         CREATE TABLE IF NOT EXISTS projection_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -299,7 +326,8 @@ fn create_schema(connection: &Connection) -> Result<()> {
             )
             SELECT DISTINCT root_id, work_id FROM graph;
         ",
-    )?;
+        )
+        .db()?;
     Ok(())
 }
 
@@ -310,14 +338,16 @@ fn represented_head(connection: &Connection) -> Result<Option<Head>> {
             [],
             |row| row.get(0),
         )
-        .optional()?;
+        .optional()
+        .db()?;
     let seq: Option<String> = connection
         .query_row(
             "SELECT value FROM projection_meta WHERE key = 'seq'",
             [],
             |row| row.get(0),
         )
-        .optional()?;
+        .optional()
+        .db()?;
     match (revision, seq) {
         (None, None) => Ok(None),
         (Some(revision), Some(seq)) => Ok(Some(Head::try_from_parts(
@@ -339,9 +369,10 @@ fn rebuild(
     events: &[Event],
     state: &ProjectState,
 ) -> Result<()> {
-    let transaction = connection.transaction()?;
-    transaction.execute_batch(
-        "
+    let transaction = connection.transaction().db()?;
+    transaction
+        .execute_batch(
+            "
         DELETE FROM loop_control;
         DELETE FROM question_answers;
         DELETE FROM questions;
@@ -353,147 +384,170 @@ fn rebuild(
         DELETE FROM events;
         DELETE FROM projection_meta;
         ",
-    )?;
+        )
+        .db()?;
     insert_events(&transaction, events)?;
     insert_state(&transaction, state)?;
-    transaction.execute(
-        "INSERT INTO projection_meta(key, value) VALUES ('revision', ?1)",
-        [head.revision().unwrap_or("")],
-    )?;
-    transaction.execute(
-        "INSERT INTO projection_meta(key, value) VALUES ('seq', ?1)",
-        [head.sequence().to_string()],
-    )?;
-    transaction.commit()?;
+    transaction
+        .execute(
+            "INSERT INTO projection_meta(key, value) VALUES ('revision', ?1)",
+            [head.revision().unwrap_or("")],
+        )
+        .db()?;
+    transaction
+        .execute(
+            "INSERT INTO projection_meta(key, value) VALUES ('seq', ?1)",
+            [head.sequence().to_string()],
+        )
+        .db()?;
+    transaction.commit().db()?;
     Ok(())
 }
 
 fn insert_events(transaction: &Transaction<'_>, events: &[Event]) -> Result<()> {
     for event in events {
-        transaction.execute(
-            "INSERT INTO events(seq, id, at, actor, type, body_json)
+        transaction
+            .execute(
+                "INSERT INTO events(seq, id, at, actor, type, body_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                event.seq,
-                event.id,
-                event.at.to_rfc3339(),
-                event.actor,
-                event.payload.type_name(),
-                serde_json::to_string(&event.payload)?,
-            ],
-        )?;
+                params![
+                    event.seq,
+                    event.id,
+                    event.at.to_rfc3339(),
+                    event.actor,
+                    event.payload.type_name(),
+                    serde_json::to_string(&event.payload)?,
+                ],
+            )
+            .db()?;
     }
     Ok(())
 }
 
 fn insert_state(transaction: &Transaction<'_>, state: &ProjectState) -> Result<()> {
     for work in state.work.values() {
-        transaction.execute(
-            "INSERT INTO work_current
+        transaction
+            .execute(
+                "INSERT INTO work_current
              (id, title, spec, priority, state, block_reason, block_until, outcome,
               opened_seq, changed_seq)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                work.id,
-                work.title,
-                work.spec,
-                work.priority,
-                enum_json(work.state)?,
-                work.block_reason,
-                work.block_until.map(|until| until.to_rfc3339()),
-                work.outcome,
-                work.opened_seq,
-                work.changed_seq,
-            ],
-        )?;
+                params![
+                    work.id,
+                    work.title,
+                    work.spec,
+                    work.priority,
+                    enum_json(work.state)?,
+                    work.block_reason,
+                    work.block_until.map(|until| until.to_rfc3339()),
+                    work.outcome,
+                    work.opened_seq,
+                    work.changed_seq,
+                ],
+            )
+            .db()?;
         for required in &work.requires {
-            transaction.execute(
-                "INSERT INTO dependencies(work_id, required_id) VALUES (?1, ?2)",
-                params![work.id, required],
-            )?;
+            transaction
+                .execute(
+                    "INSERT INTO dependencies(work_id, required_id) VALUES (?1, ?2)",
+                    params![work.id, required],
+                )
+                .db()?;
         }
         for check in &work.checks {
-            transaction.execute(
-                "INSERT INTO work_checks(work_id, key, description) VALUES (?1, ?2, ?3)",
-                params![work.id, check.key, check.description],
-            )?;
+            transaction
+                .execute(
+                    "INSERT INTO work_checks(work_id, key, description) VALUES (?1, ?2, ?3)",
+                    params![work.id, check.key, check.description],
+                )
+                .db()?;
         }
     }
     for attempt in state.attempts.values() {
-        transaction.execute(
-            "INSERT INTO attempts
+        transaction
+            .execute(
+                "INSERT INTO attempts
              (id, work_id, state, outcome, tier, handle, metadata, note, started_seq, bound_seq,
               updated_seq, ended_seq)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                attempt.id,
-                attempt.work_id,
-                enum_json(attempt.state)?,
-                attempt.outcome.map(enum_json).transpose()?,
-                attempt.tier,
-                attempt.handle,
-                serde_json::to_string(&attempt.metadata)?,
-                attempt.note,
-                attempt.started_seq,
-                attempt.bound_seq,
-                attempt.updated_seq,
-                attempt.ended_seq,
-            ],
-        )?;
-        for check in attempt.checks.values() {
-            transaction.execute(
-                "INSERT INTO attempt_checks(attempt_id, key, status, evidence, updated_seq)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     attempt.id,
-                    check.key,
-                    enum_json(check.status)?,
-                    check.evidence,
-                    check.updated_seq,
+                    attempt.work_id,
+                    enum_json(attempt.state)?,
+                    attempt.outcome.map(enum_json).transpose()?,
+                    attempt.tier,
+                    attempt.handle,
+                    serde_json::to_string(&attempt.metadata)?,
+                    attempt.note,
+                    attempt.started_seq,
+                    attempt.bound_seq,
+                    attempt.updated_seq,
+                    attempt.ended_seq,
                 ],
-            )?;
+            )
+            .db()?;
+        for check in attempt.checks.values() {
+            transaction
+                .execute(
+                    "INSERT INTO attempt_checks(attempt_id, key, status, evidence, updated_seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        attempt.id,
+                        check.key,
+                        enum_json(check.status)?,
+                        check.evidence,
+                        check.updated_seq,
+                    ],
+                )
+                .db()?;
         }
     }
     for question in state.questions.values() {
         insert_question(transaction, question)?;
     }
     let control = &state.loop_control;
-    transaction.execute(
-        "INSERT INTO loop_control
+    transaction
+        .execute(
+            "INSERT INTO loop_control
          (id, paused, pause_reason, engine, rotate_requested_seq, nudge_requested_seq)
          VALUES (0, ?1, ?2, ?3, ?4, ?5)",
-        params![
-            control.paused as i64,
-            control.pause_reason,
-            control.engine,
-            control.rotate_requested_seq,
-            control.nudge_requested_seq,
-        ],
-    )?;
+            params![
+                control.paused as i64,
+                control.pause_reason,
+                control.engine,
+                control.rotate_requested_seq,
+                control.nudge_requested_seq,
+            ],
+        )
+        .db()?;
     Ok(())
 }
 
 fn insert_question(transaction: &Transaction<'_>, question: &Question) -> Result<()> {
-    transaction.execute(
-        "INSERT INTO questions
+    transaction
+        .execute(
+            "INSERT INTO questions
          (id, work_id, text, answer, asked_seq, answered_seq, answered_by)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            question.id,
-            question.work_id,
-            question.text,
-            question.answer,
-            question.asked_seq,
-            question.answered_seq,
-            question.answered_by,
-        ],
-    )?;
+            params![
+                question.id,
+                question.work_id,
+                question.text,
+                question.answer,
+                question.asked_seq,
+                question.answered_seq,
+                question.answered_by,
+            ],
+        )
+        .db()?;
     for answer in &question.answers {
-        transaction.execute(
-            "INSERT INTO question_answers(question_id, seq, answer, actor)
+        transaction
+            .execute(
+                "INSERT INTO question_answers(question_id, seq, answer, actor)
              VALUES (?1, ?2, ?3, ?4)",
-            params![question.id, answer.seq, answer.answer, answer.actor],
-        )?;
+                params![question.id, answer.seq, answer.answer, answer.actor],
+            )
+            .db()?;
     }
     Ok(())
 }

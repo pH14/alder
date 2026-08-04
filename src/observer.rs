@@ -9,7 +9,7 @@ use std::{
 
 use chrono::Utc;
 use rustix::process::{Pid, Signal, kill_process_group};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use wait_timeout::ChildExt;
 
@@ -18,6 +18,8 @@ use crate::{
     domain::{AttemptState, ObservationKey, ProjectState, WorkState},
     error::{AlderError, Result},
 };
+pub use alder_observation::{NormalizedObject, ObservationChange};
+use alder_observation::{bounded, validate_output, validate_probe_output};
 
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_EXECUTIONS: usize = 4;
@@ -44,25 +46,6 @@ pub struct ExecutionResult {
     pub timed_out: bool,
     pub stderr: String,
     pub validation_error: Option<String>,
-}
-
-/// One current level reported by an observer script. For `liveness` rows the
-/// subject is the opaque handle exactly as the runner bound it; for every
-/// other field the subject is stored verbatim as the observation subject.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NormalizedObject {
-    pub subject: String,
-    pub field: String,
-    pub level: String,
-}
-
-/// One planned change to the durable observation picture: a level to report,
-/// or — when `level` is `None` — a key to retire.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObservationChange {
-    pub key: ObservationKey,
-    pub level: Option<String>,
 }
 
 /// The observation changes one successful `list` run implies, as a pure
@@ -458,71 +441,10 @@ fn handle_kill_result(result: rustix::io::Result<()>) -> Result<()> {
     }
 }
 
-fn validate_output(bytes: &[u8]) -> Result<Vec<NormalizedObject>> {
-    let objects: Vec<NormalizedObject> = serde_json::from_slice(bytes).map_err(|error| {
-        AlderError::with_context(
-            "invalid_observation",
-            format!("standard output is not one normalized JSON array: {error}"),
-            json!({"line": error.line(), "column": error.column()}),
-        )
-    })?;
-    let mut keys = BTreeSet::new();
-    for object in &objects {
-        if object.subject.trim().is_empty() {
-            return Err(AlderError::new(
-                "invalid_observation",
-                "an observation subject cannot be empty",
-            ));
-        }
-        if object.field.trim().is_empty() || object.level.trim().is_empty() {
-            return Err(AlderError::new(
-                "invalid_observation",
-                "an observation field and level cannot be empty",
-            ));
-        }
-        if !keys.insert((&object.subject, &object.field)) {
-            return Err(AlderError::with_context(
-                "invalid_observation",
-                format!(
-                    "duplicate observation key `{}` / `{}`",
-                    object.subject, object.field
-                ),
-                json!({"subject": object.subject, "field": object.field}),
-            ));
-        }
-    }
-    Ok(objects)
-}
-
-/// A probe answers with exactly one word — `present`, `absent`, or
-/// `unknown` — surrounded by nothing but whitespace. Anything else is an
-/// invalid execution and retries like malformed `list` output.
-fn validate_probe_output(bytes: &[u8]) -> Result<String> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| AlderError::new("invalid_observation", "a probe answer must be UTF-8 text"))?;
-    match text.trim() {
-        answer @ ("present" | "absent" | "unknown") => Ok(answer.to_owned()),
-        other => Err(AlderError::with_context(
-            "invalid_observation",
-            "a probe must answer exactly one of `present`, `absent`, or `unknown`",
-            json!({"answer": bounded(other.as_bytes(), 80)}),
-        )),
-    }
-}
-
 fn read_all(mut reader: impl Read) -> Vec<u8> {
     let mut bytes = Vec::new();
     let _ = reader.read_to_end(&mut bytes);
     bytes
-}
-
-fn bounded(bytes: &[u8], limit: usize) -> String {
-    let value = String::from_utf8_lossy(bytes);
-    let mut output: String = value.chars().take(limit).collect();
-    if value.chars().count() > limit {
-        output.push('…');
-    }
-    output
 }
 
 #[derive(Debug, Clone, Serialize)]

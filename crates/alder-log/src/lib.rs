@@ -6,6 +6,7 @@
 //! reconsider after a head conflict. Stable record IDs resolve lost responses.
 //! The API is synchronous and the Git implementation invokes the `git` executable.
 
+pub mod alder_error;
 mod error;
 mod git;
 mod memory;
