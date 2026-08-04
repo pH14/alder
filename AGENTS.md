@@ -42,10 +42,12 @@ same decision from the same log.
 ## Intent before effects
 
 The record of an intent is appended *before* the effect it describes:
-`attempt.started` before a worker is launched, `loop wake` before a leader is
-prompted. Flag the inverted order, and flag a new effect that acquires no such
-record. Both crash windows must stay repairable, and the repair must be
-sayable in ordinary commands.
+`attempt.started` before a worker is launched. Flag the inverted order, and
+flag a new effect that acquires no such record — with one deliberate
+exception: a wake has no record at all, because the log never mentions its
+own readers. The loop's crash story is idempotence instead of repair: a
+missed or duplicated wake must stay harmless, and flag anything that makes a
+wake carry state a crash could strand.
 
 ## Repairs are adoptive over their own residue
 
@@ -53,17 +55,17 @@ A repair takes over what a previous run left rather than duplicating it:
 `spawn` adopts an open unbound attempt instead of opening a second one, a
 later caller adopts a live execution whose attempt is still active, `init`
 re-run against a compatible manifest changes nothing at all. Flag any repair
-that, run twice, leaves two of something — two attempts, two sessions, two
-passes — or that fails on its own leftovers instead of converging on them.
+that, run twice, leaves two of something — two attempts, two sessions — or
+that fails on its own leftovers instead of converging on them.
 
 ## One at a time
 
-At most one active attempt per work item; at most one open pass per loop. The
-parent creates, because only the parent knows whether another is allowed; the
-record closes itself, because by then it exists. Flag a second launch that
-hides the first, and flag any path that ends a durable record before the
-external thing behind it is confirmed stopped — an ended attempt with a live
-worker is untracked, which is worse than an honest orphan.
+At most one active attempt per work item. The parent creates, because only
+the parent knows whether another is allowed; the record closes itself,
+because by then it exists. Flag a second launch that hides the first, and
+flag any path that ends a durable record before the external thing behind it
+is confirmed stopped — an ended attempt with a live worker is untracked,
+which is worse than an honest orphan.
 
 ## Sleeping is not coordination
 

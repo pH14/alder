@@ -50,14 +50,14 @@ mod tests {
     fn codes_are_carried_through_and_matchable() {
         let plain = DriverError::new("tmux is missing");
         assert_eq!(plain.to_string(), "tmux is missing");
-        assert!(!plain.is("pass_open"));
+        assert!(!plain.is("store_unavailable"));
 
-        let coded = DriverError::coded("pass_open", "pass `hm-pass-1` is still open");
+        let coded = DriverError::coded("store_unavailable", "the remote is unreachable");
         assert_eq!(
             coded.to_string(),
-            "[pass_open] pass `hm-pass-1` is still open"
+            "[store_unavailable] the remote is unreachable"
         );
-        assert!(coded.is("pass_open"));
-        assert!(!coded.is("store_unavailable"));
+        assert!(coded.is("store_unavailable"));
+        assert!(!coded.is("legacy_event"));
     }
 }
