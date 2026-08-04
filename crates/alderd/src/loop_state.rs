@@ -4,10 +4,15 @@ use serde_json::Value;
 
 use crate::error::{DriverError, Result};
 
-/// The loop section of `alder status --json`, plus the head that document
-/// reported. This is the driver's complete view of the durable log: it never
-/// reads work, attempts, or questions, because deciding anything about them
-/// would be judgment.
+/// The driver's read of the loop section of `alder status --json`, plus the
+/// head that document reported. This is the driver's complete view of the
+/// durable log: it never reads work, attempts, or questions, because deciding
+/// anything about them would be judgment.
+///
+/// Only the fields the driver's own triggers consume are parsed. The loop
+/// section carries more — the desired engine, the rotation request — but
+/// those belong to the configured command now, which reads status itself;
+/// parsing them here would be knowledge without a use.
 ///
 /// Everything here is a durable statement about the loop. Nothing records
 /// whether this driver has acted on any of it — the log never mentions its
@@ -26,20 +31,9 @@ pub struct LoopState {
     pub head: u64,
     #[serde(default)]
     pub paused: bool,
-    #[serde(default)]
-    pub pause_reason: Option<String>,
-    #[serde(default)]
-    pub engine: Option<String>,
-    /// The sequence of the latest rotation request, if any was ever made.
-    #[serde(default)]
-    pub rotate_requested_seq: Option<u64>,
     /// The sequence of the latest nudge request, if any was ever made.
     #[serde(default)]
     pub nudge_requested_seq: Option<u64>,
-    /// The earliest `work block --until` deadline any blocked item carries:
-    /// the loop's next review rendezvous, kept for the human status line.
-    #[serde(default)]
-    pub review_at: Option<DateTime<Utc>>,
     /// Every blocked item's `work block --until` deadline, sorted. The due
     /// trigger checks each one: an item still blocked past its own deadline
     /// must not swallow the wake a later deadline is owed.
@@ -89,14 +83,7 @@ mod tests {
         let state = LoopState::from_status(&status).unwrap();
         assert_eq!(state.head, 42);
         assert!(state.paused);
-        assert_eq!(state.pause_reason.as_deref(), Some("release freeze"));
-        assert_eq!(state.engine.as_deref(), Some("codex"));
-        assert_eq!(state.rotate_requested_seq, Some(17));
         assert_eq!(state.nudge_requested_seq, Some(41));
-        assert_eq!(
-            state.review_at.unwrap().to_rfc3339(),
-            "2026-08-04T15:00:00+00:00"
-        );
         assert_eq!(
             state
                 .review_deadlines
@@ -113,8 +100,7 @@ mod tests {
         }))
         .unwrap();
         assert!(!empty.paused);
-        assert!(empty.rotate_requested_seq.is_none());
-        assert!(empty.review_at.is_none());
+        assert!(empty.nudge_requested_seq.is_none());
         assert!(empty.review_deadlines.is_empty());
 
         assert!(LoopState::from_status(&json!({"head": 1})).is_err());

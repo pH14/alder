@@ -3,7 +3,7 @@ name = "alderd"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "A token-free daemon that decides when to wake an Alder executor agent"
+description = "A token-free daemon that watches the Alder log and runs a configured command when it moves"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }

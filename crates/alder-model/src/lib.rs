@@ -2,18 +2,17 @@
 //!
 //! The model checks the wake protocol under every interleaving of a small
 //! cast: the shared CAS log, the daemon's decide loop with its machine-local
-//! notes, the executor engine it wakes, and an optional second writer (a phone
-//! session). It deliberately reuses the real implementation wherever the
-//! implementation is a pure function of a snapshot:
+//! notes, the executor behind the command it runs, and an optional second
+//! writer (a phone session). It deliberately reuses the real implementation
+//! wherever the implementation is a pure function of a snapshot:
 //!
 //! - the log is a real [`MemoryLog`], so append semantics are the shipped
 //!   resolution order, not a re-telling;
 //! - records are encoded and decoded through the real codec, and every state
 //!   is interpreted by the real [`ProjectState::fold`];
 //! - the daemon reads the log through the real `loop_section` projection and
-//!   the real [`LoopState`] parser, and judges with the real [`decide`],
-//!   [`resolve_engine`][decide::resolve_engine], and
-//!   [`session_action`][decide::session_action] over real [`Notes`];
+//!   the real [`LoopState`] parser, and judges with the real [`decide`] over
+//!   real [`Notes`];
 //! - and the safety properties are the shared sentences from
 //!   [`alder::domain::invariants`][invariants], which the crash simulator also
 //!   asserts, so the two harnesses cannot drift into meaning different things
@@ -23,11 +22,14 @@
 //! actor: where a process can be interrupted between reading and writing, and
 //! what a crash erases. The central claim is stated by the shape of the model
 //! itself: the daemon has no append step, because it appends nothing. A wake
-//! is an injection plus a notes write, both outside the log, so the crash
-//! windows are "delivered but not noted" (a duplicate wake) and "noted state
-//! lost" (also a duplicate wake) — and every property holds through both,
+//! is one command run plus a notes write, both outside the log, so the crash
+//! windows are "command ran but not noted" (a duplicate run) and "noted state
+//! lost" (also a duplicate run) — and every property holds through both,
 //! which is what "passes are idempotent and nothing durable records them"
-//! means, checked. See README.md for the bounds and the findings.
+//! means, checked. Since the execution extraction the daemon holds no session
+//! knowledge at all: what the command does with its wake — engines, panes,
+//! rotation — belongs to the command, so none of it is a daemon transition
+//! here. See README.md for the bounds and the findings.
 
 use std::hash::{Hash, Hasher};
 
@@ -38,7 +40,7 @@ use alder::domain::{
 };
 use alder_log::{Log, MemoryLog, Record, RecordDraft};
 use alderd::config::Config;
-use alderd::decide::{self, Decision, EngineChoice, Notes, Poll, SessionAction, config_for};
+use alderd::decide::{self, Decision, Notes, Poll, config_for};
 use alderd::loop_state::LoopState;
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -59,7 +61,10 @@ const PHONE_ACTOR: &str = "phone";
 /// Which optional actors and faults a run explores, and how far.
 pub struct Scenario {
     pub config: Config,
-    /// The second writer may append one `loop.rotation_requested`.
+    /// The second writer may append one `loop.rotation_requested`. The
+    /// daemon no longer consumes rotations — the command honors them by
+    /// reading status itself — so here a rotation request is one more append
+    /// that must wake the command exactly like any other writer's.
     pub phone_rotation: bool,
     /// The second writer may pause the loop with a stated reason.
     pub phone_pause: bool,
@@ -69,8 +74,6 @@ pub struct Scenario {
     pub executor_appends: u8,
     /// How many daemon process crashes may be injected.
     pub daemon_crashes: u8,
-    /// How many executor tmux session crashes may be injected.
-    pub session_crashes: u8,
     /// How many times the daemon's notes file may be lost.
     pub notes_losses: u8,
 }
@@ -78,13 +81,12 @@ pub struct Scenario {
 impl Scenario {
     pub fn new() -> Self {
         Self {
-            config: config_for(&[("claude", "claude")]),
+            config: config_for("run-the-executor"),
             phone_rotation: false,
             phone_pause: false,
             phone_work: false,
             executor_appends: 1,
             daemon_crashes: 0,
-            session_crashes: 0,
             notes_losses: 0,
         }
     }
@@ -98,8 +100,7 @@ impl Default for Scenario {
 
 /// The durable state plus every actor's volatile memory. The log is the only
 /// shared truth about the project; the notes are one machine's truth about
-/// itself; the rest models one process's state or the tmux reality the daemon
-/// observes.
+/// itself; the rest models one process's state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProtocolState {
     /// The shared record log, in append order.
@@ -109,9 +110,8 @@ pub struct ProtocolState {
     pub notes: Notes,
     pub daemon: Daemon,
     pub phone: Phone,
-    /// The executor tmux session generation, if one exists.
-    pub tmux: Option<u8>,
-    /// Whether the executor holds a submitted wake line it has not acted on.
+    /// Whether the executor behind the command holds a wake it has not acted
+    /// on.
     pub executor_pending: bool,
     /// Work statements the executor may still append.
     pub executor_appends_left: u8,
@@ -132,7 +132,6 @@ impl Hash for ProtocolState {
             .hash(hasher);
         self.daemon.hash(hasher);
         self.phone.hash(hasher);
-        self.tmux.hash(hasher);
         self.executor_pending.hash(hasher);
         self.executor_appends_left.hash(hasher);
         self.ghosts.hash(hasher);
@@ -142,31 +141,25 @@ impl Hash for ProtocolState {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Daemon {
     pub ctl: DaemonCtl,
-    /// Whether this daemon created the running session generation
-    /// (`driver.rs`'s `self.session`); forgotten on a daemon crash.
-    pub knows_session: Option<u8>,
     /// Remaining daemon process crashes the scenario may inject.
     pub crashes_left: u8,
 }
 
 /// The daemon's position between its atomic steps. The real driver runs
-/// poll-decide-reconcile, then `tmux_send_keys`, then the notes write; a
-/// crash can land between any two of them.
+/// poll-decide, then the command, then the notes write; the command runs
+/// synchronously inside the poll, so the interruptible boundary is between
+/// the completed command and the notes write.
 ///
-/// `Fired` and `Injected` carry the head the decision saw, because that is
-/// what the notes write records. Recomputing it at the write would be noting
-/// a fresher head than the driver acted on.
+/// `Ran` carries the head the decision saw, because that is what the notes
+/// write records. Recomputing it at the write would be noting a fresher head
+/// than the driver acted on.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DaemonCtl {
     Idle,
-    /// Decided `Fire` and reconciled the session; the injection is next.
-    Fired {
-        head: u64,
-    },
-    /// The line was typed and submitted; the notes write is next. A crash
-    /// here is the duplicate-wake window: the executor was handed the line, and
+    /// The command ran to completion; the notes write is next. A crash here
+    /// is the duplicate-run window: the executor was handed the wake, and
     /// nothing anywhere says so.
-    Injected {
+    Ran {
         head: u64,
     },
 }
@@ -183,54 +176,37 @@ pub struct Phone {
 /// state graph acyclic.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Ghosts {
-    /// Sessions ever created; the next generation number.
-    pub sessions_created: u8,
-    /// Executor session crashes injected so far.
-    pub session_crashes: u8,
     /// Notes-file losses injected so far.
     pub notes_lost: u8,
-    /// Wake lines ever submitted at the executor.
+    /// Command runs ever delivered.
     pub wakes_delivered: u8,
-    /// The head the most recent delivery was for, to spot a duplicate.
+    /// The head the most recent run was for, to spot a duplicate.
     pub last_delivered_head: Option<u64>,
-    /// A wake was delivered twice for the same head.
+    /// The command ran twice for the same head.
     pub duplicate_wake: bool,
-    /// A daemon crash landed between the injection and the notes write,
+    /// A daemon crash landed between the command and the notes write,
     /// stranding a delivered wake that nothing anywhere records.
     pub wake_delivered_unnoted: bool,
-    /// Mirror of "a rotation request awaits its consuming act", maintained
-    /// independently of the fold so the two derivations can be compared.
-    pub rotation_pending: bool,
-    /// A fresh session was created after the pending request.
-    pub rotation_performed: bool,
-    /// A notes write consumed a rotation whose restart had already happened.
-    pub rotation_consumed_performed: bool,
-    /// A notes write consumed a rotation that was never performed.
-    pub rotation_lost: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ProtocolAction {
-    /// Poll, decide `Fire`, and reconcile the session (the pre-wake step).
-    DaemonPollFires,
-    /// Type the wake line into the executor's terminal and submit it — the
-    /// driver's `tmux_send_keys`.
-    DaemonInject,
+    /// Poll, decide `Fire`, and run the configured command to completion —
+    /// the driver's synchronous wake, up to but not including the notes
+    /// write.
+    DaemonPollRuns,
     /// Persist the notes: the head just acted on, durably enough for a
     /// restart.
     DaemonNoteWrite,
-    /// The daemon process dies and restarts, forgetting its session memory.
-    /// The notes file survives.
+    /// The daemon process dies and restarts. The notes file survives.
     DaemonCrash,
     /// The machine loses the notes file.
     NotesLost,
-    /// The woken engine reads the fold and acts: appends one work statement,
-    /// or finds nothing demanding and idles.
+    /// The executor behind the command reads the fold and acts: appends one
+    /// work statement, or finds nothing demanding and idles.
     ExecutorActs {
         appends: bool,
     },
-    /// The executor tmux session dies.
-    ExecutorCrash,
     PhoneRotationRequest,
     PhonePause,
     PhoneWorkStatement,
@@ -283,14 +259,12 @@ fn daemon_view(records: &[Record]) -> Option<LoopState> {
     LoopState::from_status(&status).ok()
 }
 
-/// What the daemon observes besides the log and its notes: nothing. No client
-/// is attached, refresh saw no change, and debounce has settled.
+/// What the daemon observes besides the log and its notes: nothing. The
+/// debounce has settled.
 fn observation() -> Poll {
     Poll {
         now: epoch(),
-        refresh_changed: false,
         pending_since: None,
-        attached_client: false,
     }
 }
 
@@ -349,99 +323,34 @@ fn recovered(state: &ProtocolState) -> bool {
 }
 
 impl Scenario {
-    /// The daemon fire path: real decide over real notes, real engine
-    /// resolution, real session reconciliation, in the driver's order —
-    /// session first, notes last, so a crash between them re-rotates or
-    /// re-delivers instead of losing anything.
-    fn daemon_poll_fires(&self, state: &mut ProtocolState) -> Option<()> {
+    /// The daemon fire path: real decide over real notes, then the command,
+    /// in the driver's order — command first, notes last, so a crash between
+    /// them re-runs instead of losing anything.
+    fn daemon_poll_runs(&self, state: &mut ProtocolState) -> Option<()> {
         let view = daemon_view(&state.log)?;
         let Decision::Fire(_) = decide::decide(&self.config, &view, &state.notes, &observation())
         else {
             return None;
         };
-        let EngineChoice::Run(engine) = decide::resolve_engine(&self.config, &view) else {
-            return None;
-        };
-        let known = state.daemon.knows_session.and_then(|generation| {
-            (state.tmux == Some(generation)).then(|| decide::Session {
-                engine: engine.clone(),
-                pass_doc_hash: 0,
-                created_at: epoch(),
-            })
-        });
-        let action = decide::session_action(
-            &self.config,
-            decide::rotate_pending(&view, &state.notes),
-            &engine,
-            0,
-            state.tmux.is_some(),
-            known.as_ref(),
-            epoch(),
-        );
-        match action {
-            SessionAction::Reuse => {}
-            SessionAction::Restart(_) | SessionAction::Create => {
-                state.ghosts.sessions_created += 1;
-                let generation = state.ghosts.sessions_created;
-                state.tmux = Some(generation);
-                state.daemon.knows_session = Some(generation);
-                // The pane died with whatever line it held.
-                state.executor_pending = false;
-                if state.ghosts.rotation_pending {
-                    state.ghosts.rotation_performed = true;
-                }
-            }
-        }
-        state.daemon.ctl = DaemonCtl::Fired {
-            head: state.log.len() as u64,
-        };
-        Some(())
-    }
-
-    fn daemon_inject(state: &mut ProtocolState) -> Option<()> {
-        let DaemonCtl::Fired { head } = state.daemon.ctl else {
-            return None;
-        };
-        if state.tmux.is_none() {
-            // The session died between the reconcile and the send. The real
-            // send fails, the poll errors, and nothing was noted: the next
-            // poll starts over.
-            state.daemon.ctl = DaemonCtl::Idle;
-            return Some(());
-        }
+        let head = state.log.len() as u64;
         state.executor_pending = true;
         state.ghosts.wakes_delivered += 1;
         if state.ghosts.last_delivered_head == Some(head) {
             state.ghosts.duplicate_wake = true;
         }
         state.ghosts.last_delivered_head = Some(head);
-        state.daemon.ctl = DaemonCtl::Injected { head };
+        state.daemon.ctl = DaemonCtl::Ran { head };
         Some(())
     }
 
     fn daemon_note_write(state: &mut ProtocolState) -> Option<()> {
-        let DaemonCtl::Injected { head } = state.daemon.ctl else {
+        let DaemonCtl::Ran { head } = state.daemon.ctl else {
             return None;
         };
         state.notes = Notes {
             last_head: head,
             last_wake_at: Some(epoch()),
         };
-        // Acting consumed any request at or before the noted head.
-        if state.ghosts.rotation_pending {
-            let consumed = fold(&state.log)
-                .and_then(|project| project.loop_control.rotate_requested_seq)
-                .is_some_and(|requested| requested <= head);
-            if consumed {
-                if state.ghosts.rotation_performed {
-                    state.ghosts.rotation_consumed_performed = true;
-                } else {
-                    state.ghosts.rotation_lost = true;
-                }
-                state.ghosts.rotation_pending = false;
-                state.ghosts.rotation_performed = false;
-            }
-        }
         state.daemon.ctl = DaemonCtl::Idle;
         Some(())
     }
@@ -457,7 +366,6 @@ impl Model for Scenario {
             notes: Notes::default(),
             daemon: Daemon {
                 ctl: DaemonCtl::Idle,
-                knows_session: None,
                 crashes_left: self.daemon_crashes,
             },
             phone: Phone {
@@ -465,7 +373,6 @@ impl Model for Scenario {
                 pause_left: self.phone_pause,
                 work_left: self.phone_work,
             },
-            tmux: None,
             executor_pending: false,
             executor_appends_left: self.executor_appends,
             ghosts: Ghosts::default(),
@@ -487,11 +394,10 @@ impl Model for Scenario {
                         Decision::Fire(_)
                     )
                 {
-                    actions.push(ProtocolAction::DaemonPollFires);
+                    actions.push(ProtocolAction::DaemonPollRuns);
                 }
             }
-            DaemonCtl::Fired { .. } => actions.push(ProtocolAction::DaemonInject),
-            DaemonCtl::Injected { .. } => actions.push(ProtocolAction::DaemonNoteWrite),
+            DaemonCtl::Ran { .. } => actions.push(ProtocolAction::DaemonNoteWrite),
         }
         if state.daemon.crashes_left > 0 {
             actions.push(ProtocolAction::DaemonCrash);
@@ -500,14 +406,11 @@ impl Model for Scenario {
             actions.push(ProtocolAction::NotesLost);
         }
 
-        if state.executor_pending && state.tmux.is_some() {
+        if state.executor_pending {
             actions.push(ProtocolAction::ExecutorActs { appends: false });
             if state.executor_appends_left > 0 {
                 actions.push(ProtocolAction::ExecutorActs { appends: true });
             }
-        }
-        if state.tmux.is_some() && state.ghosts.session_crashes < self.session_crashes {
-            actions.push(ProtocolAction::ExecutorCrash);
         }
 
         if state.phone.rotation_left {
@@ -524,41 +427,21 @@ impl Model for Scenario {
     fn next_state(&self, last: &Self::State, action: Self::Action) -> Option<Self::State> {
         let mut state = last.clone();
         match action {
-            ProtocolAction::DaemonPollFires => self.daemon_poll_fires(&mut state)?,
-            ProtocolAction::DaemonInject => Self::daemon_inject(&mut state)?,
+            ProtocolAction::DaemonPollRuns => self.daemon_poll_runs(&mut state)?,
             ProtocolAction::DaemonNoteWrite => Self::daemon_note_write(&mut state)?,
             ProtocolAction::DaemonCrash => {
-                if matches!(state.daemon.ctl, DaemonCtl::Injected { .. }) {
+                if matches!(state.daemon.ctl, DaemonCtl::Ran { .. }) {
                     state.ghosts.wake_delivered_unnoted = true;
                 }
                 state.daemon.ctl = DaemonCtl::Idle;
-                state.daemon.knows_session = None;
                 state.daemon.crashes_left -= 1;
             }
             ProtocolAction::NotesLost => {
                 state.notes = Notes::default();
                 state.ghosts.notes_lost += 1;
-                // With the notes gone, every recorded request looks
-                // outstanding again from this machine's point of view. A
-                // request that was genuinely still pending keeps its ghost
-                // state untouched. One that had already been consumed comes
-                // back as a *phantom*: it re-pends, and — because consumption
-                // only ever follows a restart, the ordering this ghost
-                // audits — the fresh session that answered it still exists,
-                // so it re-pends as already performed. The daemon may rotate
-                // once more for it, which is redundant and harmless; what it
-                // can never do is consume a rotation nobody performed.
-                if !state.ghosts.rotation_pending
-                    && fold(&state.log)
-                        .and_then(|project| project.loop_control.rotate_requested_seq)
-                        .is_some()
-                {
-                    state.ghosts.rotation_pending = true;
-                    state.ghosts.rotation_performed = true;
-                }
             }
             ProtocolAction::ExecutorActs { appends } => {
-                if !state.executor_pending || state.tmux.is_none() {
+                if !state.executor_pending {
                     return None;
                 }
                 if appends {
@@ -576,12 +459,6 @@ impl Model for Scenario {
                 }
                 state.executor_pending = false;
             }
-            ProtocolAction::ExecutorCrash => {
-                state.tmux = None;
-                state.ghosts.session_crashes += 1;
-                // The session took its pending line with it.
-                state.executor_pending = false;
-            }
             ProtocolAction::PhoneRotationRequest => {
                 let draft = typed_draft(
                     "phone-rotate-1",
@@ -590,8 +467,6 @@ impl Model for Scenario {
                 );
                 state.log = append_now(&state.log, &draft);
                 state.phone.rotation_left = false;
-                state.ghosts.rotation_pending = true;
-                state.ghosts.rotation_performed = false;
             }
             ProtocolAction::PhonePause => {
                 let draft = typed_draft(
@@ -618,9 +493,9 @@ impl Model for Scenario {
         // `alder::domain::invariants` rather than restating the predicate
         // here, so this model and the crash simulator cannot drift into
         // meaning different things by "correct" while both stay green.
-        // Everything below them — liveness, the ghost audit, and every
-        // `sometimes` — is a claim about reachability across a state space,
-        // which only a model checker has, and stays local on purpose.
+        // Everything below them — liveness and every `sometimes` — is a claim
+        // about reachability across a state space, which only a model checker
+        // has, and stays local on purpose.
         let mut properties = vec![
             Property::<Self>::always("every reachable log folds cleanly", |_, state| {
                 invariants::log_folds_cleanly(&state.log)
@@ -644,30 +519,9 @@ impl Model for Scenario {
                     !enabled.is_empty() || recovered(state)
                 },
             ),
-            // Not a protocol predicate: an audit of this model's own
-            // bookkeeping. Several `sometimes` properties and the rotation
-            // ordering claim are derived from the ghost mirror, so a mirror
-            // that drifted would let them report on a rotation log nobody
-            // has. Checking it against the fold keeps them honest.
-            Property::<Self>::always("the rotation ghost tracks the fold", |_, state| {
-                fold(&state.log).is_some_and(|project| {
-                    let pending = project
-                        .loop_control
-                        .rotate_requested_seq
-                        .is_some_and(|requested| requested > state.notes.last_head);
-                    pending == state.ghosts.rotation_pending
-                })
-            }),
-            // The rotation ordering guarantee: acting consumes a rotation
-            // only after a restart performed it, whatever crashed in between.
-            // There is no racing waker anymore — a wake is not an append — so
-            // this holds unconditionally.
-            Property::<Self>::always("a consumed rotation was performed first", |_, state| {
-                !state.ghosts.rotation_lost
-            }),
         ];
         if self.daemon_crashes > 0 {
-            // The duplicate-wake window, and its harmlessness. Both are
+            // The duplicate-run window, and its harmlessness. Both are
             // `sometimes` because a window nobody enters proves nothing: the
             // model has to actually strand a delivered wake before "and
             // nothing broke" means anything — the `always` properties above
@@ -677,32 +531,32 @@ impl Model for Scenario {
                 |_, state| state.ghosts.wake_delivered_unnoted,
             ));
             properties.push(Property::<Self>::sometimes(
-                "a wake is delivered twice for the same head",
+                "the command runs twice for the same head",
                 |_, state| state.ghosts.duplicate_wake,
+            ));
+            properties.push(Property::<Self>::sometimes(
+                "a daemon crash is exercised",
+                |model, state| state.daemon.crashes_left < model.daemon_crashes,
             ));
         }
         if self.notes_losses > 0 {
             properties.push(Property::<Self>::sometimes(
-                "lost notes cost a duplicate wake and nothing else",
+                "lost notes cost a duplicate run and nothing else",
                 |_, state| state.ghosts.notes_lost > 0 && state.ghosts.duplicate_wake,
             ));
         }
         if self.phone_rotation {
+            // The daemon no longer consumes rotations; what is checked is
+            // that a rotation request wakes the command like any other
+            // append, and the fold keeps serving it for the command to read.
             properties.push(Property::<Self>::sometimes(
-                "a rotation is performed and then consumed",
-                |_, state| state.ghosts.rotation_consumed_performed,
-            ));
-        }
-        if self.session_crashes > 0 {
-            properties.push(Property::<Self>::sometimes(
-                "a session crash is exercised",
-                |_, state| state.ghosts.session_crashes > 0,
-            ));
-        }
-        if self.daemon_crashes > 0 {
-            properties.push(Property::<Self>::sometimes(
-                "a daemon crash is exercised",
-                |model, state| state.daemon.crashes_left < model.daemon_crashes,
+                "a rotation request is served to a woken command",
+                |_, state| {
+                    state.ghosts.wakes_delivered > 0
+                        && fold(&state.log).is_some_and(|project| {
+                            project.loop_control.rotate_requested_seq.is_some()
+                        })
+                },
             ));
         }
         properties
