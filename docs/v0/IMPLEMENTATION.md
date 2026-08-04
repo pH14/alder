@@ -24,8 +24,8 @@ documents intentionally leave open.
   use the specified never-reused per-work ordinal.
 - The SQLite projection stores normalized durable base tables and defines the
   required named projections as tables or views. Rebuild deletes and replaces
-  only durable rows in one transaction; observation inventory and execution
-  summaries are separate tables and survive.
+  every row in one transaction; the projection holds nothing that is not a
+  fold of the log, observations included.
 - CLI metadata values are parsed as JSON scalars or objects when possible and
   otherwise stored as strings. This keeps common `key=value` calls concise
   without assigning meaning to metadata keys.

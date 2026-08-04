@@ -290,7 +290,8 @@ An attempt is one external execution of one work item.
 | `work_id` | Work being attempted |
 | `state` | `starting`, `active`, or `ended` |
 | `outcome` | `succeeded`, `failed`, `cancelled`, `lost`, or `not_started` |
-| `handle` | Optional external handle once bound |
+| `tier` | The runner's rung name, opaque to Alder; explicit null when unset |
+| `handle` | Optional opaque foreign name for the execution, bound once |
 | `metadata` | Open-ended JSON supplied by project skills |
 | `started_seq` | Intent recorded before launch |
 | `bound_seq` | External handle binding |
@@ -299,22 +300,18 @@ An attempt is one external execution of one work item.
 
 There may be at most one active attempt for a work item in v0.
 
-An attempt ID is the effect-boundary fence. External workers should expose the
-attempt ID wherever their environment permits. A later caller adopts an
-existing attempt when both of these are true:
-
-- the attempt is active in Alder;
-- the external execution presents the same attempt ID.
-
-An external execution for an ended or unknown attempt is a collision requiring
-caller action. Alder reports it; observation never kills it merely because it
-was found.
+The attempt is the one joint between judgment and execution: work on one
+side, the handle on the other, the outcome when it closes. The handle and
+the tier are the runner's names, held verbatim; no environment variable,
+stamp, or marker of Alder's is planted in the execution. The connection is
+re-established each sweep by comparing the handle the attempt records with
+the handles an observer lists.
 
 ### Starting
 
-`attempt.started` is appended before launch and may contain project-defined
-metadata. Alder then returns the attempt ID. A repository-tuned skill launches
-the work and stamps the external execution with that ID.
+`attempt.started` is appended before launch and may carry the runner's tier
+name and project-defined metadata. Alder then returns the attempt ID and the
+runner launches the work.
 
 After launch:
 
@@ -365,58 +362,44 @@ untracked worker running.
 
 A later attempt may start only after the prior attempt has ended.
 
-## Handles and metadata
+## Handles, tiers, and metadata
 
-A handle names something outside Alder:
+A handle is an opaque foreign name for something outside Alder — a tmux
+session, a sandbox, a CI run. Alder stores the string a runner hands it,
+compares it for equality, and never parses it: no grammar, no kind prefix,
+no field inside it selects anything. Within a project, the complete handle
+identifies one observed object, because the runner that names its executions
+also supplies the observer that lists them.
 
-`<kind>:<opaque-value>`
+The tier is the runner's rung name for the execution — `luna`, `terra`,
+`sol`, or whatever ladder the runner climbs. Alder validates only that it is
+non-empty; no table of valid tiers exists anywhere in Alder. It is stored so
+a later reader can say "retry this at a higher rung" from the log alone.
 
-The kind is a stable, syntactically valid name used to select an observation
-command. The value is interpreted only by that command. Within a project, the
-complete handle identifies one observed object.
+The direction is deliberately asymmetric: **the log stores the runner's
+names; the runner stores nothing of Alder's.** Work must not know how it is
+executed —
+the same item could be run by an agent in tmux, an agent in a web sandbox,
+or a deterministic script — so no engine name, session kind, or execution
+vocabulary appears in the work schema, and nothing of Alder's is planted in
+the execution environment.
 
-Examples:
+V0 stores at most one primary handle on an attempt. Metadata is open-ended
+JSON. Alder stores and displays it but does not use its keys for readiness,
+completion, conflict detection, or any other core transition. Repository
+skills define useful conventions — review provenance, consult records —
+and own their meaning.
 
-| Kind | Example | Typical role |
-| --- | --- | --- |
-| `tmux` | `tmux:box-17/alder-hm-9a1-attempt-1` | Attempt execution |
-| `codex` | `codex:019f...` | Attempt execution |
-| `github-actions` | `github-actions:owner/repo/run/4212` | Attempt execution |
-| `nimbus` | `nimbus:box-17` | Environment inventory |
-
-Claude Code running inside tmux uses a tmux handle plus metadata such as
-`agent=claude-code`. It earns its own handle kind only if it later exposes a
-stable identity or observation API independent of tmux.
-
-V0 stores at most one primary handle on an attempt. Related objects such as
-its host may be recorded in metadata:
-
-```json
-{
-  "agent": "claude-code",
-  "engine": "opus-5",
-  "host": "nimbus:box-17"
-}
-```
-
-Metadata is open-ended JSON. Alder stores and displays it but does not use its
-keys for readiness, completion, conflict detection, or any other core
-transition. Repository skills define useful conventions. If requested and
-observed values both matter, a skill may use distinct keys such as
-`requested_host` and `host`; Alder does not define a separate request/facts
-model.
-
-Handle validity does not depend on an observation command currently being
-configured. Unknown kinds remain replayable and visible; they simply have no
-fresh observation.
+Handle validity does not depend on any observer currently listing it. A
+handle nothing observes remains replayable and visible; its attempt simply
+has no fresh liveness level.
 
 V0 has no observer plugin system or provider-specific Rust adapter. The
 manifest's `observers` array supplies at most one `list` command for each
-observer name. The name is the first component of every observation key and
-may also coincide with a handle kind.
+observer name. The name is the first component of every observation key.
 
 The command defines its own scope through its arguments, environment, and
-native tool configuration. If several scopes contribute to one kind, the
+native tool configuration. If several scopes contribute to one observer, the
 command must aggregate them into one complete result. Credentials remain in
 the native environment rather than Alder metadata.
 
@@ -428,17 +411,22 @@ On success, standard output contains exactly one JSON array. Each entry has:
 | `field` | A stable lower-case field name, such as `liveness` or `ci` |
 | `level` | The current value for that key, such as `present` or `passing` |
 
-The configured observer name plus `(subject, field)` is the complete key.
+Rows whose field is `liveness` are statements about execution: their subject
+is a handle exactly as a runner bound it. Refresh reads open attempts and
+their handles from the fold, matches each listed handle by equality, and
+records the level under the attempt's own ID, so the durable key is
+`(observer, attempt-id, liveness)`. A listed handle no live attempt claims
+appends nothing — an unclaimed session is the runner's residue, not a
+statement about work. Rows with any other field are generic observations
+keyed by their subject verbatim.
+
 Duplicate keys, surrounding prose, or any other schema violation invalidates
-the complete result. A successful array is complete for its observer: omitted
-previous keys are retired. The old handle-inventory array is accepted during
-the migration and maps each returned value to `liveness=present` plus an
-`attempt-id` level when it carries one; new scripts must emit level reports
-directly.
+the complete result; the retired handle-inventory shape (`value`,
+`attempt_id`, `metadata`) is no longer valid observer output.
 
 Observation configuration is executable trusted configuration. Alder does not
 interpolate event data or handle values into `list`. Launching remains the
-responsibility of repository-tuned skills.
+runner's responsibility.
 
 ## Acceptance checks
 
@@ -617,14 +605,20 @@ bounded final-execution diagnostics but appends no replacement belief. A
 timeout terminates the complete shell pipeline, not only its parent shell.
 
 After a valid snapshot, each returned level is applied through the observation
-append path and every omitted prior key for that observer is retired.
+append path and every omitted prior key for that observer is retired — except
+a liveness key whose attempt is still active, which becomes an explicit
+`absent` level. A dead worker is a statement the fold must carry: a reader
+with no observer of its own can only learn the death from a level, never from
+silence. The key retires once its attempt ends.
 
 `alder refresh` performs this scheduled ingestion. `alder reconcile` normally
-refreshes first, then compares liveness observations with durable attempts:
+refreshes first, then compares durable attempts with the attempt-keyed
+liveness levels:
 
-- active attempt with its handle present: healthy;
-- active attempt whose handle is omitted from a fresh complete snapshot:
-  possible lost attempt;
+- active attempt whose level is `present`: healthy;
+- active attempt whose level is `absent`: possible lost attempt (`missing`);
+- ended attempt whose level is still `present`: an execution outliving its
+  attempt (`orphan`);
 - unbound starting attempt: launch or end it through an ordinary repair;
 - failed observer command: no new liveness belief and no destructive action.
 

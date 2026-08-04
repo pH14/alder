@@ -45,10 +45,10 @@ Start an attempt, bind its external handle, record a check result with
 evidence, and then end the failed attempt:
 
 ```text
-$ alder work start ex-qq6rkd --meta engine=gpt-5.6-terra --meta reasoning_effort=high
+$ alder work start ex-qq6rkd --tier terra
 ex-qq6rkd-attempt-1
 
-$ alder attempt edit ex-qq6rkd-attempt-1 --handle process:local-4242 --meta host=builder-1
+$ alder attempt edit ex-qq6rkd-attempt-1 --handle process:local-4242
 ex-qq6rkd-attempt-1  bound process:local-4242
 
 $ alder attempt edit ex-qq6rkd-attempt-1 --failed tests --evidence "cargo test --workspace: parser fixture fails" --note "Reproduced the parser failure."

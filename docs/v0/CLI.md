@@ -457,9 +457,7 @@ confirmation or override flag.
 Work creates its attempts, so the noun is `work`:
 
 ```text
-$ alder work start hm-9a1 \
-    --meta engine=opus-5 \
-    --meta requested_host=box-a
+$ alder work start hm-9a1 --tier terra
 hm-9a1-attempt-1
 ```
 
@@ -470,11 +468,14 @@ The command:
 3. commits and pushes it;
 4. returns the attempt ID.
 
-A repository-tuned skill then launches the worker, stamps it with
-`hm-9a1-attempt-1`, and attaches the resulting external handle with
-`alder attempt edit`. This wrapper owns choices such as engine, host, and cloud
-allocation. Alder records those choices as metadata but does not interpret
-them.
+`--tier <name>` records the runner's rung name on the attempt. It is opaque:
+any non-empty string is legal, no table of valid tiers exists anywhere in
+Alder, and its meaning lives with whatever runs the work. Storing it lets a
+later reader say "retry this at a higher rung" from the log alone.
+
+The runner then launches the worker and attaches the resulting external
+handle with `alder attempt edit`. The runner owns every execution choice;
+Alder records the names it is handed and interprets none of them.
 
 A second `work start` is rejected while an active attempt exists.
 
@@ -482,26 +483,25 @@ A second `work start` is rejected while an active attempt exists.
 
 ```text
 $ alder attempt edit hm-9a1-attempt-1 \
-    --handle tmux:nimbus-box-17/alder-hm-9a1-attempt-1 \
-    --meta host=nimbus:box-17 \
-    --meta toolchain=rustc-1.91-zzz
+    --handle tmux:alder-work-hm-9a1
 ```
 
-`--handle` attaches one external handle to the attempt. A handle is
-`<kind>:<opaque-value>`; its kind selects a configured observation command and
-the rest is opaque to Alder.
-
-Used by the launch skill or reconciler after locating an external execution by
-attempt ID. An unknown handle kind is accepted and preserved, but cannot be
-refreshed until a matching observation command is configured.
+`--handle` attaches one external handle to the attempt. A handle is a
+non-empty opaque string — a foreign name the runner chose. Alder stores it
+verbatim and compares it for equality; it never parses it, and no part of it
+selects anything inside Alder. An observer that lists the same string is what
+connects it back to a liveness level.
 
 Attaching a handle is a one-way transition: the attempt must not already have
 one, and the handle cannot later be replaced or cleared. Alder records the
 edit as `attempt.bound`. This is a strict field-specific rule of
 `attempt edit`, not a separate command.
 
-Attempt metadata is open ended. Repository skills define useful conventions;
-Alder never gates core behavior on metadata keys.
+`--tier <name>` records a new rung name on the attempt, with the same
+opaque-name rule as `work start --tier`.
+
+Attempt metadata (`--meta KEY=VALUE`) is open ended. Repository skills define
+useful conventions; Alder never gates core behavior on metadata keys.
 
 ```text
 $ alder attempt edit hm-9a1-attempt-1 \
@@ -707,7 +707,7 @@ key, ordered by that key. It does not run scripts or inspect SQLite.
 ```text
 $ alder observations
 github  owner/repo#171  ci  passing
-tmux    alder-hm-9a1   liveness  present
+tmux    hm-9a1-attempt-1  liveness  present
 ```
 
 ### `alder observation report <observer> <subject> <field> <level>`
@@ -742,11 +742,20 @@ The manifest entry supplies the first key part:
 {"observer":"github", "list":"ci list --json | jq '[.[] | {subject: .id, field: \"ci\", level: .state}]'"}
 ```
 
+Rows whose field is `liveness` are statements about execution: their subject
+is an opaque handle exactly as a runner bound it. Refresh reads the open
+attempts and their handles from the fold, matches each listed handle by
+equality, and records the level under the attempt's own ID — the durable key
+is `(observer, attempt-id, liveness)`. A listed handle no live attempt claims
+appends nothing. Rows with any other field are generic observations and keep
+their subject verbatim.
+
 An exit-zero valid array is complete for that observer: reported keys are
 updated through the append layer, and previously current keys omitted from the
-array are retired. A failure appends no belief. Alder runs the script through a
-fixed `bash -o pipefail` wrapper with a 20-second timeout and up to three
-retries; the first valid result wins.
+array are retired — except a liveness key whose attempt is still active, which
+becomes an explicit `absent` level until the attempt ends. A failure appends
+no belief. Alder runs the script through a fixed `bash -o pipefail` wrapper
+with a 20-second timeout and up to three retries; the first valid result wins.
 
 `refresh` returns `changed`, the number of appended changes, and retired-key
 count. It is the normal scheduled ingestion command for alderd or cron. A
@@ -800,9 +809,9 @@ named reads and `--json`.
 
 ### `alder debug observations [<kind>] [--run]`
 
-Without a kind, list configured and durably referenced observation kinds with
-their folded current keys. Kinds referenced by handles but lacking
-configuration are shown as `unconfigured`.
+Without a kind, list configured observation kinds and the observer names in
+the folded picture, with their folded current keys. A kind present in the fold
+but lacking configuration is shown as unconfigured.
 
 With a kind, show its configured command, effective shell, timeout and retry
 settings, and folded current keys.
@@ -819,13 +828,12 @@ All forms support `--json`.
 $ alder status
 $ alder reconcile
 $ alder next
-$ alder work start hm-9a1 --meta engine=opus-5 --meta requested_host=box-a
+$ alder work start hm-9a1 --tier terra
 hm-9a1-attempt-1
 
-# The repository skill launches the worker, then:
+# The runner launches the worker, then:
 $ alder attempt edit hm-9a1-attempt-1 \
-    --handle tmux:nimbus-box-17/alder-hm-9a1-attempt-1 \
-    --meta host=nimbus:box-17
+    --handle tmux:alder-work-hm-9a1
 ```
 
 Later:

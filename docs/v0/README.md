@@ -115,16 +115,16 @@ planning language.
 
 ### Record intent before effects
 
-An attempt is recorded before its worker is launched. The external worker is
-stamped with the attempt ID, then its external handle is attached to the
-attempt with `alder attempt edit`.
+An attempt is recorded before its worker is launched, then the worker's
+opaque handle is attached to the attempt with `alder attempt edit`. Nothing
+of Alder's is planted in the worker: the runner stores nothing of the log's,
+and the log stores the runner's names.
 
-This makes both crash windows repairable:
-
-- recorded attempt, no worker: launch one for it, or end the attempt as
-  `not_started` if the work no longer wants one;
-- worker exists, handle was not recorded: find it by attempt ID and attach its
-  handle with `alder attempt edit`.
+This makes the crash window repairable: a recorded attempt with no bound
+handle is `unspawned` — launch a worker for it, or end the attempt as
+`not_started` if the work no longer wants one. The runner owns any execution
+it launched but never bound; sweeping such residue is its housekeeping, not
+a log repair.
 
 The loop deliberately does not follow this rule, because a wake has no
 effects worth recording: it launches nothing and owns nothing. The driver
@@ -194,30 +194,30 @@ only when the work itself has changed identity.
 
 ## Execution and environment boundary
 
-`alder work start` records an attempt and returns its ID. A repository-tuned
-skill then launches the work, stamps the external execution with that ID, and
-attaches an external handle to the attempt with `alder attempt edit`.
+`alder work start` records an attempt — optionally with the runner's opaque
+tier name — and returns its ID. The runner then launches the work and
+attaches an opaque handle to the attempt with `alder attempt edit`.
 
-A handle has the form `<kind>:<opaque-value>`, such as:
-
-- `tmux:box-17/alder-hm-9a1-attempt-1`
-- `codex:019f...`
-- `github-actions:owner/repo/run/4212`
-
-The kind selects a configured observation command. The value is opaque to
-Alder. Removing an observation command never invalidates a stored handle or
-prevents replay.
+A handle is a non-empty opaque string the runner chose, such as
+`tmux:alder-work-hm-9a1` or `codex:019f...`. Alder stores it verbatim and
+never parses it; no part of it selects anything inside Alder. Removing an
+observation command never invalidates a stored handle or prevents replay.
 
 An attempt also has an open-ended metadata map. Skills may record useful
-provenance such as engine, host, model, or toolchain. Alder stores and displays
-that metadata but never makes core state transitions depend on its keys.
+provenance conventions. Alder stores and displays that metadata but never
+makes core state transitions depend on its keys.
 
 Observation commands are small shell pipelines over tools already present in
 the environment. Each command owns one observer name and prints a normalized
-JSON array of current levels keyed by subject and field. `alder refresh`
-appends only changed levels and retires omitted keys, so the shared log is the
-current observation picture. `alder reconcile` compares that picture with
-durable attempts and proposes repairs; it never acts on a provider.
+JSON array of current levels keyed by subject and field. A `liveness` row's
+subject is a handle as the runner bound it; `alder refresh` reads open
+attempts from the fold, matches listed handles by equality, and records each
+level under the attempt's own ID, so execution liveness is keyed by attempt.
+Refresh appends only changed levels and retires omitted keys — keeping an
+active attempt's vanished worker as an explicit `absent` level until the
+attempt ends — so the shared log is the current observation picture.
+`alder reconcile` compares that picture with durable attempts and proposes
+repairs; it never acts on a provider.
 
 Alder runs each command with fixed pipefail semantics, a 20-second timeout per
 execution, and up to three retries after the initial execution. Only an

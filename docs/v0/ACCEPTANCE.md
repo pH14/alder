@@ -54,11 +54,14 @@ allowing the attempt to end as `not_started`.
 
 ### A4. Crash after launch
 
-Record `attempt.started`, create a stamped external worker, then crash before
+Record `attempt.started`, create an external worker, then crash before
 recording its handle binding.
 
-Reconciliation must find the worker by attempt ID and allow a later caller to
-attach its handle with `attempt edit` and adopt it.
+Nothing of Alder's is stamped into the worker, so the log cannot attribute
+the execution: reconciliation reports the attempt as `unspawned` while its
+work is live. The runner — which named the execution — either binds the
+handle it created with `attempt edit` or replaces the execution; the
+unattributed leftover is the runner's residue to sweep.
 
 ### A5. Unknown append outcome
 
@@ -140,10 +143,12 @@ override flag.
 
 An active worker disappears without producing an event.
 
-A fresh complete observation must retire its `liveness` key. Reconciliation of
-that fresh snapshot must surface the attempt as needing repair. Ending it as
-`lost` returns its work to open. To leave the work blocked, block the work
-first and then end the attempt.
+A fresh complete observation must flip the attempt's `liveness` key — keyed
+by the attempt ID — to an explicit `absent` level while the attempt is
+active; the key retires only once the attempt ends. Reconciliation of the
+folded picture must surface the attempt as `missing` with its repair. Ending
+it as `lost` returns its work to open. To leave the work blocked, block the
+work first and then end the attempt.
 
 Status must expose the relevant progress and folded levels, but Alder must not
 derive a `stale` state or require a configured inactivity threshold. The
@@ -199,12 +204,14 @@ claim to enforce writer roles.
 Exercise each disagreement:
 
 - active attempt, no external handle;
-- starting attempt, matching unbound handle;
-- ended attempt, still-running external handle;
-- active attempt, mismatched attempt identity on its handle.
+- active attempt whose handle is observed absent;
+- ended attempt, still-running external handle.
 
 Each must be visible and repairable through normal commands. None may require
-editing event history or the SQLite database.
+editing event history or the SQLite database. There is no attempt-identity
+stamp to mismatch: the handle on the attempt record is the only connection,
+and an external execution nothing claims is the runner's residue rather than
+a log finding.
 
 ### A17. Hypothetical introspection
 
@@ -250,17 +257,14 @@ If Nimbus is unreachable, it appends no replacement level and retires no key.
 ### A20. Handle variety
 
 Attach tmux, Codex, and GitHub Actions handles to attempts with
-`attempt edit --handle`, and discover unbound Nimbus handles.
+`attempt edit --handle`.
 
-All must use the same core handle representation. Provider-specific values
-remain opaque, and provider metadata must not alter readiness or completion
-rules.
+All must use the same core handle representation: one opaque non-empty
+string Alder never parses. Provider-specific values remain opaque, and
+provider metadata must not alter readiness or completion rules.
 
 Adding a new observable kind must require only a configured command producing
 the normalized JSON contract, not a provider plugin or Rust adapter.
-
-Claude Code running inside tmux must work as a tmux handle with metadata; it
-must not require a new core type.
 
 Trying to replace or clear an attached handle must be rejected. Attaching the
 first handle records `attempt.bound`; there is no public `bind` command.

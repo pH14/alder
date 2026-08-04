@@ -85,10 +85,10 @@ flag without its own operator ruling.
    observer, so status reflects live worker sessions.
 2. **Reconcile.** `alder reconcile`. Apply repairs through the commands it
    names: a `missing` finding means the worker session died — end the
-   attempt as it suggests; a `bindable` finding means a session lost its
-   handle — rebind it; an `unspawned` finding means an attempt exists that
-   never had a worker — `alderd spawn <id>` adopts it rather than opening a
-   second one.
+   attempt as it suggests; an `unspawned` finding means an attempt exists
+   that never had a worker — `alderd spawn <id>` adopts it rather than
+   opening a second one; an `orphan` finding means a session outlived its
+   ended attempt — kill the session.
 3. **Triage questions.** For every *unanswered* question, decide which of
    four kinds it is before you decide anything else. See "Triage" below.
 4. **Relay answers.** For each answered question whose work has an active
