@@ -77,10 +77,10 @@ use std::{
 use alder::{
     domain::{
         AttemptDefinition, AttemptOutcome, AttemptState, CheckDefinition, EventDraft, EventPayload,
-        ProjectState, Snapshot, WorkDefinition, WorkOperation, decode_record, encode_draft,
+        ObservationDefinition, ProjectState, Snapshot, WorkDefinition, WorkOperation,
+        decode_record, encode_draft,
     },
-    observer::{ReconcileFinding, reconcile},
-    projection::{ObservationStatus, ObservedHandle},
+    observer::{NormalizedObject, ReconcileFinding, plan_observer_run, reconcile},
 };
 use alder_log::{Head, Log, LogError, MemoryLog, RecordDraft};
 use alderd::{
@@ -117,7 +117,6 @@ enum SessionKind {
 #[derive(Debug, Clone)]
 struct Session {
     kind: SessionKind,
-    cwd: PathBuf,
     attempt_id: Option<String>,
     /// Literal text typed into the pane and not yet submitted. Production's
     /// `tmux_send_keys` is two tmux invocations — `send-keys -l -- <text>`
@@ -156,7 +155,6 @@ enum Mutation {
     File(PathBuf),
     SessionCreate {
         name: String,
-        cwd: PathBuf,
     },
     SessionStamp {
         name: String,
@@ -790,7 +788,7 @@ impl Simulator {
             Mutation::File(path) => {
                 self.shared.world.borrow_mut().files.insert(path.clone());
             }
-            Mutation::SessionCreate { name, cwd } => {
+            Mutation::SessionCreate { name } => {
                 let mut world = self.shared.world.borrow_mut();
                 let kind = if name == LEADER_SESSION {
                     SessionKind::Leader
@@ -801,7 +799,6 @@ impl Simulator {
                     name.clone(),
                     Session {
                         kind,
-                        cwd: cwd.clone(),
                         attempt_id: None,
                         pending_input: None,
                         injected_line: None,
@@ -898,8 +895,15 @@ impl Simulator {
         alder::app::status_document(&snapshot.state, &snapshot.head, false, None)
     }
 
-    fn observations(&self) -> Vec<ObservedHandle> {
-        self.shared
+    /// The observation sweep, applied through production's own plan. The
+    /// world's live worker sessions become liveness rows whose subject is
+    /// the opaque handle the spawn bound; `plan_observer_run` reads open
+    /// attempts from the fold and turns them into attempt-keyed levels and
+    /// retirements, exactly as `alder refresh` does. Like the CLI's quiet
+    /// append path, an unchanged level appends nothing.
+    fn observe(&self) {
+        let rows: Vec<NormalizedObject> = self
+            .shared
             .world
             .borrow()
             .sessions
@@ -908,21 +912,41 @@ impl Simulator {
             // sessions. The leader is the loop's session, not an attempt
             // handle.
             .filter(|(_, session)| session.kind == SessionKind::Worker)
-            .map(|(name, session)| ObservedHandle {
-                handle: format!("tmux:{name}"),
-                attempt_id: session.attempt_id.clone(),
-                status: ObservationStatus::Present,
-                metadata: json!({"cwd": session.cwd}),
-                observed_at: self.logical_now().to_rfc3339(),
-                detail: None,
+            .map(|(name, _)| NormalizedObject {
+                subject: format!("tmux:{name}"),
+                field: "liveness".to_owned(),
+                level: "present".to_owned(),
             })
-            .collect()
+            .collect();
+        let state = self.snapshot().state;
+        for change in plan_observer_run(&state, "tmux", &rows) {
+            let current = state.observations.get(&change.key);
+            match change.level {
+                Some(level) => {
+                    if current.is_some_and(|observation| observation.level == level) {
+                        continue;
+                    }
+                    self.append_unfaulted(EventPayload::ObservationReported {
+                        observation: ObservationDefinition {
+                            key: change.key,
+                            level,
+                        },
+                    });
+                }
+                None => {
+                    if current.is_none() {
+                        continue;
+                    }
+                    self.append_unfaulted(EventPayload::ObservationRetired { key: change.key });
+                }
+            }
+        }
     }
 
     fn reconcile(&self) -> Vec<ReconcileFinding> {
         let state = self.snapshot().state;
         let kinds = BTreeSet::from(["tmux".to_owned()]);
-        reconcile(&state, &self.observations(), &kinds, &kinds)
+        reconcile(&state, &kinds, &kinds)
     }
 
     /// Directories and files belonging to no registered worktree.
@@ -1018,6 +1042,9 @@ impl Simulator {
                 findings
                     .iter()
                     .any(|finding| finding.handle.as_deref() == Some(&format!("tmux:{name}")))
+                    || local_findings
+                        .iter()
+                        .any(|(_, subject)| subject == &anomaly)
             } else {
                 local_findings
                     .iter()
@@ -1040,7 +1067,9 @@ impl Simulator {
         self.anomalies(want_worker)
             .into_iter()
             .filter_map(|anomaly| {
-                if anomaly.starts_with("worktree:") {
+                if anomaly.starts_with("session:") {
+                    Some(("stray_session".to_owned(), anomaly))
+                } else if anomaly.starts_with("worktree:") {
                     Some(("stray_worktree".to_owned(), anomaly))
                 } else if anomaly.starts_with("path:") {
                     Some(("stray_path".to_owned(), anomaly))
@@ -1064,6 +1093,33 @@ impl Simulator {
     /// Modelling the sweep here keeps the convergence property meaningful and
     /// keeps the missing production step visible instead of silently excluded.
     fn clean_strays(&self) -> Result<bool> {
+        // Worker sessions no active attempt describes. Reconciliation cannot
+        // see them any more: an unclaimed session is the runner's residue,
+        // not a statement about work, so no observation names it. Sweeping
+        // them is runner-side housekeeping, modelled here like the worktree
+        // sweep below until the runner extraction gives it a production home.
+        let stray_sessions: Vec<String> = {
+            let world = self.shared.world.borrow();
+            let state = self.snapshot().state;
+            world
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.kind == SessionKind::Worker)
+                .filter(|(name, session)| {
+                    let described = session.attempt_id.as_deref().is_some_and(|attempt_id| {
+                        state.attempts.get(attempt_id).is_some_and(|attempt| {
+                            attempt.state == AttemptState::Active
+                                && attempt.handle.as_deref() == Some(&format!("tmux:{name}"))
+                        })
+                    });
+                    !described
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        for session in &stray_sessions {
+            <Self as SpawnHost>::tmux_kill_session(self, session)?;
+        }
         let stray: Vec<PathBuf> = {
             let world = self.shared.world.borrow();
             world
@@ -1102,19 +1158,18 @@ impl Simulator {
             };
             self.effect("repair.path-sweep", Footprint::tearable(footprint));
         }
-        Ok(!stray.is_empty() || !orphans.is_empty())
+        Ok(!stray_sessions.is_empty() || !stray.is_empty() || !orphans.is_empty())
     }
 
     fn repair_findings(&self, findings: &[ReconcileFinding]) -> Result<bool> {
         let mut changed = false;
-        // External objects that cannot truthfully be bound are removed before
-        // an unspawned attempt is retried on the same deterministic name.
-        for finding in findings.iter().filter(|finding| {
-            matches!(
-                finding.kind.as_str(),
-                "unclaimed" | "orphan" | "identity_mismatch"
-            )
-        }) {
+        // A session an ended attempt still holds cannot truthfully serve any
+        // other attempt; it is removed before an unspawned attempt is retried
+        // on the same deterministic name.
+        for finding in findings
+            .iter()
+            .filter(|finding| finding.kind.as_str() == "orphan")
+        {
             if let Some(session) = finding
                 .handle
                 .as_deref()
@@ -1128,12 +1183,6 @@ impl Simulator {
 
         for finding in findings {
             match finding.kind.as_str() {
-                "bindable" => {
-                    let attempt = finding.attempt_id.as_deref().expect("bindable attempt");
-                    let handle = finding.handle.as_deref().expect("bindable handle");
-                    self.alder_command(&["attempt", "edit", attempt, "--handle", handle])?;
-                    changed = true;
-                }
                 "missing" => {
                     let attempt = finding.attempt_id.as_deref().expect("missing attempt");
                     self.alder_command(&[
@@ -1191,7 +1240,7 @@ impl Simulator {
                 // which is exactly why a duplicated wake is harmless.
                 self.run_leader_if_injected();
                 // observe
-                let _observations = self.observations();
+                self.observe();
                 // reconcile
                 let findings = self.reconcile();
                 self.assert_anomalies_named(want_worker, &findings);
@@ -1206,7 +1255,14 @@ impl Simulator {
             });
             match round {
                 Some(Ok(_)) => {
-                    self.run_leader_if_injected();
+                    // The leader consuming a just-injected wake is an effect
+                    // boundary like any other: a scheduled fault may land on
+                    // it, and that death is a case to recover from, not a
+                    // harness failure.
+                    if catch_sim_crash(|| self.run_leader_if_injected()).is_none() {
+                        daemon = Driver::new(self.clone(), config());
+                        continue;
+                    }
                     let findings = self.reconcile();
                     let stable = findings.is_empty()
                         && self.anomalies(want_worker).is_empty()
@@ -1423,6 +1479,7 @@ impl Simulator {
                         attempt: AttemptDefinition {
                             id: attempt_id.clone(),
                             work_id: (*work_id).to_owned(),
+                            tier: None,
                             metadata: BTreeMap::new(),
                         },
                     },
@@ -1617,7 +1674,7 @@ impl SpawnHost for Simulator {
     fn tmux_new_session(
         &self,
         session: &str,
-        cwd: &Path,
+        _cwd: &Path,
         _command: &str,
         attempt_id: &str,
     ) -> Result<()> {
@@ -1634,7 +1691,6 @@ impl SpawnHost for Simulator {
             Footprint::tearable(vec![
                 Mutation::SessionCreate {
                     name: session.to_owned(),
-                    cwd: cwd.to_path_buf(),
                 },
                 Mutation::SessionStamp {
                     name: session.to_owned(),
@@ -1747,7 +1803,6 @@ impl Effects for Simulator {
             "wake.session-create",
             Footprint::tearable(vec![Mutation::SessionCreate {
                 name: session.to_owned(),
-                cwd: self.root.clone(),
             }]),
         );
         Ok(())
