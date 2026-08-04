@@ -478,7 +478,7 @@ fn sandboxed_spawn_cuts_a_worktree_and_leaves_a_live_pane() {
     );
 
     // Simulate a worktree cut before the helper existed. Adopting its exited
-    // pane must backfill the adapter instead of sending a leader back to a
+    // pane must backfill the adapter instead of sending an executor back to a
     // hand-written tmux command.
     fs::remove_file(&relay).expect("the first-generation helper is removed");
 

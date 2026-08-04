@@ -55,7 +55,7 @@ CLI is presentation. The loop-control records live in neither application —
 they stay with the CLI until they are removed from the log entirely.
 
 The primary user is an agent driving a project. A repository skill may call
-that agent the leader, but Alder stores no leader, generation, lease, or
+that agent the executor, but Alder stores no executor, generation, lease, or
 writer role. The human operates Alder through an agent or another chat
 surface; the human should not need a shell.
 
@@ -154,7 +154,7 @@ attempt is invalid only when Alder has ended it.
 
 ### Writers use optimistic concurrency
 
-Alder has no durable leader or writer generation. Each mutation reads one log
+Alder has no durable executor or writer generation. Each mutation reads one log
 head, validates against the projection for that head, and conditionally
 appends to it. If another writer advances the log before the append, the
 mutation changes nothing and the caller must reread and reconsider it.
@@ -166,7 +166,7 @@ fact about the command — nothing was appended, and here is the event that was
 not written — and never in a form that reads as a receipt.
 
 The expected head is internal to the command. V0 has no public `--if-head`
-option. A repository skill that wants one operational leader must ensure that
+option. A repository skill that wants one operational executor must ensure that
 role above Alder; an older agent that later reads current state is technically
 another valid writer.
 
@@ -357,7 +357,7 @@ V0 does not include:
 - reviewer-seat or judge orchestration;
 - project runbooks or vocabulary profiles;
 - public dashboard publication;
-- durable leader roles, generations, or leases;
+- durable executor roles, generations, or leases;
 - generic storage backends;
 - committed SQLite projections or snapshots;
 - engine validation, or any driver diagnostic as a durable event.

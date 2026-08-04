@@ -1522,7 +1522,7 @@ fn a_deferral_is_a_statement_on_the_work_item_and_expires_into_review() {
     ]);
 
     // The earliest deadline over all blocked work is the loop's next review
-    // rendezvous — what the driver wakes the leader at.
+    // rendezvous — what the driver wakes the executor at.
     let status = project.success(&["status", "--section", "blocked"]);
     assert_eq!(status["loop"]["review_at"], "2099-01-02T15:00:00Z");
     let untils: Vec<_> = status["blocked"]
@@ -2014,7 +2014,7 @@ fn a_never_observed_dead_worker_is_missing_through_default_reconcile() {
 }
 
 /// The live incident of al-pass-64, reproduced over the mutation that
-/// remains: a leader-side write lost the compare-and-append to a worker
+/// remains: an executor-side write lost the compare-and-append to a worker
 /// appending its own milestones.
 ///
 /// The loss itself is correct and stays: an ordinary mutation validated

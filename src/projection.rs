@@ -592,7 +592,7 @@ mod tests {
     fn overlapping_opens_each_leave_the_schema_whole() {
         // Opening drops and recreates every view, so two opens that overlap
         // must not interleave: one would find a view the other had already
-        // recreated and fail. A leader and its workers all read at once, so
+        // recreated and fail. An executor and its workers all read at once, so
         // this is the ordinary case, not a corner.
         let temporary = TempDir::new().unwrap();
         let projection = Projection::new(temporary.path().join("state.db"));
@@ -638,12 +638,12 @@ mod tests {
             .add_work("Build".to_owned(), None, 42, Vec::new(), Vec::new())
             .unwrap();
         let (_, first) = log.start(&work_id, None, BTreeMap::new()).unwrap();
-        log.bind_attempt(&first, "tmux:leader".to_owned(), BTreeMap::new())
+        log.bind_attempt(&first, "tmux:executor".to_owned(), BTreeMap::new())
             .unwrap();
         log.end_attempt(&first, AttemptOutcome::Lost, "handle absent".to_owned())
             .unwrap();
         let (_, second) = log.start(&work_id, None, BTreeMap::new()).unwrap();
-        log.bind_attempt(&second, "tmux:leader".to_owned(), BTreeMap::new())
+        log.bind_attempt(&second, "tmux:executor".to_owned(), BTreeMap::new())
             .unwrap();
         let snapshot = log.snapshot().unwrap();
 
@@ -654,7 +654,7 @@ mod tests {
             .unwrap();
 
         let rows = projection
-            .raw_query("SELECT count(*) AS total FROM attempts WHERE handle = 'tmux:leader'")
+            .raw_query("SELECT count(*) AS total FROM attempts WHERE handle = 'tmux:executor'")
             .unwrap();
         assert_eq!(rows["rows"][0]["total"], 2);
     }

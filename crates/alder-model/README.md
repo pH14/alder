@@ -3,7 +3,7 @@
 A [stateright](https://docs.rs/stateright) model of Alder's protocol core.
 It checks the wake protocol under **every interleaving** of a small cast —
 the shared log, the daemon's decide loop with its machine-local notes, the
-leader engine, and an optional second writer (a phone session) — including
+executor engine, and an optional second writer (a phone session) — including
 crash transitions. It is a dev-only crate: nothing depends on it, and it
 ships nothing.
 
@@ -58,7 +58,7 @@ daemon's actor" — holds in every reachable state of every scenario.
   (`tmux_send_keys`), then the notes write. The order of the last two is the
   duplicate-wake window: a crash between them leaves a delivered wake that
   nothing anywhere records, so the restarted daemon delivers it again.
-- **The leader**, when woken, reads the fold and acts: appends one work
+- **The executor**, when woken, reads the fold and acts: appends one work
   statement (budget-bounded), or finds nothing demanding and idles. Or its
   session dies.
 - **The phone** optionally requests a rotation, pauses the loop with a
@@ -81,7 +81,7 @@ driver tests cover them.
    injection and the notes write strands a delivered wake nothing recorded
    (`sometimes`, so the window is actually entered); the same head is then
    woken twice (`sometimes`); and every `always` property holds through
-   both, because a wake carries no work of its own — the leader reads the
+   both, because a wake carries no work of its own — the executor reads the
    fold either way. Checked in
    `crashes_cost_duplicate_wakes_and_nothing_else`.
 3. **A consumed rotation was performed first.** The driver reconciles the
@@ -103,7 +103,7 @@ driver tests cover them.
 
 ## State-space bounds
 
-Budgets bound the space: one leader statement, one phone statement, one
+Budgets bound the space: one executor statement, one phone statement, one
 rotation request, one pause, and per-scenario fault counts. Counts from
 `cargo test -- --nocapture`:
 

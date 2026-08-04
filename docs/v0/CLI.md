@@ -1,7 +1,7 @@
 # Alder v0 CLI
 
 The CLI is organized around the project-driving workflow, not the storage
-model. Alder itself stores no leader or writer role; repository skills may
+model. Alder itself stores no executor or writer role; repository skills may
 assign those roles above the CLI.
 
 ## Grammar
@@ -689,12 +689,12 @@ $ alder loop nudge --why "answered the release question"
 nudge requested
 ```
 
-A request that the driver wake the leader now rather than at the next
+A request that the driver wake the executor now rather than at the next
 scheduled trigger. A nudge follows the identical rule as rotation — the fold
 records its sequence, and each driver treats one later than its noted head as
 outstanding. The driver reports it as the `manual` trigger and fires through
 its own deferrals; it does not override `loop pause`. A nudge changes *when*
-the leader is next woken, never *what* it does.
+the executor is next woken, never *what* it does.
 
 ## Observations
 

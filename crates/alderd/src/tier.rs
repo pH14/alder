@@ -188,7 +188,7 @@ impl Tier {
     /// watching for — with a sandbox that has neither network access nor the
     /// git common dir, so the resumed worker can neither commit nor append.
     ///
-    /// So the flags are not documented for a leader to retype. They are
+    /// So the flags are not documented for an executor to retype. They are
     /// written into the worktree at spawn, by the same table that built the
     /// launch, and the relay is one short command.
     pub fn resume_script(&self, git_common_dir: Option<&str>) -> Option<String> {
@@ -205,7 +205,7 @@ impl Tier {
             .collect();
         Some(format!(
             r#"#!/bin/sh
-# Resume this worker's codex session with a ruling from the leader.
+# Resume this worker's codex session with a ruling from the executor.
 #
 #     .alder/resume <codex-session-id> "<the ruling>"
 #
@@ -323,7 +323,7 @@ disown || true
 /// workspace, so a `workspace-write` worker that is given only its own
 /// checkout fails on the first commit with
 /// `Unable to create '…/index.lock': Operation not permitted`. Naming the
-/// common dir writable fixes exactly that and nothing else: the leader's
+/// common dir writable fixes exactly that and nothing else: the executor's
 /// working tree stays read-only to the worker, which is the part that matters.
 fn writable_roots(git_common_dir: Option<&str>) -> String {
     let roots: Vec<&str> = git_common_dir.into_iter().collect();

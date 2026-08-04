@@ -7,7 +7,7 @@
 //! The wake rule is one comparison: the head has moved past the last head this
 //! driver acted on. That baseline lives in the driver's machine-local
 //! [`Notes`], never in the log — the log never mentions its own readers — and
-//! losing it is harmless: the driver acts once more, the leader reads the fold,
+//! losing it is harmless: the driver acts once more, the executor reads the fold,
 //! finds nothing new to do, and idles. Passes are idempotent; a missed or
 //! duplicated wake changes nothing durable.
 
@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{config::Config, loop_state::LoopState};
 
-/// Why the driver would wake the leader. These kinds are informational
-/// provenance in the injected line; they never limit what the leader must do.
+/// Why the driver would wake the executor. These kinds are informational
+/// provenance in the injected line; they never limit what the executor must do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Trigger {
     Manual,
@@ -75,7 +75,7 @@ pub enum Decision {
     Idle(&'static str),
     /// The condition holds but the injection waits.
     Hold(&'static str),
-    /// Wake the leader, with these trigger kinds as provenance.
+    /// Wake the executor, with these trigger kinds as provenance.
     Fire(Vec<Trigger>),
 }
 
@@ -117,9 +117,9 @@ pub fn triggers(config: &Config, state: &LoopState, notes: &Notes, poll: &Poll) 
     triggers
 }
 
-/// A deferral's deadline has arrived and this driver has not woken the leader
-/// since it passed. One wake per deadline: a leader that reviews the item
-/// moves the deadline or removes it, and a leader that does not is caught by
+/// A deferral's deadline has arrived and this driver has not woken the executor
+/// since it passed. One wake per deadline: an executor that reviews the item
+/// moves the deadline or removes it, and an executor that does not is caught by
 /// the max-interval ceiling rather than woken every poll. Every blocked
 /// item's deadline is checked, not just the earliest: an item that stays
 /// blocked past its own deadline must not swallow the wake a later deadline
@@ -131,7 +131,7 @@ fn review_due(state: &LoopState, notes: &Notes, now: DateTime<Utc>) -> bool {
         .any(|&deadline| now >= deadline && notes.last_wake_at.is_none_or(|woke| woke < deadline))
 }
 
-/// The leader has not been woken for longer than the configured ceiling. A
+/// The executor has not been woken for longer than the configured ceiling. A
 /// driver with no notes has never woken anyone, so a fresh start fires
 /// immediately.
 fn max_interval_elapsed(config: &Config, notes: &Notes, now: DateTime<Utc>) -> bool {
@@ -276,10 +276,10 @@ pub fn session_action(
     SessionAction::Reuse
 }
 
-/// The message injected into the leader's terminal.
+/// The message injected into the executor's terminal.
 ///
 /// It carries no identifier, because nothing durable exists to identify: the
-/// leader reads the fold and acts on whatever the state demands. Trigger kinds
+/// executor reads the fold and acts on whatever the state demands. Trigger kinds
 /// ride along as provenance and never say "only look at X".
 pub fn injection(bootstrap: bool, pass_doc: &str, triggers: &[Trigger]) -> String {
     let kinds = triggers
@@ -434,11 +434,11 @@ mod tests {
             vec![Trigger::Due]
         );
         // A wake delivered after the deadline consumes it; the ceiling is the
-        // backstop for a leader that never reviews the item.
+        // backstop for an executor that never reviews the item.
         assert!(triggers(&config, &deferred, &acted(21), &poll(22)).is_empty());
 
         // A head behind the note is still a difference: a rebuilt or
-        // truncated log ref wakes the leader once, and re-noting self-heals.
+        // truncated log ref wakes the executor once, and re-noting self-heals.
         let mut rebuilt = settled_state();
         rebuilt.head = 39;
         assert_eq!(

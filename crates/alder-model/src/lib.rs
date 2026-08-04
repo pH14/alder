@@ -2,7 +2,7 @@
 //!
 //! The model checks the wake protocol under every interleaving of a small
 //! cast: the shared CAS log, the daemon's decide loop with its machine-local
-//! notes, the leader engine it wakes, and an optional second writer (a phone
+//! notes, the executor engine it wakes, and an optional second writer (a phone
 //! session). It deliberately reuses the real implementation wherever the
 //! implementation is a pure function of a snapshot:
 //!
@@ -53,7 +53,7 @@ fn epoch() -> DateTime<Utc> {
 
 const SCHEMA: &str = "alder.event.v0";
 const DAEMON_ACTOR: &str = "alderd";
-const LEADER_ACTOR: &str = "leader";
+const EXECUTOR_ACTOR: &str = "executor";
 const PHONE_ACTOR: &str = "phone";
 
 /// Which optional actors and faults a run explores, and how far.
@@ -65,11 +65,11 @@ pub struct Scenario {
     pub phone_pause: bool,
     /// The second writer may append one ordinary work statement.
     pub phone_work: bool,
-    /// How many work statements the leader may append when woken.
-    pub leader_appends: u8,
+    /// How many work statements the executor may append when woken.
+    pub executor_appends: u8,
     /// How many daemon process crashes may be injected.
     pub daemon_crashes: u8,
-    /// How many leader tmux session crashes may be injected.
+    /// How many executor tmux session crashes may be injected.
     pub session_crashes: u8,
     /// How many times the daemon's notes file may be lost.
     pub notes_losses: u8,
@@ -82,7 +82,7 @@ impl Scenario {
             phone_rotation: false,
             phone_pause: false,
             phone_work: false,
-            leader_appends: 1,
+            executor_appends: 1,
             daemon_crashes: 0,
             session_crashes: 0,
             notes_losses: 0,
@@ -109,12 +109,12 @@ pub struct ProtocolState {
     pub notes: Notes,
     pub daemon: Daemon,
     pub phone: Phone,
-    /// The leader tmux session generation, if one exists.
+    /// The executor tmux session generation, if one exists.
     pub tmux: Option<u8>,
-    /// Whether the leader holds a submitted wake line it has not acted on.
-    pub leader_pending: bool,
-    /// Work statements the leader may still append.
-    pub leader_appends_left: u8,
+    /// Whether the executor holds a submitted wake line it has not acted on.
+    pub executor_pending: bool,
+    /// Work statements the executor may still append.
+    pub executor_appends_left: u8,
     pub ghosts: Ghosts,
 }
 
@@ -133,8 +133,8 @@ impl Hash for ProtocolState {
         self.daemon.hash(hasher);
         self.phone.hash(hasher);
         self.tmux.hash(hasher);
-        self.leader_pending.hash(hasher);
-        self.leader_appends_left.hash(hasher);
+        self.executor_pending.hash(hasher);
+        self.executor_appends_left.hash(hasher);
         self.ghosts.hash(hasher);
     }
 }
@@ -164,7 +164,7 @@ pub enum DaemonCtl {
         head: u64,
     },
     /// The line was typed and submitted; the notes write is next. A crash
-    /// here is the duplicate-wake window: the leader was handed the line, and
+    /// here is the duplicate-wake window: the executor was handed the line, and
     /// nothing anywhere says so.
     Injected {
         head: u64,
@@ -185,11 +185,11 @@ pub struct Phone {
 pub struct Ghosts {
     /// Sessions ever created; the next generation number.
     pub sessions_created: u8,
-    /// Leader session crashes injected so far.
+    /// Executor session crashes injected so far.
     pub session_crashes: u8,
     /// Notes-file losses injected so far.
     pub notes_lost: u8,
-    /// Wake lines ever submitted at the leader.
+    /// Wake lines ever submitted at the executor.
     pub wakes_delivered: u8,
     /// The head the most recent delivery was for, to spot a duplicate.
     pub last_delivered_head: Option<u64>,
@@ -213,7 +213,7 @@ pub struct Ghosts {
 pub enum ProtocolAction {
     /// Poll, decide `Fire`, and reconcile the session (the pre-wake step).
     DaemonPollFires,
-    /// Type the wake line into the leader's terminal and submit it — the
+    /// Type the wake line into the executor's terminal and submit it — the
     /// driver's `tmux_send_keys`.
     DaemonInject,
     /// Persist the notes: the head just acted on, durably enough for a
@@ -226,11 +226,11 @@ pub enum ProtocolAction {
     NotesLost,
     /// The woken engine reads the fold and acts: appends one work statement,
     /// or finds nothing demanding and idles.
-    LeaderActs {
+    ExecutorActs {
         appends: bool,
     },
-    /// The leader tmux session dies.
-    LeaderCrash,
+    /// The executor tmux session dies.
+    ExecutorCrash,
     PhoneRotationRequest,
     PhonePause,
     PhoneWorkStatement,
@@ -386,7 +386,7 @@ impl Scenario {
                 state.tmux = Some(generation);
                 state.daemon.knows_session = Some(generation);
                 // The pane died with whatever line it held.
-                state.leader_pending = false;
+                state.executor_pending = false;
                 if state.ghosts.rotation_pending {
                     state.ghosts.rotation_performed = true;
                 }
@@ -409,7 +409,7 @@ impl Scenario {
             state.daemon.ctl = DaemonCtl::Idle;
             return Some(());
         }
-        state.leader_pending = true;
+        state.executor_pending = true;
         state.ghosts.wakes_delivered += 1;
         if state.ghosts.last_delivered_head == Some(head) {
             state.ghosts.duplicate_wake = true;
@@ -466,8 +466,8 @@ impl Model for Scenario {
                 work_left: self.phone_work,
             },
             tmux: None,
-            leader_pending: false,
-            leader_appends_left: self.leader_appends,
+            executor_pending: false,
+            executor_appends_left: self.executor_appends,
             ghosts: Ghosts::default(),
         }]
     }
@@ -500,14 +500,14 @@ impl Model for Scenario {
             actions.push(ProtocolAction::NotesLost);
         }
 
-        if state.leader_pending && state.tmux.is_some() {
-            actions.push(ProtocolAction::LeaderActs { appends: false });
-            if state.leader_appends_left > 0 {
-                actions.push(ProtocolAction::LeaderActs { appends: true });
+        if state.executor_pending && state.tmux.is_some() {
+            actions.push(ProtocolAction::ExecutorActs { appends: false });
+            if state.executor_appends_left > 0 {
+                actions.push(ProtocolAction::ExecutorActs { appends: true });
             }
         }
         if state.tmux.is_some() && state.ghosts.session_crashes < self.session_crashes {
-            actions.push(ProtocolAction::LeaderCrash);
+            actions.push(ProtocolAction::ExecutorCrash);
         }
 
         if state.phone.rotation_left {
@@ -557,30 +557,30 @@ impl Model for Scenario {
                     state.ghosts.rotation_performed = true;
                 }
             }
-            ProtocolAction::LeaderActs { appends } => {
-                if !state.leader_pending || state.tmux.is_none() {
+            ProtocolAction::ExecutorActs { appends } => {
+                if !state.executor_pending || state.tmux.is_none() {
                     return None;
                 }
                 if appends {
-                    if state.leader_appends_left == 0 {
+                    if state.executor_appends_left == 0 {
                         return None;
                     }
-                    state.leader_appends_left -= 1;
-                    let ordinal = self.leader_appends - state.leader_appends_left;
+                    state.executor_appends_left -= 1;
+                    let ordinal = self.executor_appends - state.executor_appends_left;
                     let draft = work_statement(
-                        &format!("leader-work-{ordinal}"),
-                        &format!("al-leader-{ordinal}"),
-                        LEADER_ACTOR,
+                        &format!("executor-work-{ordinal}"),
+                        &format!("al-executor-{ordinal}"),
+                        EXECUTOR_ACTOR,
                     );
                     state.log = append_now(&state.log, &draft);
                 }
-                state.leader_pending = false;
+                state.executor_pending = false;
             }
-            ProtocolAction::LeaderCrash => {
+            ProtocolAction::ExecutorCrash => {
                 state.tmux = None;
                 state.ghosts.session_crashes += 1;
                 // The session took its pending line with it.
-                state.leader_pending = false;
+                state.executor_pending = false;
             }
             ProtocolAction::PhoneRotationRequest => {
                 let draft = typed_draft(
@@ -764,7 +764,7 @@ mod tests {
     /// to be left open.
     #[test]
     fn a_work_statement_is_recovered() {
-        let log = append_now(&[], &work_statement("w-1", "al-1", LEADER_ACTOR));
+        let log = append_now(&[], &work_statement("w-1", "al-1", EXECUTOR_ACTOR));
         assert!(recovered(&state_of(log)));
     }
 }

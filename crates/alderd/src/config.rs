@@ -49,7 +49,7 @@ pub struct Engine {
 }
 
 fn default_session() -> String {
-    "alder-leader".to_owned()
+    "alder-executor".to_owned()
 }
 
 fn default_poll() -> u64 {
@@ -147,7 +147,7 @@ mod tests {
             r#"{"engines": {"claude": {"cmd": "claude"}}, "passDoc": ".agent/skills/pass/SKILL.md"}"#,
         );
         let config = Config::load(&path).unwrap();
-        assert_eq!(config.tmux_session, "alder-leader");
+        assert_eq!(config.tmux_session, "alder-executor");
         assert_eq!(config.poll_seconds, 60);
         assert_eq!(config.debounce_seconds, 20);
         assert_eq!(config.max_interval_seconds, 1800);

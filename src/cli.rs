@@ -254,7 +254,7 @@ pub struct WorkBlockArgs {
     #[arg(long)]
     pub why: String,
     /// Review deadline as an RFC 3339 instant, such as 2026-08-04T15:00:00Z.
-    /// Stored on the work item; the driver wakes the leader at that time, and
+    /// Stored on the work item; the driver wakes the executor at that time, and
     /// an expired deadline surfaces in `status` for review — nothing unblocks
     /// by itself.
     #[arg(long, value_name = "RFC3339")]
@@ -355,15 +355,15 @@ pub struct LoopArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum LoopCommand {
-    /// Ask the driver to stop waking the leader.
+    /// Ask the driver to stop waking the executor.
     Pause(OptionalReasonArgs),
-    /// Ask the driver to resume waking the leader.
+    /// Ask the driver to resume waking the executor.
     Resume,
     /// Set the desired engine name. Alder never validates it.
     Use(LoopUseArgs),
     /// Ask the next wake to start a fresh session.
     Rotate(OptionalReasonArgs),
-    /// Ask the driver to wake the leader now, ahead of any schedule.
+    /// Ask the driver to wake the executor now, ahead of any schedule.
     Nudge(OptionalReasonArgs),
 }
 

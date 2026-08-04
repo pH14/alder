@@ -51,8 +51,8 @@ fn check(scenario: Scenario, name: &str, states: usize) {
     );
 }
 
-/// Baseline: one daemon, one leader, no faults. The fresh project fires once,
-/// the woken leader may append one statement, the follow-up wake finds
+/// Baseline: one daemon, one executor, no faults. The fresh project fires once,
+/// the woken executor may append one statement, the follow-up wake finds
 /// nothing, and the loop quiesces recovered.
 fn lone_daemon() -> Scenario {
     Scenario::new()

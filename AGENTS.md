@@ -35,7 +35,7 @@ delta, a "changed since" cursor driving behaviour, a cached section reused
 instead of refetched, or a flag that must be cleared by whoever served it.
 The one sanctioned cursor is the daemon's machine-local notes — the last head
 it acted on — and its licence is exactly that losing it is harmless: it
-gates only *when* the leader is woken, never what anyone decides, and a
+gates only *when* the executor is woken, never what anyone decides, and a
 request in the log is served by comparing its sequence with that note rather
 than by a flag someone must clear. Flag any second cursor, and flag anything
 that makes this one load-bearing for a decision.
@@ -92,7 +92,7 @@ of erroring before anything launches.
 
 A worker commits to its own branch in its own worktree. It does not push,
 fetch, add or change a remote, force anything, or write outside that worktree;
-only the leader merges, and only locally. Flag anything on a worker's path,
+only the executor merges, and only locally. Flag anything on a worker's path,
 including a script handed to it at spawn, that can reach a remote — except
 `alder` itself, whose whole job is appending to the store.
 

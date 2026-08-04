@@ -5,7 +5,7 @@
 //!
 //! What the driver has to remember — the last head it acted on, and when — is
 //! machine-local [`Notes`] persisted under `.alder/`. Losing them is harmless:
-//! the next poll delivers one wake more than it needed to, the leader reads
+//! the next poll delivers one wake more than it needed to, the executor reads
 //! the fold, finds nothing new, and idles.
 
 use std::{
@@ -268,12 +268,12 @@ impl<E: Effects> Driver<E> {
         self.effects
             .tmux_send_keys(&self.config.tmux_session, &message)?;
         self.bootstrap = false;
-        self.effects.log(&format!("woke the leader: {message}"));
+        self.effects.log(&format!("woke the executor: {message}"));
 
         // The delivery happened; note it, durably enough for a restart. The
         // order is deliberate: a crash before this write leaves stale notes,
         // and the next poll delivers the same wake again — harmless, because
-        // the leader reads the fold and nothing durable records wakes.
+        // the executor reads the fold and nothing durable records wakes.
         self.notes = Notes {
             last_head: state.head,
             last_wake_at: Some(self.effects.now()),
