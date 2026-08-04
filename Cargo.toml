@@ -33,6 +33,7 @@ unsafe_code = "forbid"
 
 [workspace]
 members = [
+    "crates/alder-ext-runner",
     "crates/alder-log",
     "crates/alder-model",
     "crates/alder-observation",

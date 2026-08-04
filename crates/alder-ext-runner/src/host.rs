@@ -1,0 +1,403 @@
+//! Everything the runner does to the world, behind one thin trait.
+//!
+//! The runner holds no git library and no tmux library. It cuts worktrees by
+//! running `git`, and it drives sessions by running `tmux`. The trait exists
+//! for the same reason the start logic is pure over it: the ordering rules in
+//! [`crate::start`] are the interesting part, and they are worth testing
+//! without a tmux server, a git checkout, or a model.
+
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
+
+use crate::{
+    error::{Result, RunnerError},
+    start::{ENGINE_ENV, ENGINE_EXITED, HANDLE_ENV, TIER_ENV, WORKTREE_ENV},
+};
+
+/// The identity and engine state observable on an existing tmux session, read
+/// back from the environment the runner stamped at creation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObservedSession {
+    pub handle: Option<String>,
+    pub tier: Option<String>,
+    pub worktree: Option<PathBuf>,
+    pub engine_live: bool,
+}
+
+/// What a shell-out did, once it ran at all.
+#[derive(Debug, Clone)]
+pub struct Run {
+    pub ok: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Everything a start does to the world.
+pub trait RunnerHost {
+    /// The repository executions are launched from.
+    fn repo(&self) -> &Path;
+    /// Run `git <args>` in the repository. An error means git could not be
+    /// run at all; a git command that ran and failed comes back as `Run`.
+    fn git(&self, args: &[&str]) -> Result<Run>;
+    fn tmux_session(&self, session: &str) -> Result<Option<ObservedSession>>;
+    fn tmux_new_session(
+        &self,
+        session: &str,
+        cwd: &Path,
+        command: &str,
+        environment: &[(&str, String)],
+    ) -> Result<()>;
+    fn tmux_kill_session(&self, session: &str) -> Result<()>;
+    fn path_exists(&self, path: &Path) -> bool;
+    /// Resolve a path before comparing it with Git's canonical worktree
+    /// registry entries.
+    fn canonical_path(&self, path: &Path) -> Result<PathBuf>;
+    /// Remove one unregistered worktree residue. Implementations must remove
+    /// a symlink itself rather than following it.
+    fn remove_path(&self, path: &Path) -> Result<()>;
+    fn create_dir_all(&self, path: &Path) -> Result<()>;
+    fn write_executable(&self, path: &Path, body: &str) -> Result<()>;
+    fn log(&self, message: &str);
+}
+
+/// The real world: a working directory, git, and tmux.
+pub struct Host {
+    repo: PathBuf,
+}
+
+impl Host {
+    pub fn new(repo: PathBuf) -> Self {
+        Self { repo }
+    }
+
+    fn run(&self, program: &str, args: &[&str]) -> Result<std::process::Output> {
+        Command::new(program)
+            .args(args)
+            .current_dir(&self.repo)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| RunnerError::new(format!("cannot run `{program}`: {error}")))
+    }
+
+    fn session_exists(&self, session: &str) -> Result<bool> {
+        Ok(self
+            .run("tmux", &["has-session", "-t", &format!("={session}")])?
+            .status
+            .success())
+    }
+
+    /// One variable of a session's environment, or `None` when the session or
+    /// the variable is absent.
+    pub fn tmux_environment(&self, session: &str, name: &str) -> Result<Option<String>> {
+        let target = format!("={session}");
+        let output = self.run("tmux", &["show-environment", "-t", &target, name])?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let line = String::from_utf8_lossy(&output.stdout);
+        Ok(line
+            .trim()
+            .strip_prefix(&format!("{name}="))
+            .map(str::to_owned))
+    }
+
+    /// Load a local file into a tmux buffer byte for byte. tmux reads the
+    /// file itself, so no command substitution can trim a newline or make its
+    /// contents shell syntax.
+    pub fn tmux_load_buffer(&self, buffer: &str, file: &Path) -> Result<()> {
+        self.tmux_ok(&[
+            "load-buffer",
+            "-b",
+            buffer,
+            "--",
+            &file.display().to_string(),
+        ])
+    }
+
+    pub fn tmux_set_buffer(&self, buffer: &str, text: &str) -> Result<()> {
+        self.tmux_ok(&["set-buffer", "-b", buffer, "--", text])
+    }
+
+    /// Paste one buffer into the session's pane and delete it. `-r` preserves
+    /// LF as input bytes: without it tmux changes every line break to CR,
+    /// which submits multi-line text as separate prompts.
+    pub fn tmux_paste_buffer(&self, buffer: &str, session: &str) -> Result<()> {
+        let pane = format!("={session}:");
+        self.tmux_ok(&["paste-buffer", "-d", "-r", "-b", buffer, "-t", &pane])
+    }
+
+    pub fn tmux_submit(&self, session: &str) -> Result<()> {
+        let pane = format!("={session}:");
+        self.tmux_ok(&["send-keys", "-t", &pane, "Enter"])
+    }
+
+    pub fn tmux_delete_buffer(&self, buffer: &str) {
+        let _ = self.run("tmux", &["delete-buffer", "-b", buffer]);
+    }
+
+    fn tmux_ok(&self, args: &[&str]) -> Result<()> {
+        let output = self.run("tmux", args)?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(RunnerError::new(format!(
+                "tmux {} failed: {}",
+                args.first().copied().unwrap_or_default(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    fn say(&self, message: &str) {
+        eprintln!("alder-ext-runner: {message}");
+    }
+}
+
+/// This block and the inherent one above are the host code a start reaches,
+/// and neither may wait for an engine to come up. `start`'s tests read both
+/// for the words that can only mean waiting; a bounded timeout on a command
+/// that can hang is still allowed, spelled with a `Duration`.
+impl RunnerHost for Host {
+    fn repo(&self) -> &Path {
+        &self.repo
+    }
+
+    fn git(&self, args: &[&str]) -> Result<Run> {
+        let output = self.run("git", args)?;
+        Ok(Run {
+            ok: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn tmux_session(&self, session: &str) -> Result<Option<ObservedSession>> {
+        if !self.session_exists(session)? {
+            return Ok(None);
+        }
+        let environment = |name: &str| self.tmux_environment(session, name);
+        Ok(Some(ObservedSession {
+            handle: environment(HANDLE_ENV)?,
+            tier: environment(TIER_ENV)?,
+            worktree: environment(WORKTREE_ENV)?.map(PathBuf::from),
+            // Anything but an explicit exited marker is conservatively a live
+            // engine: a session of unknown provenance must be refused, never
+            // typed over.
+            engine_live: environment(ENGINE_ENV)?.as_deref() != Some(ENGINE_EXITED),
+        }))
+    }
+
+    fn tmux_new_session(
+        &self,
+        session: &str,
+        cwd: &Path,
+        command: &str,
+        environment: &[(&str, String)],
+    ) -> Result<()> {
+        let cwd = cwd.display().to_string();
+        let mut args: Vec<String> = vec![
+            "new-session".to_owned(),
+            "-d".to_owned(),
+            "-s".to_owned(),
+            session.to_owned(),
+            "-c".to_owned(),
+            cwd,
+        ];
+        for (name, value) in environment {
+            args.push("-e".to_owned());
+            args.push(format!("{name}={value}"));
+        }
+        args.push(command.to_owned());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self.run("tmux", &args)?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(RunnerError::new(format!(
+                "tmux new-session failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    fn tmux_kill_session(&self, session: &str) -> Result<()> {
+        self.run("tmux", &["kill-session", "-t", &format!("={session}")])?;
+        Ok(())
+    }
+
+    fn path_exists(&self, path: &Path) -> bool {
+        path.symlink_metadata().is_ok()
+    }
+
+    fn canonical_path(&self, path: &Path) -> Result<PathBuf> {
+        std::fs::canonicalize(path).map_err(|error| {
+            RunnerError::new(format!(
+                "cannot resolve `{}` before checking Git's worktree registry: {error}",
+                path.display()
+            ))
+        })
+    }
+
+    fn remove_path(&self, path: &Path) -> Result<()> {
+        remove_residue(
+            path,
+            || {
+                path.symlink_metadata()
+                    .map(|metadata| metadata.file_type().is_dir())
+            },
+            |is_directory| {
+                if is_directory {
+                    std::fs::remove_dir_all(path)
+                } else {
+                    // `symlink_metadata` above deliberately does not follow
+                    // a symlink, so this removes the residue link rather than
+                    // its target outside the worktree parent.
+                    std::fs::remove_file(path)
+                }
+            },
+        )
+    }
+
+    fn create_dir_all(&self, path: &Path) -> Result<()> {
+        std::fs::create_dir_all(path).map_err(|error| {
+            RunnerError::new(format!("cannot create `{}`: {error}", path.display()))
+        })
+    }
+
+    fn write_executable(&self, path: &Path, body: &str) -> Result<()> {
+        std::fs::write(path, body)
+            .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)))
+            .map_err(|error| {
+                RunnerError::new(format!("cannot write `{}`: {error}", path.display()))
+            })
+    }
+
+    fn log(&self, message: &str) {
+        self.say(message);
+    }
+}
+
+/// Remove a worktree residue after inspecting its file kind.
+///
+/// The path can disappear in either filesystem call: another repair may win
+/// that race, which is already the desired state. Keeping those two operations
+/// injectable makes both convergence cases deterministic to test.
+fn remove_residue(
+    path: &Path,
+    inspect: impl FnOnce() -> std::io::Result<bool>,
+    remove: impl FnOnce(bool) -> std::io::Result<()>,
+) -> Result<()> {
+    let is_directory = match inspect() {
+        Ok(is_directory) => is_directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(RunnerError::new(format!(
+                "cannot inspect `{}` before removing it: {error}",
+                path.display()
+            )));
+        }
+    };
+    match remove(is_directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(RunnerError::new(format!(
+            "cannot remove unregistered worktree residue `{}`: {error}",
+            path.display()
+        ))),
+    }
+}
+
+/// Single-quote one shell word for the command tmux will run.
+pub(crate) fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    #[test]
+    fn shell_words_survive_quotes_intact() {
+        assert_eq!(quote("claude"), "'claude'");
+        assert_eq!(quote("a b"), "'a b'");
+        assert_eq!(quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn removing_residue_does_not_follow_a_symlink_outside_its_path() {
+        let root = tempfile::TempDir::new().expect("a project root");
+        let outside = tempfile::TempDir::new().expect("an outside directory");
+        let protected = outside.path().join("protected");
+        std::fs::write(&protected, "keep").expect("the outside file is written");
+        let residue = root.path().join("alder-ext-orphan");
+        symlink(outside.path(), &residue).expect("the residue link is created");
+        let host = Host::new(root.path().to_path_buf());
+
+        host.remove_path(&residue)
+            .expect("the residue link is removed");
+
+        assert!(residue.symlink_metadata().is_err());
+        assert_eq!(std::fs::read_to_string(protected).unwrap(), "keep");
+    }
+
+    #[test]
+    fn host_paths_are_real_and_missing_residue_is_harmless() {
+        let root = tempfile::TempDir::new().expect("a project root");
+        let host = Host::new(root.path().to_path_buf());
+
+        assert_eq!(
+            host.canonical_path(root.path()).unwrap(),
+            std::fs::canonicalize(root.path()).unwrap(),
+        );
+        host.remove_path(&root.path().join("already-gone"))
+            .expect("removing absent residue converges");
+    }
+
+    #[test]
+    fn removing_residue_does_not_hide_non_not_found_errors() {
+        let root = tempfile::TempDir::new().expect("a project root");
+        let not_a_directory = root.path().join("file");
+        std::fs::write(&not_a_directory, "not a directory").unwrap();
+        let impossible_child = not_a_directory.join("child");
+        let host = Host::new(root.path().to_path_buf());
+
+        let error = host
+            .remove_path(&impossible_child)
+            .expect_err("only a missing path is safe to ignore");
+
+        assert!(error.message.contains("cannot inspect"), "{error}");
+    }
+
+    #[test]
+    fn a_residue_that_disappears_during_either_filesystem_step_is_already_repaired() {
+        let path = Path::new("/projects/alder-ext-run");
+        remove_residue(
+            path,
+            || Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            |_| panic!("nothing is removed when inspection finds nothing"),
+        )
+        .expect("a path absent before inspection is converged");
+        remove_residue(
+            path,
+            || Ok(false),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        )
+        .expect("a path removed after inspection is converged too");
+
+        let error = remove_residue(
+            path,
+            || Ok(false),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .expect_err("only NotFound is a completed repair");
+        assert!(
+            error.message.contains("cannot remove unregistered"),
+            "{error}"
+        );
+    }
+}
