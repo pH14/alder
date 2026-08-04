@@ -34,12 +34,15 @@ The loop is a singleton per log. There is one loop, so it needs no ID, and
 Alder stores. The driver schedules. The executor thinks.
 
 The **driver** (`alderd`, or anything that behaves like it) decides *when* to
-wake an executor. It exercises no judgment about work, and it appends nothing.
-Its complete read surface is two things:
+run the executor. It exercises no judgment about work, and it appends
+nothing. Its complete read surface is one thing:
 
 1. `alder status --json`: the current head, and the loop section. It ignores
    the rest of the document.
-2. `alder refresh --json` → `.changed`.
+
+When a trigger fires it runs one configured shell command with the trigger
+names in `ALDERD_TRIGGERS`; sessions, engines, and the observation sweep
+(`alder refresh`) are that command's business, never the driver's.
 
 Its complete durable write surface is one machine-local file:
 `.alder/alderd-notes.json`, the last head it acted on and when. That file is
@@ -72,8 +75,8 @@ The process tree has a root outside the daemon:
 ```text
 launchd (KeepAlive, RunAtLoad)
   └─ alderd
-       └─ executor session
-            └─ worker sessions
+       └─ the configured command
+            └─ whatever it drives (sessions are its business, not alderd's)
 ```
 
 `scripts/alderd-install.sh` renders the launchd agent for one checkout and
@@ -102,10 +105,9 @@ worker's milestone, a phone command — moves the head past the note and wakes
 the executor again. Being woken by your own writes is harmless: the executor
 reads the fold, and a fold with nothing new demands nothing.
 
-Three more conditions wake without a head movement, each read from the same
-status document or the driver's own observation:
+Two more conditions wake without a head movement, both read from the same
+status document:
 
-- **observations**: `alder refresh` reported a semantic change;
 - **due**: a deferral deadline (any entry in the loop section's
   `review_deadlines`) has arrived and no wake has been delivered since it
   passed, or `maxIntervalSeconds` elapsed since the last wake — the ceiling
@@ -114,36 +116,28 @@ status document or the driver's own observation:
 
 ### The delivery
 
-Firing is strictly ordered: reconcile the session, inject the line, then
-write the notes. The two crash windows this leaves are both benign, and both
-are pinned by the crash simulator and the model checker:
+Firing is strictly ordered: run the configured command to completion, then
+write the notes. The crash windows this leaves are benign, and pinned by the
+crash simulator and the model checker:
 
-- **Injected, not noted.** The executor was handed the line; the restarted
-  daemon does not know that, and delivers it again. A duplicate wake finds a
-  executor with nothing new to do.
-- **Torn injection.** The text was typed, the Enter was not. Nothing was
-  delivered and nothing was noted; the next fire restarts the pane it does
-  not recognize and delivers a fresh line.
+- **Ran, not noted.** The command completed; the restarted daemon does not
+  know that, and runs it again. A duplicate wake finds an executor with
+  nothing new to do.
+- **Command failed or died.** Nothing was noted; the next poll runs the same
+  wake again. The command must therefore be idempotent, which the waking
+  design already demands of everything downstream of a wake.
 
-The injected message takes one of two forms and nothing else:
+The command receives one thing beyond its configuration: the trigger names,
+comma-joined, in `ALDERD_TRIGGERS` (for example `log,due`).
 
-```text
-Read <passDoc>, then read the current Alder state and act on it (triggers: <kinds>).
-Read the current Alder state and act on it (triggers: <kinds>).
-```
-
-The first is the bootstrap form, used on a fresh session that has not read
-the pass document. There is no identifier in the line, because nothing
-durable exists to identify.
-
-The message is deliberately not a prompt. Everything the executor needs to know
-about *how* to act lives in the pass document, in the repository, under
-review. Anything the driver said instead would be operational instruction
+The delivery is deliberately not a prompt. Everything the executor needs to
+know about *how* to act lives in the repository, under review, behind the
+command. Anything the driver said instead would be operational instruction
 smuggled past the place where it can be read and changed.
 
-**Trigger kinds are informational. They are never scope limiters.** An executor
-woken by `observations` reads the complete state exactly like one woken by
-`due`; the driver cannot know what else changed while it was not looking.
+**Trigger kinds are informational. They are never scope limiters.** A command
+run for `manual` reads the complete state exactly like one run for `due`;
+the driver cannot know what else changed while it was not looking.
 
 ## Fold rules
 
@@ -154,15 +148,21 @@ reason from the event; `loop.resumed` sets it to false and clears the reason.
 No count, no nesting, no owner.
 
 **Engine.** Last writer wins. `loop.engine_selected` replaces the desired
-engine name. The name is an opaque string that Alder never validates.
+engine name. The name is an opaque string that Alder never validates; the
+driver never reads it — it is served for the configured command, which is
+what runs engines now.
 
 **Rotation and nudge.** Each request records the sequence it was asked at:
 `rotate_requested_seq`, `nudge_requested_seq`. That is all the fold says.
 Whether a request has been *acted on* is not a log fact — the log does not
-record its readers — so each driver compares the request sequence with its
-own noted head: later than the note means outstanding, and acting (which
-moves the note past it) consumes it. Two drivers with separate notes each
-honor the request once, which is the harmless direction.
+record its readers — so a reader compares the request sequence with its own
+machine-local note: later than the note means outstanding, and acting (which
+moves the note past it) consumes it. The driver applies that rule to the
+nudge, which is its manual trigger. The rotation request is the command's to
+honor the same way — the driver no longer maintains any session to rotate —
+and the request's own append still moves the head, so the command is woken
+for it like for any other write. Two readers with separate notes each honor
+a request once, which is the harmless direction.
 
 **Deferral.** `work block --until <RFC3339>` stores a review deadline on the
 work item. The loop section serves every blocked item's deadline, sorted, as
@@ -177,20 +177,15 @@ rotation request); no append path can produce a new one.
 
 ## Eras and rotation
 
-A **session era** is one engine process serving a run of wakes. An era ends
-for one of five reasons, and the driver checks them in this order:
-
-1. the running session is not one this daemon started;
-2. the desired engine changed;
-3. a rotation request is later in the log than the noted head;
-4. the pass document changed;
-5. the session outlived `maxSessionAgeSeconds`.
-
-The first is why a driver restart replaces the session rather than adopting
-it: the daemon cannot tell what engine is running or how much context it has
-accumulated, and adopting a stranger would silently defeat every other rule.
-The last is wall-clock age on purpose: nothing durable counts passes, so
-nothing counts them here either.
+A **session era** is one engine process serving a run of wakes. Eras belong
+to the configured command now: whether the executor is a long-lived
+interactive session, a one-shot process per wake, or something else entirely
+is the command's design, and the driver neither knows nor cares. What the
+durable model provides is the era boundary an operator can request:
+`loop rotate` appends a rotation request, the fold serves its sequence, and
+the command — which reads status itself — ends whatever era it maintains and
+notes the request consumed, by the same note-comparison rule the driver uses
+for nudges.
 
 Rotation is the operator's manual era boundary: `loop rotate` after upgrading
 an engine, or when a session has drifted. It is *not* an emergency stop — it
@@ -200,70 +195,49 @@ changes which process serves the next wake; `loop pause` stops wakes.
 
 A nudge is the operator's "wake it now". `loop nudge` appends a request; the
 append itself moves the head, and the request being later in the log than the
-driver's note makes it the `manual` trigger, which overrides both of the
-driver's deferrals — the debounce and the attached-client hold — the way the
-`maxIntervalSeconds` ceiling does. It does not override `loop pause`. A nudge
-changes *when* the executor is next woken, never *what* it does.
+driver's note makes it the `manual` trigger, which overrides the driver's
+debounce the way the `maxIntervalSeconds` ceiling does. It does not override
+`loop pause`. A nudge changes *when* the executor is next woken, never *what*
+it does.
 
 ## Workers
 
-An executor may dispatch implementation to worker sessions rather than doing it
-itself — one work item per worker, each in its own git worktree and tmux
-session, stamped with its attempt ID and bound to the attempt through the
-ordinary handle. This is entirely process layer: Alder stores attempts,
-handles, questions, and observations exactly as before, the tmux probe
-answers for each bound handle like any other observed object, and
-`reconcile` catches dead ones with the same rules. No Alder mechanism knows
-the word "worker". See the [pass](../../.agent/skills/pass/SKILL.md) and
-[worker](../../.agent/skills/worker/SKILL.md) skills for the process itself,
-and `alderd spawn` for the dispatch.
+An executor may dispatch implementation to worker sessions rather than doing
+it itself — one work item per worker, each in its own git worktree, bound to
+the attempt through the ordinary handle. This is entirely process layer:
+Alder stores attempts, handles, questions, and observations exactly as
+before, the configured probe answers for each bound handle like any other
+observed object, and `reconcile` catches dead ones with the same rules. No
+Alder mechanism knows the word "worker". See the
+[pass](../../.agent/skills/pass/SKILL.md) and
+[worker](../../.agent/skills/worker/SKILL.md) skills for the process itself.
 
-`alderd spawn <work-id> [tier]` is the whole dispatch: it reads the item,
-records the attempt, cuts the worktree and branch, launches the pane with the
-item's goal **as argv**, and binds the handle. Nothing is typed at the
-session and nothing waits for an engine to boot, so there is no sleep on the
-path; the pane command ends `; exec bash`, so a one-shot engine leaves a live
-session behind and the handle stays true. The daemon still reaches the log
-only by running `alder`, and it hands the worktree a copy of `alder` alone —
-a worker cannot dispatch.
+Actually running a worker — cut a worktree on a branch, hand a prompt to a
+model at some effort, get back a handle to ask after, send into, or kill —
+is `alder-ext-runner`'s job (`crates/alder-ext-runner`), a tool that is
+deliberately generic: it imports no Alder crate, never touches the Alder
+log, and stamps only its own names into the sessions it creates; nothing in
+Alder depends on it back. The glue that composes an item's brief into a
+prompt, starts an execution through the runner, and binds the printed handle
+to the attempt is the executor-side process the skills describe — Alder
+stores the results and reads nothing into the mechanics.
 
-A Codex pane starts a launcher-owned sidecar before `codex exec`. It snapshots
-the existing local Codex rollouts, finds the first new `session_meta` whose
-`cwd` is the worktree, and stamps that UUID as `codex-session` on the attempt.
-This is deliberately outside the worker turn: a one-shot that dies before its
-first tool call still has a durable resume handle. The sidecar leaves a local
-marker first; when a log append is temporarily unavailable, the tmux
-observer recovers the fresh rollout UUID and supplies it to `reconcile`, which names a
-`codex_session_unstamped` finding and its exact `attempt edit` repair. A
-resume without that UUID is refused rather than guessing from `--last`, since
-a consult can be newer than the worker session.
-
-The six rungs — `luna`, `terra`, `sol` on codex and `sonnet`, `opus`, `fable`
-on claude — are a table in the daemon, each pinning a model *and* a reasoning
-effort. An unknown rung is an error rather than a fall-through, because
-falling through to a CLI default would launch a worker at an unknown model
-and record nothing about it. A rung whose provider is rate-limited is served
-by the rung of equal standing on the other ladder; `alderd budget` reads
-trailing spend per provider off local transcripts, and `alderd limit` is how
-a limit gets recorded.
-
-The spawn is checked end to end by `crates/alderd/tests/spawn_host.rs` under
-`cargo test`, and by `scripts/tests/verify-spawn.sh` against a real `alder`
-and a throwaway log. Both run a throwaway repository and their own tmux
-server and assert what a live session actually received. That sandbox must
-never reach the machine's own tmux server, so the teardown that enforces it —
-one session, by exact name, only after proving the sandbox server holds
-nothing else — lives in `scripts/tests/tmux-sandbox.sh` and is itself tested
-by `scripts/tests/test-teardown-guard.sh`.
+The rungs the runner dispatches on — `luna`, `terra`, `sol` on codex and
+`sonnet`, `opus`, `fable` on claude, each pinning a model *and* a reasoning
+effort — are the runner's table, machine-locally configurable, with an
+unknown rung a hard error rather than a fall-through to a CLI default. A
+rung whose provider is rate-limited is served by the rung of equal standing
+on the other ladder; `alder-ext-runner budget` reads trailing spend per
+provider off local transcripts, and `alder-ext-runner limit` is how a limit
+gets recorded.
 
 Two conventions in that process are worth naming here because they show up
 in the log rather than in the repository. A worker records an up-tier
 consult as `consulted` metadata on its own attempt, and a dispatch records
-the rung it launched at as `tier`, `engine` and `effort` metadata; the Codex
-sidecar also records `codex-session`. Between them, an item resent up the
-ladder carries the whole climb and a one-shot worker carries its resume
-handle. All are ordinary open-ended metadata: Alder stores and displays them
-and reads nothing into them.
+the rung it launched at as `tier`, `engine` and `effort` metadata. Between
+them, an item resent up the ladder carries the whole climb. All are ordinary
+open-ended metadata: Alder stores and displays them and reads nothing into
+them.
 
 ## Driver configuration
 
@@ -271,42 +245,37 @@ and reads nothing into them.
 
 ```json
 {
-  "engines": {
-    "claude": { "cmd": "claude", "args": [] },
-    "codex": { "cmd": "codex", "args": ["--full-auto"] }
-  },
-  "passDoc": ".agent/skills/pass/SKILL.md",
-  "tmuxSession": "alder-executor",
+  "command": "alder-pass",
   "pollSeconds": 60,
   "debounceSeconds": 20,
   "maxIntervalSeconds": 1800,
-  "maxSessionAgeSeconds": 21600,
   "notify": "terminal-notifier -title alder -message"
 }
 ```
 
-`engines` maps the opaque name recorded by `loop use` to a command on this
-machine. `passDoc` names the pass prompt document; its content hash is an era
-boundary. The remaining fields are timings and a notification hook, and only
-`engines` and `passDoc` are required.
+`command` is the shell command a wake runs, and the only required field; the
+remaining fields are timings and a notification hook. How that command runs
+the executor — which engines exist on this box, where the pass document
+lives, what sessions look like — is the command's own configuration, not the
+driver's.
 
-This file is local on purpose. Which engines are installed and how aggressively
-to poll are properties of a box, not durable project facts, and putting them in
-the log would invite one machine's configuration to become another's problem.
-See [crates/alderd/README.md](../../crates/alderd/README.md) for the field
-table and the poll sequence.
+This file is local on purpose. What command drives the executor and how
+aggressively to poll are properties of a box, not durable project facts, and
+putting them in the log would invite one machine's configuration to become
+another's problem. See
+[crates/alderd/README.md](../../crates/alderd/README.md) for the field table
+and the poll sequence.
 
-## Deferral of the injection
+## Deferral of the wake
 
-Two conditions hold an injection without cancelling it:
+One condition holds a wake without cancelling it:
 
-- **Debounce.** A burst of commits should produce one wake, not one per commit.
-- **An attached client.** If someone is watching the tmux session, an injection
-  would land under their cursor.
+- **Debounce.** A burst of commits should produce one run, not one per
+  commit.
 
-Neither survives `maxIntervalSeconds`, and neither survives a pending nudge.
-A loop that never runs is a worse failure than an inconvenient injection, and
-a deferral with no ceiling is indistinguishable from a hang.
+It survives neither `maxIntervalSeconds` nor a pending nudge. A loop that
+never runs is a worse failure than a redundant run, and a deferral with no
+ceiling is indistinguishable from a hang.
 
 ## What the loop is not
 
@@ -319,5 +288,6 @@ a deferral with no ceiling is indistinguishable from a hang.
   log is the folded observation picture, so a flip and return between observer
   runs is intentionally absent.
 - **Not a place for driver diagnostics.** A driver that cannot reach the store
-  or cannot find its engine says so to its operator. It does not write its own
-  troubles into the project's log — the log never mentions its readers.
+  or whose command keeps failing says so to its operator. It does not write
+  its own troubles into the project's log — the log never mentions its
+  readers.
