@@ -176,7 +176,9 @@ cat "$TMUX_LOG"
 [ -s "$SB/argv.txt" ] || fail "the engine received no prompt"
 [ "$(cat "$SB/argc.txt")" = "1" ] ||
   fail "the prompt arrived as $(cat "$SB/argc.txt") arguments, not one"
-diff -u "$SB/prompt.txt" "$SB/argv.txt" >/dev/null ||
+# The stub prints its one argument plus a final newline, so the expected
+# bytes are the prompt file plus exactly one newline.
+diff <(cat "$SB/prompt.txt"; echo) "$SB/argv.txt" >/dev/null ||
   fail "the prompt bytes were changed on the way to the engine"
 
 # Nothing was typed at the session, and nothing waited for it to boot.
