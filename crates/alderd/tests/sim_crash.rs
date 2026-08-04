@@ -109,7 +109,7 @@ fn every_torn_subset_of_the_wake_lifecycle_converges() {
     let probe = Simulator::new(3);
     let mut driver = Driver::new(probe.clone(), config());
     driver.poll_once().unwrap();
-    probe.run_leader_if_injected();
+    probe.run_executor_if_injected();
     let lifecycle = probe.trace();
     for label in ["wake.session-create", "wake.inject", "notes.write"] {
         position_of(&lifecycle, label);
@@ -123,7 +123,7 @@ fn every_torn_subset_of_the_wake_lifecycle_converges() {
             assert!(
                 catch_sim_crash(|| {
                     driver.poll_once()?;
-                    host.run_leader_if_injected();
+                    host.run_executor_if_injected();
                     Ok::<(), alderd::error::DriverError>(())
                 })
                 .is_none(),
@@ -139,7 +139,7 @@ fn every_torn_subset_of_the_wake_lifecycle_converges() {
 }
 
 /// A crash between the injection and the notes write is the duplicate-wake
-/// window: the leader was handed the line, but the restarted daemon does not
+/// window: the executor was handed the line, but the restarted daemon does not
 /// know that and delivers it again. Pinned so the interesting subset does not
 /// depend on enumeration order, and asserted to actually produce the second
 /// delivery — which the invariant then holds harmless.
@@ -201,10 +201,10 @@ fn a_log_append_tears_to_nothing_or_everything() {
     }
     // The daemon poll path is checked too, and the stronger fact rides along:
     // it contains no append at all. The daemon appends nothing.
-    let leader = Simulator::new(6);
-    Driver::new(leader.clone(), config()).poll_once().unwrap();
-    leader.run_leader_if_injected();
-    for boundary in &leader.trace() {
+    let executor = Simulator::new(6);
+    Driver::new(executor.clone(), config()).poll_once().unwrap();
+    executor.run_executor_if_injected();
+    for boundary in &executor.trace() {
         assert!(
             !boundary.footprint.contains(&"append"),
             "the daemon poll path appended to the log: {boundary:#?}"
@@ -367,7 +367,7 @@ fn a_failing_seed_replays_byte_for_byte() {
             Operation::RestartDaemon,
             Operation::PollDaemon,
             Operation::Tick(7),
-            Operation::LeaderDiesMidPass,
+            Operation::ExecutorDiesMidPass,
             Operation::RestartDaemon,
         ],
         fault_schedule: vec![Fault::torn(5, 0b10), Fault::whole(19)],
@@ -398,7 +398,7 @@ fn a_daemon_restart_interleaves_with_an_interrupted_spawn() {
     );
 }
 
-/// An execution outliving its ended attempt — the leader ended the attempt,
+/// An execution outliving its ended attempt — the executor ended the attempt,
 /// then died before killing the session — must surface as production's
 /// `orphan` finding through the ordinary observe-then-reconcile round, and
 /// the repair must kill exactly that session.
@@ -564,7 +564,7 @@ fn generated_case(seed: u64, noise: Vec<u8>, fault_slots: Vec<(u8, u8)>) -> Case
         });
     }
     operations.extend([
-        Operation::LeaderDiesMidPass,
+        Operation::ExecutorDiesMidPass,
         Operation::RestartDaemon,
         Operation::PollDaemon,
     ]);
@@ -590,7 +590,7 @@ fn generated_case(seed: u64, noise: Vec<u8>, fault_slots: Vec<(u8, u8)>) -> Case
 /// next injection must bootstrap — and a real crash erases all of it. A case
 /// that caught the panic and carried the same `Driver` into the next operation
 /// let that state outlive the process it lived in, and the difference is not
-/// academic: a daemon that still believes it owns the leader session reuses it
+/// academic: a daemon that still believes it owns the executor session reuses it
 /// instead of restarting it, so it types the next injection straight onto the
 /// text the torn one left behind.
 #[test]
@@ -619,29 +619,29 @@ fn a_daemon_that_died_mid_injection_does_not_reuse_the_pane_it_dirtied() {
 ///
 /// The script belongs to the wake, not to a session, and getting that wrong
 /// has failed in both directions here. Arming only the *next* session creation
-/// never reached a leader the daemon reuses, so an operation named for a death
+/// never reached an executor the daemon reuses, so an operation named for a death
 /// produced none. Arming both the live session and the next creation fired on
 /// the live one and then stayed armed for its replacement, so one operation
 /// modelled two deaths and quietly changed the interleaving under test. This
-/// pins both edges at once: a reused leader dies, and the leader created after
+/// pins both edges at once: a reused executor dies, and the executor created after
 /// it is an ordinary one.
 #[test]
-fn one_armed_leader_death_kills_exactly_one_leader() {
+fn one_armed_executor_death_kills_exactly_one_executor() {
     let host = Simulator::new(31);
     let mut driver = Driver::new(host.clone(), config());
-    // A leader session exists and this daemon knows it, so the next fire
+    // An executor session exists and this daemon knows it, so the next fire
     // reuses it rather than restarting it.
     driver.poll_once().unwrap();
-    host.run_leader_if_injected();
-    host.script_leader(AgentScript::DieMidAct);
+    host.run_executor_if_injected();
+    host.script_executor(AgentScript::DieMidAct);
     host.nudge();
     driver.poll_once().unwrap();
-    host.run_leader_if_injected();
-    // The scripted leader is gone; firing again builds a replacement, which
-    // acts as an ordinary leader.
+    host.run_executor_if_injected();
+    // The scripted executor is gone; firing again builds a replacement, which
+    // acts as an ordinary executor.
     host.nudge();
     let _ = driver.poll_once();
-    host.run_leader_if_injected();
+    host.run_executor_if_injected();
 
     let deaths = host
         .trace()
@@ -658,39 +658,39 @@ fn one_armed_leader_death_kills_exactly_one_leader() {
     host.assert_invariant(false);
 }
 
-/// The operation named for a leader death has to actually kill a leader.
+/// The operation named for an executor death has to actually kill an executor.
 ///
 /// It mostly did not. Scripting the death set only what the *next* session
 /// creation would run, and a daemon that already has a session reuses it — so
 /// unless something happened to restart it first, the scripted death never
-/// reached the running leader and the pass ended normally. That matters well
+/// reached the running executor and the pass ended normally. That matters well
 /// beyond this one operation: it is the generated cases' only source of
 /// mid-pass death, so a whole class of interleavings named for it was not
 /// exercising it, and the convergence evidence read stronger than it was.
 ///
 /// This uses the generated shape at its least helpful — no noise, so nothing
-/// restarts the daemon between the poll that creates the leader session and
+/// restarts the daemon between the poll that creates the executor session and
 /// the operation meant to kill it.
 #[test]
-fn the_leader_death_operation_kills_a_leader_that_is_already_running() {
+fn the_executor_death_operation_kills_a_executor_that_is_already_running() {
     let case = generated_case(21, Vec::new(), Vec::new());
     let digest = execute_case(&case);
     let created = digest
         .trace
         .iter()
         .position(|boundary| boundary.contains("wake.session-create"))
-        .expect("the poll before the death creates a leader session");
+        .expect("the poll before the death creates an executor session");
     let died = digest
         .trace
         .iter()
         .position(|boundary| boundary.contains("agent.die"))
         .unwrap_or_else(|| {
-            panic!("no leader died in a case named for a leader death: {digest:#?}")
+            panic!("no executor died in a case named for an executor death: {digest:#?}")
         });
     assert!(
         created < died,
-        "the leader that died was created after the death, so the operation \
-         never reached a running leader: {digest:#?}"
+        "the executor that died was created after the death, so the operation \
+         never reached a running executor: {digest:#?}"
     );
 }
 
@@ -726,12 +726,12 @@ proptest! {
 }
 
 #[test]
-fn a_leader_stub_can_die_mid_act_without_stranding_anything() {
+fn a_executor_stub_can_die_mid_act_without_stranding_anything() {
     let host = Simulator::new(4);
-    host.script_leader(AgentScript::DieMidAct);
+    host.script_executor(AgentScript::DieMidAct);
     let mut driver = Driver::new(host.clone(), config());
     driver.poll_once().unwrap();
-    host.run_leader_if_injected();
+    host.run_executor_if_injected();
     host.recover(false);
     host.assert_invariant(false);
 }

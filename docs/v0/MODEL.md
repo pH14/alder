@@ -60,7 +60,7 @@ The Git log contains typed events. Every event has this envelope:
 
 `seq`, not `at`, determines order. Every mutation uses the same expected-head
 conditional append path. `actor` is provenance, not an authorization claim;
-Alder does not assign durable writer roles or distinguish a leader, human,
+Alder does not assign durable writer roles or distinguish an executor, human,
 worker, or side session for permission purposes. Repository skills and their
 host environment own those workflow policies.
 
@@ -539,19 +539,19 @@ harmless direction.
 
 The loop section of `alder status` also serves `review_at`: the earliest
 `work block --until` deadline over all blocked work. It is derived from work
-items, not stored on the loop; it exists so a driver can wake the leader at
+items, not stored on the loop; it exists so a driver can wake the executor at
 the deferral's instant without reading work state.
 
 Pause is desired state, not a lock: enforcement belongs to whatever schedules
 the loop. Alder does not store which driver, host, or process owns the loop,
-for the same reason it stores no leader role.
+for the same reason it stores no executor role.
 
 [LOOP.md](LOOP.md) states the driver's read surface and why a missed or
 duplicated wake is harmless.
 
 ## Concurrent writers
 
-Alder stores no leader, generation, lease, or writer role. For each mutation:
+Alder stores no executor, generation, lease, or writer role. For each mutation:
 
 1. the caller queries the configured remote ref and reads log head `H`;
 2. Alder validates the command against the projection for `H`;
@@ -580,7 +580,7 @@ channel.
 The expected head is internal to the command. There is no public `--if-head`
 option. A change committed before a command begins is part of the state
 against which that command is validated. A repository skill may still assign
-one agent the leader role, but that role has no representation or enforcement
+one agent the executor role, but that role has no representation or enforcement
 inside Alder.
 
 Every ordinary read and mutation must first establish the current shared-log

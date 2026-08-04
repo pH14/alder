@@ -211,7 +211,7 @@ fn alder_binary(root: &Path) -> String {
 }
 
 const USAGE: &str = "\
-alderd — wake the Alder leader, and dispatch its workers
+alderd — wake the Alder executor, and dispatch its workers
 
 usage: alderd [--root <project>]                     run the driving loop
        alderd [--root <project>] spawn <work-id> [tier]

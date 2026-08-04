@@ -927,7 +927,7 @@ pub fn loop_section(state: &ProjectState) -> Value {
 /// `now` is a parameter rather than a clock read so the derivation stays a
 /// pure function a test can pin: an expired `--until` is
 /// "unblocked-pending-review", meaning the item stays blocked in the fold and
-/// this finding is what puts the review in front of the leader.
+/// this finding is what puts the review in front of the executor.
 pub fn expired_block_findings(
     state: &ProjectState,
     now: DateTime<Utc>,

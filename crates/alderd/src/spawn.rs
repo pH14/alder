@@ -45,15 +45,15 @@ use crate::{
 /// that needs it after its launch turn.
 pub const GATES: &str = "cargo fmt --check, cargo clippy --workspace --all-targets with zero warnings, cargo test --workspace green";
 
-/// Checks the leader records from outside the worker's session, so a goal must
+/// Checks the executor records from outside the worker's session, so a goal must
 /// not present them as the worker's own.
 ///
 /// A worker stops when every check it was given is satisfied. A check only the
-/// leader can satisfy — a cross-review is one by construction, since its whole
+/// executor can satisfy — a cross-review is one by construction, since its whole
 /// point is that the author did not run it — would therefore strand every
-/// worker one step short of the marker the leader is waiting for. Naming these
+/// worker one step short of the marker the executor is waiting for. Naming these
 /// separately is what keeps "every check" true for both readers.
-pub const LEADER_CHECKS: [&str; 1] = ["cross-review"];
+pub const EXECUTOR_CHECKS: [&str; 1] = ["cross-review"];
 
 /// Replaces the whole engine invocation, so a test can spawn a stub instead of
 /// a model. The goal is still appended as the final argument.
@@ -77,7 +77,7 @@ pub struct ObservedSession {
 /// is one: the ordering rules above are the interesting part, and they are
 /// worth testing without a tmux server, a git checkout, or a model.
 pub trait SpawnHost {
-    /// The project the leader dispatches from.
+    /// The project the executor dispatches from.
     fn root(&self) -> &Path;
     /// The `alder` binary, as a path that can be copied into a worktree.
     fn alder_binary(&self) -> PathBuf;
@@ -239,10 +239,10 @@ impl Brief {
         if self.checks.is_empty() {
             parts.push("No acceptance checks are recorded; the spec is the whole bar.".to_owned());
         } else {
-            let (leaders, mine): (Vec<_>, Vec<_>) = self
+            let (executors, mine): (Vec<_>, Vec<_>) = self
                 .checks
                 .iter()
-                .partition(|(key, _)| LEADER_CHECKS.contains(&key.as_str()));
+                .partition(|(key, _)| EXECUTOR_CHECKS.contains(&key.as_str()));
             if mine.is_empty() {
                 parts.push(
                     "No acceptance check is yours to satisfy; the spec is the whole bar."
@@ -254,11 +254,11 @@ impl Brief {
                     listed(&mine)
                 ));
             }
-            if !leaders.is_empty() {
+            if !executors.is_empty() {
                 parts.push(format!(
-                    "The leader records these from outside your session, after you stop: {}. \
+                    "The executor records these from outside your session, after you stop: {}. \
                      They are not yours to satisfy and not a reason to withhold the marker.",
-                    listed(&leaders)
+                    listed(&executors)
                 ));
             }
         }
@@ -387,7 +387,7 @@ pub fn spawn(
     sweep_unregistered_worktree(host, worktree_parent, &worktree)?;
     let worktree_present = verify_worktree(host, &worktree, &branch)?;
     // Worktrees outlive a driver process.  Put the current delivery adapter
-    // into an adopted checkout too, so a leader never has to fall back to
+    // into an adopted checkout too, so an executor never has to fall back to
     // hand-crafted tmux input merely because the checkout predates the helper.
     if worktree_present {
         install_relay(host, &worktree)?;
@@ -769,7 +769,7 @@ fn launch(
         &worktree.join(".alder/config.json"),
     )?;
     host.copy_file(&host.alder_binary(), &worktree.join(".alder/bin/alder"))?;
-    // A ruling is durable before a leader asks a transport to deliver it.
+    // A ruling is durable before an executor asks a transport to deliver it.
     // This tmux adapter is deliberately separate from that durable protocol:
     // another worker transport can read the same ruling from the log without
     // teaching the event model anything about tmux or a local path.
@@ -814,7 +814,7 @@ fn install_relay(host: &impl SpawnHost, worktree: &Path) -> Result<()> {
 
 /// The tmux delivery adapter installed into every worker worktree.
 ///
-/// The file is local input to the leader's process. Its bytes are either
+/// The file is local input to the executor's process. Its bytes are either
 /// loaded into a tmux buffer directly (an interactive worker), or encoded
 /// before a one-shot Codex shell reconstructs them as an argv value for the
 /// already-generated `.alder/resume` script. In neither route does the helper
@@ -1569,7 +1569,7 @@ mod tests {
     /// A dispatch asks the world a fixed set of questions and never asks again.
     ///
     /// A wait is an observation made again in the hope of a different answer,
-    /// so the two are the same claim seen from either end. What a leader can
+    /// so the two are the same claim seen from either end. What an executor can
     /// observe about whether a dispatch waited is exactly which questions went
     /// out and how many times, and every question this path puts to the world
     /// goes through the host — so the log below is that observation, not a note
@@ -2398,7 +2398,7 @@ esac
     }
 
     #[test]
-    fn a_leader_owned_check_is_not_presented_as_the_workers() {
+    fn a_executor_owned_check_is_not_presented_as_the_workers() {
         let brief = Brief::from_show(&json!({"current": {
             "id": "al-5",
             "title": "Do the thing",
@@ -2410,22 +2410,22 @@ esac
         }}))
         .unwrap();
         let goal = brief.goal("al-5-attempt-1");
-        let (mine, leaders) = goal
-            .split_once("The leader records these")
-            .expect("a leader-owned check is named separately");
+        let (mine, executors) = goal
+            .split_once("The executor records these")
+            .expect("an executor-owned check is named separately");
         assert!(
             mine.contains("Done when every check is satisfied: gates —"),
             "{goal}"
         );
         assert!(!mine.contains("cross-review"), "{goal}");
-        assert!(leaders.contains("cross-review"), "{goal}");
-        assert!(leaders.contains("not yours to satisfy"), "{goal}");
+        assert!(executors.contains("cross-review"), "{goal}");
+        assert!(executors.contains("not yours to satisfy"), "{goal}");
     }
 
     /// The deadlock this avoids: a worker told to stop when every check is
     /// satisfied, whose only check is one it cannot satisfy, never stops.
     #[test]
-    fn an_item_whose_only_check_is_the_leaders_leaves_the_worker_none() {
+    fn an_item_whose_only_check_is_the_executors_leaves_the_worker_none() {
         let brief = Brief::from_show(&json!({"current": {
             "id": "al-6",
             "title": "Do the thing",

@@ -52,7 +52,7 @@ not merge.
 ## Reviewer selection
 
 The reviewer is the rung across from the author's or higher — never the
-author's own vendor or session, and never a subagent of the leader (it
+author's own vendor or session, and never a subagent of the executor (it
 inherits unlogged session effort). The author is every vendor with an attempt
 on the branch; check the `engine` metadata of every attempt, not just the
 newest. Attempt IDs take the form `al-<id>-attempt-N`, so inspect each attempt
@@ -105,7 +105,7 @@ tmux new-session -d -s review-<id> -c <branch-worktree> \
 
 Collect the verdict from the session's pane/transcript, record it, then kill
 the session. Freshness still matters: a new session every review, never the
-leader's own or a subagent (both carry unlogged context or effort).
+executor's own or a subagent (both carry unlogged context or effort).
 
 The prompt file (in `$scratch`, outside the worktree) holds the brief:
 
@@ -163,7 +163,7 @@ Pick the fix tier by the size of the findings, not the original item.
 ## Declaration and legacy items
 
 Declare the check at admission (`work add --check cross-review:"reviewed by
-the other vendor's ladder; the leader records this one, not the worker"`) —
+the other vendor's ladder; the executor records this one, not the worker"`) —
 checks cannot change while an attempt is active. Items admitted before the
 rule have no check to write to: review anyway and park the verdict in
 metadata (`cross-review=<verdict>`,

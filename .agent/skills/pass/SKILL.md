@@ -1,11 +1,11 @@
 ---
 name: pass
-description: Drive one bounded Alder leader pass from durable state.
+description: Drive one bounded Alder executor pass from durable state.
 ---
 
 # One pass
 
-You are the leader for the alder project — the repository you are sitting
+You are the executor for the alder project — the repository you are sitting
 in. You do not implement work items yourself anymore: workers do, one item
 each, in worktrees at `../alder-work-<id>` on branches `work/<id>`, in tmux
 sessions named `alder-work-<id>`. You dispatch them, rule for them, review
@@ -45,7 +45,7 @@ sequence rather than pasting it into the event.
 
 For a tmux worker, record the ruling first, then call that worktree's
 `.alder/relay <session> <file>`. The helper owns literal tmux delivery and any
-Codex resume mechanics; leaders do not recreate a `send-keys`, command
+Codex resume mechanics; executors do not recreate a `send-keys`, command
 substitution, or quoted resume command. It reports one tmux delivery to the
 working engine, never by inspecting a pane's input line or synchronously
 probing worker progress.
@@ -184,7 +184,7 @@ flag without its own operator ruling.
      gets recorded when a spawn or a worker dies on one.
 8. **Nudge stalls.** For each in-flight attempt with no milestone in a long
    while, use fresh observations and the attempt's durable progress rather
-   than pane text. A genuine stall gets one short, leader-authored nudge
+   than pane text. A genuine stall gets one short, executor-authored nudge
    through `.alder/relay`; its one-delivery report applies. Stalled
    again next pass: kill, respawn fresh (same item, same branch). Fails a
    second respawn: `alder work ask <id>` — the operator decides.
@@ -270,7 +270,7 @@ Everything a pass once reported goes where it belongs, before you stop:
 - a conclusion about an item — "held off because …" — is an attempt note
   (`alder attempt edit --note-file`) or the item's block reason;
 - "check again at 3pm" is `alder work block <id> --why "…" --until
-  <RFC3339>`. The driver wakes the leader at that instant, and the expired
+  <RFC3339>`. The driver wakes the executor at that instant, and the expired
   deferral surfaces under `attention` until someone reviews it — nothing
   unblocks by itself;
 - a heavy or degraded context is `alder loop rotate --why "…"`, which makes

@@ -130,7 +130,7 @@ impl Effects for Fake {
 
     fn tmux_session_exists(&self, session: &str) -> Result<bool> {
         let world = self.world.borrow();
-        Ok(world.session.is_some() && session == "alder-leader")
+        Ok(world.session.is_some() && session == "alder-executor")
     }
 
     fn tmux_new_session(&self, session: &str, engine: &Engine) -> Result<()> {
@@ -250,7 +250,7 @@ fn a_cold_start_creates_the_session_bootstraps_and_notes_the_head_it_acted_on() 
     // the pass document, and nothing is ever appended.
     assert!(positions("tmux new") < positions("tmux send"));
     assert!(calls.iter().any(|call| {
-        call == "tmux send alder-leader Read .agent/skills/pass/SKILL.md, then read the current \
+        call == "tmux send alder-executor Read .agent/skills/pass/SKILL.md, then read the current \
                  Alder state and act on it (triggers: due)."
     }));
     assert!(
@@ -288,7 +288,7 @@ fn a_cold_start_creates_the_session_bootstraps_and_notes_the_head_it_acted_on() 
     );
     assert!(
         calls.contains(
-            &"tmux send alder-leader Read the current Alder state and act on it (triggers: log)."
+            &"tmux send alder-executor Read the current Alder state and act on it (triggers: log)."
                 .to_owned()
         )
     );
@@ -513,7 +513,7 @@ fn a_rotation_and_an_engine_swap_each_replace_the_session() {
         calls.iter().filter(|c| c.starts_with("tmux kill")).count(),
         2
     );
-    assert!(calls.contains(&"tmux new alder-leader codex".to_owned()));
+    assert!(calls.contains(&"tmux new alder-executor codex".to_owned()));
 }
 
 #[test]
@@ -608,7 +608,7 @@ fn only_a_store_outage_counts_toward_the_outage_notice() {
 }
 
 #[test]
-fn an_observation_change_wakes_the_leader_on_its_own() {
+fn an_observation_change_wakes_the_executor_on_its_own() {
     // No one else appended and no deadline has passed: the refresh sweep is
     // the reason to run, and it is reason enough. The sweep's own appends
     // move the head, so the log trigger honestly rides along.
@@ -686,7 +686,7 @@ fn a_torn_injection_is_not_noted_and_the_next_poll_retries_delivery() {
 }
 
 #[test]
-fn a_deferral_deadline_wakes_the_leader_once_at_its_instant() {
+fn a_deferral_deadline_wakes_the_executor_once_at_its_instant() {
     let mut deferred = settled("claude");
     deferred.review_deadlines = vec![
         DateTime::from_timestamp(1_800_000_000 + 600, 0).unwrap(),
@@ -717,7 +717,7 @@ fn a_deferral_deadline_wakes_the_leader_once_at_its_instant() {
         "{calls:?}"
     );
 
-    // The leader did not touch the item; that deadline does not fire again —
+    // The executor did not touch the item; that deadline does not fire again —
     // the ceiling, not a per-poll retry, is the backstop.
     driver.poll_once().unwrap();
     assert_eq!(sends(&driver), 1);
@@ -759,7 +759,7 @@ fn a_changed_pass_skill_starts_a_new_era_and_hashes_that_skill() {
         2
     );
     // A fresh engine has read nothing, so it is pointed at the document again.
-    let bootstrap = "tmux send alder-leader Read .agent/skills/pass/SKILL.md, then read the \
+    let bootstrap = "tmux send alder-executor Read .agent/skills/pass/SKILL.md, then read the \
                      current Alder state and act on it (triggers: log).";
     assert!(calls.contains(&bootstrap.to_owned()), "{calls:?}");
     assert_eq!(

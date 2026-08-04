@@ -47,7 +47,7 @@
 //! Torn subsets surface residue `reconcile` has no vocabulary for, because
 //! `reconcile` reasons about attempts and handles and knows nothing about
 //! directories. [`Simulator::stray_paths`] and [`Simulator::clean_strays`] are
-//! this harness standing in for a leader-side sweep production does not have
+//! this harness standing in for an executor-side sweep production does not have
 //! yet — tracked as work `al-3pph8m` (formerly handoff al-handoff-vpzdqw). Fixing that is not this branch's job;
 //! naming it is, so the convergence property below stays honest rather than
 //! quietly excluding the subsets that expose it.
@@ -99,7 +99,7 @@ use serde_json::{Value, json};
 
 const ROOT: &str = "/sim/alder";
 const WORK_ID: &str = "al-sim";
-const LEADER_SESSION: &str = "alder-leader";
+const EXECUTOR_SESSION: &str = "alder-executor";
 const NOTES_FILE: &str = ".alder/alderd-notes.json";
 const MAX_RECOVERY_ROUNDS: usize = 96;
 
@@ -111,7 +111,7 @@ pub enum AgentScript {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionKind {
-    Leader,
+    Executor,
     Worker,
 }
 
@@ -125,7 +125,7 @@ struct Session {
     /// a killed daemon really can leave, and the next injection would be typed
     /// on top of it.
     pending_input: Option<String>,
-    /// The wake line the leader was actually handed, once the text was
+    /// The wake line the executor was actually handed, once the text was
     /// submitted and not yet acted on.
     injected_line: Option<String>,
 }
@@ -363,13 +363,13 @@ struct World {
     branches: BTreeSet<String>,
     directories: BTreeSet<PathBuf>,
     files: BTreeSet<PathBuf>,
-    /// What the next leader agent to be handed a wake will do. A one-shot:
-    /// running it consumes it, so one `script_leader` means one scripted act,
+    /// What the next executor agent to be handed a wake will do. A one-shot:
+    /// running it consumes it, so one `script_executor` means one scripted act,
     /// whichever session ends up handling it.
     pending_script: AgentScript,
     /// The driver's machine-local notes file, as bytes on the fake disk.
     notes: Option<Vec<u8>>,
-    /// How many wake lines were ever submitted into the leader's pane. Not
+    /// How many wake lines were ever submitted into the executor's pane. Not
     /// process state: a witness, so a test can prove a duplicate delivery
     /// actually happened and was harmless.
     wakes_delivered: usize,
@@ -425,7 +425,7 @@ pub enum Operation {
     SpawnWorker,
     RestartDaemon,
     PollDaemon,
-    LeaderDiesMidPass,
+    ExecutorDiesMidPass,
     Tick(u8),
 }
 
@@ -506,22 +506,22 @@ impl Simulator {
         self.shared.world.borrow().faults.iter().copied().collect()
     }
 
-    /// Script what the leader agent does on the next wake it is handed.
+    /// Script what the executor agent does on the next wake it is handed.
     ///
     /// The script belongs to the *wake*, not to a session, and that is what
     /// makes one call mean exactly one scripted act. Scripting a session
     /// instead has a failure on each side and the harness has had both: a
-    /// script left on the next *creation* never reaches a leader the daemon
+    /// script left on the next *creation* never reaches an executor the daemon
     /// reuses, and a script written to both places fires on the live session
     /// and then stays armed for the replacement, so one call meant two deaths.
     /// Whichever session ends up handed the wake consumes it — see
-    /// [`Simulator::run_leader_if_injected`] — so reuse and restart behave
+    /// [`Simulator::run_executor_if_injected`] — so reuse and restart behave
     /// alike.
-    pub fn script_leader(&self, script: AgentScript) {
+    pub fn script_executor(&self, script: AgentScript) {
         self.shared.world.borrow_mut().pending_script = script;
     }
 
-    /// How many wake lines have ever been submitted at the leader.
+    /// How many wake lines have ever been submitted at the executor.
     pub fn wakes_delivered(&self) -> usize {
         self.shared.world.borrow().wakes_delivered
     }
@@ -791,8 +791,8 @@ impl Simulator {
             }
             Mutation::SessionCreate { name } => {
                 let mut world = self.shared.world.borrow_mut();
-                let kind = if name == LEADER_SESSION {
-                    SessionKind::Leader
+                let kind = if name == EXECUTOR_SESSION {
+                    SessionKind::Executor
                 } else {
                     SessionKind::Worker
                 };
@@ -828,7 +828,7 @@ impl Simulator {
                     // Enter submits the line as it stands, garbage included if
                     // an earlier torn injection corrupted it.
                     session.injected_line = session.pending_input.take();
-                    delivered = name == LEADER_SESSION && session.injected_line.is_some();
+                    delivered = name == EXECUTOR_SESSION && session.injected_line.is_some();
                 }
                 if delivered {
                     world.wakes_delivered += 1;
@@ -973,7 +973,7 @@ impl Simulator {
         self.repair_findings(findings).expect("repair succeeds");
     }
 
-    /// End an attempt through the simulated CLI, as a leader running
+    /// End an attempt through the simulated CLI, as an executor running
     /// `alder attempt end` does.
     pub fn end_attempt(&self, attempt_id: &str, outcome: &str, why: &str) {
         self.alder_command(&[
@@ -1132,7 +1132,7 @@ impl Simulator {
             .collect()
     }
 
-    /// The leader-side sweep production does not have yet.
+    /// The executor-side sweep production does not have yet.
     ///
     /// A worktree nobody is working in is removed through git, which takes the
     /// admin entry and the checkout with it. What can be left after a torn
@@ -1294,10 +1294,10 @@ impl Simulator {
         let mut daemon = Driver::new(self.clone(), config());
         for _ in 0..MAX_RECOVERY_ROUNDS {
             let round = catch_sim_crash(|| {
-                // The leader acts on any wake it was handed. It reads the fold
+                // The executor acts on any wake it was handed. It reads the fold
                 // and finds this loop already doing the repairs, so it idles —
                 // which is exactly why a duplicated wake is harmless.
-                self.run_leader_if_injected();
+                self.run_executor_if_injected();
                 // observe
                 self.observe();
                 // reconcile
@@ -1314,11 +1314,11 @@ impl Simulator {
             });
             match round {
                 Some(Ok(_)) => {
-                    // The leader consuming a just-injected wake is an effect
+                    // The executor consuming a just-injected wake is an effect
                     // boundary like any other: a scheduled fault may land on
                     // it, and that death is a case to recover from, not a
                     // harness failure.
-                    if catch_sim_crash(|| self.run_leader_if_injected()).is_none() {
+                    if catch_sim_crash(|| self.run_executor_if_injected()).is_none() {
                         daemon = Driver::new(self.clone(), config());
                         continue;
                     }
@@ -1423,41 +1423,41 @@ impl Simulator {
         );
     }
 
-    /// The scripted leader agent, run when a submitted wake line is waiting.
+    /// The scripted executor agent, run when a submitted wake line is waiting.
     ///
     /// The ordinary script reads the fold and finds nothing this harness has
     /// not already handled, so it acts by doing nothing and clears the line.
     /// That is the load-bearing half of the protocol's crash story: a wake
-    /// delivered twice — or to a leader that already acted — changes nothing,
+    /// delivered twice — or to an executor that already acted — changes nothing,
     /// because the wake carries no work of its own and nothing durable records
     /// it.
-    pub fn run_leader_if_injected(&self) {
+    pub fn run_executor_if_injected(&self) {
         let script = {
             let mut world = self.shared.world.borrow_mut();
             let handed = world
                 .sessions
-                .get(LEADER_SESSION)
+                .get(EXECUTOR_SESSION)
                 .is_some_and(|session| session.injected_line.is_some());
             // Consumed by whichever session was handed the wake, so the
             // replacement created after a scripted death is an ordinary
-            // leader again.
+            // executor again.
             handed.then(|| std::mem::replace(&mut world.pending_script, AgentScript::Complete))
         };
         match script {
             Some(AgentScript::Complete) => {
-                // The leader's read of the current state.
-                self.effect("leader.read-state", Footprint::read_only());
+                // The executor's read of the current state.
+                self.effect("executor.read-state", Footprint::read_only());
                 self.effect(
-                    "leader.idle",
+                    "executor.idle",
                     Footprint::tearable(vec![Mutation::SessionClearInjection(
-                        LEADER_SESSION.to_owned(),
+                        EXECUTOR_SESSION.to_owned(),
                     )]),
                 );
             }
             Some(AgentScript::DieMidAct) => {
                 self.effect(
                     "agent.die",
-                    Footprint::tearable(vec![Mutation::SessionRemove(LEADER_SESSION.to_owned())]),
+                    Footprint::tearable(vec![Mutation::SessionRemove(EXECUTOR_SESSION.to_owned())]),
                 );
             }
             None => {}
@@ -1744,7 +1744,7 @@ impl SpawnHost for Simulator {
         if self.shared.world.borrow().sessions.contains_key(session) {
             return Err(DriverError::new("session already exists"));
         }
-        let label = if session == LEADER_SESSION {
+        let label = if session == EXECUTOR_SESSION {
             "wake.session-create"
         } else {
             "spawn.session-create"
@@ -1883,13 +1883,13 @@ impl Effects for Simulator {
         let pending = {
             let world = self.shared.world.borrow();
             match world.sessions.get(session) {
-                None => return Err(DriverError::new("leader session missing")),
+                None => return Err(DriverError::new("executor session missing")),
                 Some(session) => session.pending_input.clone(),
             }
         };
         // The invariant unsubmitted text is really held to: nothing is ever
         // typed on top of it. tmux appends, so an injection typed onto a dirty
-        // pane produces one garbled line the leader cannot act on. This fires
+        // pane produces one garbled line the executor cannot act on. This fires
         // the moment that happens rather than leaving it to be inferred from a
         // stuck fixpoint.
         assert!(
@@ -1900,7 +1900,7 @@ impl Effects for Simulator {
         // Production types the literal text and presses Enter as two separate
         // tmux invocations, so this is genuinely two mutations: a daemon killed
         // between them leaves the pane holding text nobody submitted, and the
-        // leader is never handed the wake.
+        // executor is never handed the wake.
         self.effect(
             "wake.inject",
             Footprint::tearable(vec![
@@ -1994,7 +1994,7 @@ fn orphan_accounted(state: &ProjectState, session: &str) -> bool {
 }
 
 pub fn config() -> alderd::config::Config {
-    alderd::decide::config_for(&[("stub", "scripted-leader")])
+    alderd::decide::config_for(&[("stub", "scripted-executor")])
 }
 
 pub fn catch_sim_crash<T>(action: impl FnOnce() -> T) -> Option<T> {
@@ -2053,15 +2053,15 @@ pub fn assert_case_converges(case: &Case) -> Digest {
             }
             Operation::PollDaemon => {
                 let survived = catch_sim_crash(|| daemon.poll_once()).is_some();
-                // The leader acts on whatever the poll delivered.
-                catch_sim_crash(|| host.run_leader_if_injected());
+                // The executor acts on whatever the poll delivered.
+                catch_sim_crash(|| host.run_executor_if_injected());
                 survived
             }
-            Operation::LeaderDiesMidPass => {
+            Operation::ExecutorDiesMidPass => {
                 host.nudge();
-                host.script_leader(AgentScript::DieMidAct);
+                host.script_executor(AgentScript::DieMidAct);
                 let survived = catch_sim_crash(|| daemon.poll_once()).is_some();
-                catch_sim_crash(|| host.run_leader_if_injected());
+                catch_sim_crash(|| host.run_executor_if_injected());
                 survived
             }
             Operation::Tick(ticks) => {

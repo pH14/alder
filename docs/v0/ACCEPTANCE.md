@@ -35,7 +35,7 @@ attempt to append them concurrently.
 - every existing active attempt must remain intact.
 
 The expected head must remain internal to each command. No mutation accepts a
-public `--if-head`, and Alder exposes no leader takeover or generation.
+public `--if-head`, and Alder exposes no executor takeover or generation.
 
 Run the protocol against a bare Git remote in automated tests and perform a
 smoke test against a private GitHub repository. GitHub must be reached through
@@ -438,9 +438,9 @@ the injection and its notes write, after both — and destroy the engine
 session at any of the same points.
 
 - the log must be identical to a run with no crash, except for statements the
-  leader itself made: no wake record, no crash verdict, no driver diagnostic
+  executor itself made: no wake record, no crash verdict, no driver diagnostic
   ever appears — the log never mentions its own readers;
-- the restarted driver must deliver at most one redundant wake, and a leader
+- the restarted driver must deliver at most one redundant wake, and an executor
   handed a redundant wake must find nothing new demanded and idle;
 - losing `.alder/alderd-notes.json` must cost exactly one redundant wake and
   nothing else.
@@ -460,7 +460,7 @@ Stop and restart the driver at an arbitrary moment.
 
 ### A29. Engine swap
 
-Run `alder loop use <other-engine>` while a leader session is running.
+Run `alder loop use <other-engine>` while an executor session is running.
 
 - the change must be accepted immediately and must fold as the desired
   engine;
@@ -494,7 +494,7 @@ consumption.
 Point two drivers, each with its own machine-local notes, at one log.
 
 - neither appends anything, so the log cannot record a conflict between
-  them: at worst the leader receives duplicate wakes, which must be no-ops;
+  them: at worst the executor receives duplicate wakes, which must be no-ops;
 - a rotation request must be honored by each driver at most once — one
   redundant rotation total, never a rotation storm.
 
@@ -508,7 +508,7 @@ and once in the past.
 - the deadline must be stored on the item and rendered by `status` and
   `show`;
 - the earliest deadline over all blocked work must be served as `review_at`
-  in the status loop section, and a driver must wake the leader once when it
+  in the status loop section, and a driver must wake the executor once when it
   arrives;
 - an expired deadline must surface as a `block_expired` attention finding
   with its suggested `work unblock`, and must not unblock the item by
@@ -540,7 +540,7 @@ Before freezing event bodies or SQLite tables, replay:
 4. one case where external reality contradicted recorded state;
 5. one case with a large number of agent-proposed follow-ups;
 6. one turn that atomically adds and rewires substantial work;
-7. one unattended day of the loop, including at least one leader-session
+7. one unattended day of the loop, including at least one executor-session
    crash and one engine rotation.
 
 For every real action, record:
@@ -565,7 +565,7 @@ The paper replay may record, but v0 need not automate:
 - engine quota and vendor-routing policy;
 - blind review fan-out and judging;
 - public dashboard publication;
-- durable writer roles, leadership generations, or leases;
+- durable writer roles, executor generations, or leases;
 - arbitrary multi-step hypothetical plans.
 
 Opaque handles and attempt metadata should preserve enough evidence to revisit

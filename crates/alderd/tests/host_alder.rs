@@ -171,8 +171,8 @@ fn notify_hands_the_message_to_the_configured_command() {
     let alder = root.path().join("alder");
     let host = Host::new(root.path().to_path_buf(), &config(&alder, Some(&command)));
 
-    host.notify("the leader is not answering");
-    assert_eq!(read(&notice), "alderd|the leader is not answering\n");
+    host.notify("the executor is not answering");
+    assert_eq!(read(&notice), "alderd|the executor is not answering\n");
 
     // With nothing configured the message is only logged, and a notifier that
     // cannot be run is still not fatal — a broken notifier must not take the

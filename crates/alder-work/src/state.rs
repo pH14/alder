@@ -663,8 +663,8 @@ impl WorkAppState {
 
     /// The earliest review deadline any blocked work item carries. A deferral
     /// is a statement on the work item — `work block --until` — and this is
-    /// its one derived rendezvous: the driver wakes the leader at this time,
-    /// and the leader reviews whatever demanded the deferral.
+    /// its one derived rendezvous: the driver wakes the executor at this time,
+    /// and the executor reviews whatever demanded the deferral.
     pub fn next_review_at(&self) -> Option<DateTime<Utc>> {
         self.work
             .values()

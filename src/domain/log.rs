@@ -965,7 +965,7 @@ mod tests {
         );
     }
 
-    /// One leader-side mutation, ready to be raced.
+    /// One executor-side mutation, ready to be raced.
     type Mutation<'a> = Box<dyn Fn() -> Result<AppendResult> + 'a>;
 
     /// Every event a mutation can append, so the sweep below can prove it
@@ -996,7 +996,7 @@ mod tests {
     /// and named.
     #[test]
     fn every_mutation_that_loses_the_race_says_it_appended_nothing() {
-        let log = ProjectLog::new(ConflictStore::new(), "hm", "leader");
+        let log = ProjectLog::new(ConflictStore::new(), "hm", "executor");
         // A fixture rich enough that every mutation gets past its own
         // preconditions and fails only on the append.
         let add = |title: &str| {

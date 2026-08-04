@@ -1014,7 +1014,7 @@ mod tests {
                 1,
                 "pass.started",
                 json!({"pass": {"id": "hm-pass-1", "engine": "claude",
-                        "handle": "tmux:alder-leader", "triggers": ["log"], "at_head": 0}}),
+                        "handle": "tmux:alder-executor", "triggers": ["log"], "at_head": 0}}),
             ))
             .unwrap();
         state

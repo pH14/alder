@@ -4,7 +4,7 @@
 //! the API reported it, so spend can be read off the disk without an API call,
 //! an API key, or a running session. `alderd budget` sums it over a trailing
 //! window and says whether either provider is currently rate-limited. That is
-//! all it does: no caps, no percentages, no thresholds. A leader deciding
+//! all it does: no caps, no percentages, no thresholds. An executor deciding
 //! which rung to dispatch on reads the number and judges.
 //!
 //! The two providers record different things, so the two halves are honest

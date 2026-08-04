@@ -263,7 +263,7 @@ pub enum WorkStateChange {
         /// An optional review deadline: "come back to this at …". Stored on
         /// the work item; passing the instant changes nothing in the fold,
         /// but `status` surfaces the expired deferral for review and the
-        /// driver wakes the leader at that time.
+        /// driver wakes the executor at that time.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         until: Option<DateTime<Utc>>,
     },

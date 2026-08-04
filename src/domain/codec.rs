@@ -170,7 +170,7 @@ mod tests {
                 "actor": "alderd",
                 "type": "pass.started",
                 "body": {"pass": {"id": "hm-pass-1", "engine": "claude",
-                          "handle": "tmux:alder-leader", "triggers": ["log", "due"],
+                          "handle": "tmux:alder-executor", "triggers": ["log", "due"],
                           "at_head": 0}},
                 "schema": "alder.event.v0"
             }),
@@ -178,7 +178,7 @@ mod tests {
                 "id": "legacy-end",
                 "seq": 2,
                 "at": "2026-07-27T12:05:00Z",
-                "actor": "leader",
+                "actor": "executor",
                 "type": "pass.ended",
                 "body": {"pass_id": "hm-pass-1", "outcome": "ok",
                           "report": "swept the frontier", "wake_at": "2026-07-27T12:25:00Z",
@@ -221,7 +221,7 @@ mod tests {
                 "id": "old-work",
                 "seq": 1,
                 "at": "2026-07-30T12:00:00Z",
-                "actor": "leader",
+                "actor": "executor",
                 "type": "work.changed",
                 "body": {"why": null, "operations": [{"op": "add", "work": {"id": "al-old", "title": "old", "spec": null, "priority": 0, "requires": [], "checks": []}}]},
                 "schema": "alder.event.v0"

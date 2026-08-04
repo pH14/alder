@@ -1,7 +1,7 @@
 # alderd
 
-`alderd` decides *when* to wake an Alder leader agent, and launches the workers
-that leader dispatches. It never decides *what* either of them should do.
+`alderd` decides *when* to wake an Alder executor agent, and launches the workers
+that executor dispatches. It never decides *what* either of them should do.
 
 The daemon holds no API token, links no model client, and reads no work,
 attempt, or question state. It shells out to the `alder` CLI for everything it
@@ -16,14 +16,14 @@ And it appends **nothing**: the log never mentions its own readers. The wake
 rule is one comparison — the head has moved past the last head this daemon
 acted on — where the baseline is the daemon's machine-local notes,
 `.alder/alderd-notes.json` (the last head acted on, and when). Losing the
-notes is harmless: the daemon wakes the leader once more than it needed to,
-the leader reads the fold, finds nothing new, and idles.
+notes is harmless: the daemon wakes the executor once more than it needed to,
+the executor reads the fold, finds nothing new, and idles.
 
 The loop runs no Git command. Only `alderd spawn` runs `git`, and only to cut
 a worker its worktree.
 
 Anything that requires judgment — which work to start, which rung to start it
-on, whether an attempt is stale, what a report means — belongs to the leader.
+on, whether an attempt is stale, what a report means — belongs to the executor.
 
 The boundary runs one way: Alder never calls `alderd`, `alderd` reaches the log
 only through the `alder` CLI, and it links no Alder crate.
@@ -76,13 +76,13 @@ Three rules make that ordering worth having:
   one-shot `codex exec` leaves a live session behind: the handle stays
   observable. Spawn writes `<worktree>/.alder/relay <session> <file>` for
   literal delivery of a ruling already recorded in the log. The adapter reads
-  the leader-local file, reports one delivery to a working engine, and never
+  the executor-local file, reports one delivery to a working engine, and never
   treats pane input as an acknowledgement or synchronizes on worker progress.
   The worker's fresh `attempt.updated` is observed on the next normal pass,
   not demanded in the same instant. Delivery is at-least-once, so a duplicate
   relay is harmless; milestones are not expected on every poll.
   For a Codex holding shell it uses the private `<worktree>/.alder/resume` script;
-  leaders never type that command themselves. It exists because `codex exec
+  executors never type that command themselves. It exists because `codex exec
   resume` inherits *nothing* from the session it resumes: no model, effort, or
   sandbox. The generated script repeats the launch exactly, and requires the
   exact session ID rather than unsafe `--last`. The strongest resumed-engine
@@ -128,7 +128,7 @@ to the store remote — and one extra writable root: the dispatching project's
 whose index, objects and branch ref all live in the project's `.git`, outside
 the sandbox's workspace; without it the worker's first commit dies on
 `Unable to create '…/index.lock': Operation not permitted`. It does not make
-the leader's working tree writable, which is the part that matters.
+the executor's working tree writable, which is the part that matters.
 
 `ALDER_WORKER_CMD` replaces the whole engine invocation,
 which is how the verification tests spawn a stub instead of a model; the goal
@@ -139,7 +139,7 @@ records.
 
 `alderd budget` prints trailing-window token spend per provider, read from the
 transcripts both CLIs already write, plus any recorded rate limit. No caps, no
-percentages, no thresholds — the leader reads the number and judges.
+percentages, no thresholds — the executor reads the number and judges.
 
 The two halves measure different things and say so: codex spend is the sum of
 per-turn `last_token_usage` from `~/.codex/sessions` (real spend in the
@@ -166,7 +166,7 @@ properties of the box, not durable project facts.
     "codex": { "cmd": "codex", "args": ["--full-auto"] }
   },
   "passDoc": ".agent/skills/pass/SKILL.md",
-  "tmuxSession": "alder-leader",
+  "tmuxSession": "alder-executor",
   "pollSeconds": 60,
   "debounceSeconds": 20,
   "maxIntervalSeconds": 1800,
@@ -180,11 +180,11 @@ properties of the box, not durable project facts.
 | --- | --- | --- |
 | `engines` | required | Engine name to the interactive CLI that provides it. The name matches `alder loop use <engine>`; Alder itself never validates it. |
 | `passDoc` | required | The pass prompt document. A bootstrap injection points the engine at it, and changing its contents ends the current session era. |
-| `tmuxSession` | `alder-leader` | The tmux session name the leader runs in. |
+| `tmuxSession` | `alder-executor` | The tmux session name the executor runs in. |
 | `pollSeconds` | 60 | Poll interval. |
 | `hintPollSeconds` | 1 | How often to stat the local append marker between full polls. |
 | `debounceSeconds` | 20 | How long a fire condition must hold before injecting. |
-| `maxIntervalSeconds` | 1800 | Ceiling between wakes. It also overrides both deferrals, and it is the backstop for a deferral deadline the leader has not yet reviewed. |
+| `maxIntervalSeconds` | 1800 | Ceiling between wakes. It also overrides both deferrals, and it is the backstop for a deferral deadline the executor has not yet reviewed. |
 | `maxSessionAgeSeconds` | 21600 | How long one engine session may serve wakes before rotation. Nothing durable counts passes, so rotation is by wall-clock age. |
 | `notify` | none | Shell command invoked with one message argument, on an unknown engine name and a repeated store outage. A standing condition is reported once, not once per poll. |
 | `alder` | `alder` | Path to the `alder` binary. |
@@ -192,8 +192,12 @@ properties of the box, not durable project facts.
 **Migrating an older config.** `driver.json` rejects unknown fields, so a
 config written before session rotation replaced pass counting must delete
 `passTimeoutSeconds` and `maxPassesPerSession`, and may set
-`maxSessionAgeSeconds` (default 21600). Until then the daemon refuses to
-start with:
+`maxSessionAgeSeconds` (default 21600). A config that carried the old
+defaults from before the executor rename should also update `tmuxSession`
+(`alder-leader` → `alder-executor`) and any `passDoc` path that still points
+at an old location — both are the operator's values, so the daemon accepts
+the old ones and simply uses them as written. Until then the daemon refuses
+to start with:
 
 ```text
 invalid driver config `.alder/driver.json`: unknown field `passTimeoutSeconds`,
@@ -231,9 +235,9 @@ Firing is strictly ordered:
 3. **Note.** Write the head this wake acted on, and the time, to
    `.alder/alderd-notes.json`. The note comes last on purpose: a crash before
    it re-delivers the wake next poll, and a duplicate wake is harmless —
-   the leader reads the fold, and nothing durable records wakes.
+   the executor reads the fold, and nothing durable records wakes.
 
-Nothing awaits. The leader acts and exits or idles; whatever it appends moves
+Nothing awaits. The executor acts and exits or idles; whatever it appends moves
 the head, and the next poll sees it. Two daemons pointed at one log at worst
 deliver duplicate wakes, which cost nothing for the same reason a crash
 costs nothing.
@@ -264,15 +268,15 @@ because a nudge is the human overriding this politeness on purpose.
 ## Trigger kinds are not scope
 
 `manual`, `log`, `observations`, and `due` are provenance repeated in the
-injected line and recorded nowhere. They never narrow what the leader does. A
-leader woken by `observations` still reads the complete state, because the
+injected line and recorded nowhere. They never narrow what the executor does. A
+executor woken by `observations` still reads the complete state, because the
 driver cannot know what else changed and is not allowed to guess.
 
 ## The canary
 
 Everything above is tested against stubs and sandboxes. One thing is not, and
 cannot be: a real model, on a real item, all the way through. That is the
-canary, and it is run once by the leader after this lands — dispatch one
+canary, and it is run once by the executor after this lands — dispatch one
 narrow, well-specified item with `alderd spawn <id> luna` and watch for five
 things, in this order:
 
@@ -282,7 +286,7 @@ things, in this order:
    with `.alder/relay <session> <file>`, and the same session continues rather
    than a new one starting;
 4. it leaves a `ready for review` note;
-5. the leader reviews the branch, runs the gates on it, and merges.
+5. the executor reviews the branch, runs the gates on it, and merges.
 
 The mechanisms underneath 1–3 were each probed before the canary was spent,
 because each had a way to fail silently:

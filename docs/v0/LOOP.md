@@ -1,7 +1,7 @@
 # Alder v0 loop
 
 [README.md](README.md) describes one bounded pass of the driving loop. This
-document defines what makes that loop durable: who wakes the leader, what is
+document defines what makes that loop durable: who wakes the executor, what is
 recorded where, and why a crash anywhere in the wake path is harmless.
 
 ## The one rule
@@ -22,8 +22,8 @@ elsewhere, each fact where it belongs:
 The payoff is the crash story. A wake is delivered by typing one line into a
 terminal and noting, machine-locally, which head it was for. Nothing durable
 records it, so there is nothing for a crash to half-say: a missed wake is made
-up by the next poll, a duplicated wake finds a leader with nothing new to do,
-and both cost nothing because **passes are idempotent** — the leader rebuilds
+up by the next poll, a duplicated wake finds an executor with nothing new to do,
+and both cost nothing because **passes are idempotent** — the executor rebuilds
 its picture from the fold every time.
 
 The loop is a singleton per log. There is one loop, so it needs no ID, and
@@ -31,10 +31,10 @@ The loop is a singleton per log. There is one loop, so it needs no ID, and
 
 ## Division of labour
 
-Alder stores. The driver schedules. The leader thinks.
+Alder stores. The driver schedules. The executor thinks.
 
 The **driver** (`alderd`, or anything that behaves like it) decides *when* to
-wake a leader. It exercises no judgment about work, and it appends nothing.
+wake an executor. It exercises no judgment about work, and it appends nothing.
 Its complete read surface is two things:
 
 1. `alder status --json`: the current head, and the loop section. It ignores
@@ -52,10 +52,10 @@ stat is not a read of the log: the marker carries no state, only an mtime,
 and its absence merely means the next read happens on the ordinary schedule.
 
 That list is the contract. A driver that reads the ready frontier to decide
-whether waking is worthwhile has started doing the leader's job, and it will
+whether waking is worthwhile has started doing the executor's job, and it will
 be wrong in ways nobody can see, because its reasoning is not in the log.
 
-The **leader** is an agent in an interactive session. Woken, it reads the
+The **executor** is an agent in an interactive session. Woken, it reads the
 pass document, rebuilds its picture from the fold, and acts on whatever the
 state demands — open work with no attempt, an unanswered question, a dead
 execution, an observation nothing is addressing — then exits or idles.
@@ -72,7 +72,7 @@ The process tree has a root outside the daemon:
 ```text
 launchd (KeepAlive, RunAtLoad)
   └─ alderd
-       └─ leader session
+       └─ executor session
             └─ worker sessions
 ```
 
@@ -92,14 +92,14 @@ daemon, not reconstruct a checkpoint.
 
 ### The rule
 
-> Wake the leader when the observed head differs from the last head this
+> Wake the executor when the observed head differs from the last head this
 > driver acted on.
 
 The baseline is the driver's notes, not the log. Immediately after a wake the
 noted head *is* the observed head, so a driver's own delivery cannot
-self-trigger; anything anyone appends afterwards — the leader acting, a
+self-trigger; anything anyone appends afterwards — the executor acting, a
 worker's milestone, a phone command — moves the head past the note and wakes
-the leader again. Being woken by your own writes is harmless: the leader
+the executor again. Being woken by your own writes is harmless: the executor
 reads the fold, and a fold with nothing new demands nothing.
 
 Three more conditions wake without a head movement, each read from the same
@@ -118,9 +118,9 @@ Firing is strictly ordered: reconcile the session, inject the line, then
 write the notes. The two crash windows this leaves are both benign, and both
 are pinned by the crash simulator and the model checker:
 
-- **Injected, not noted.** The leader was handed the line; the restarted
+- **Injected, not noted.** The executor was handed the line; the restarted
   daemon does not know that, and delivers it again. A duplicate wake finds a
-  leader with nothing new to do.
+  executor with nothing new to do.
 - **Torn injection.** The text was typed, the Enter was not. Nothing was
   delivered and nothing was noted; the next fire restarts the pane it does
   not recognize and delivers a fresh line.
@@ -136,12 +136,12 @@ The first is the bootstrap form, used on a fresh session that has not read
 the pass document. There is no identifier in the line, because nothing
 durable exists to identify.
 
-The message is deliberately not a prompt. Everything the leader needs to know
+The message is deliberately not a prompt. Everything the executor needs to know
 about *how* to act lives in the pass document, in the repository, under
 review. Anything the driver said instead would be operational instruction
 smuggled past the place where it can be read and changed.
 
-**Trigger kinds are informational. They are never scope limiters.** A leader
+**Trigger kinds are informational. They are never scope limiters.** An executor
 woken by `observations` reads the complete state exactly like one woken by
 `due`; the driver cannot know what else changed while it was not looking.
 
@@ -171,7 +171,7 @@ line. The fold is a
 pure function of the log and cannot read a clock, so nothing unblocks by
 itself — when the deadline passes, `alder status` surfaces the item as a
 `block_expired` attention finding, and the driver's `due` trigger wakes the
-leader to review it. Historical `pass.started`/`pass.ended` events decode and
+executor to review it. Historical `pass.started`/`pass.ended` events decode and
 replay as inert history (a historical `pass end --rotate` still reads as a
 rotation request); no append path can produce a new one.
 
@@ -203,11 +203,11 @@ append itself moves the head, and the request being later in the log than the
 driver's note makes it the `manual` trigger, which overrides both of the
 driver's deferrals — the debounce and the attached-client hold — the way the
 `maxIntervalSeconds` ceiling does. It does not override `loop pause`. A nudge
-changes *when* the leader is next woken, never *what* it does.
+changes *when* the executor is next woken, never *what* it does.
 
 ## Workers
 
-A leader may dispatch implementation to worker sessions rather than doing it
+An executor may dispatch implementation to worker sessions rather than doing it
 itself — one work item per worker, each in its own git worktree and tmux
 session, stamped with its attempt ID and bound to the attempt through the
 ordinary handle. This is entirely process layer: Alder stores attempts,
@@ -276,7 +276,7 @@ and reads nothing into them.
     "codex": { "cmd": "codex", "args": ["--full-auto"] }
   },
   "passDoc": ".agent/skills/pass/SKILL.md",
-  "tmuxSession": "alder-leader",
+  "tmuxSession": "alder-executor",
   "pollSeconds": 60,
   "debounceSeconds": 20,
   "maxIntervalSeconds": 1800,
@@ -311,7 +311,7 @@ a deferral with no ceiling is indistinguishable from a hang.
 ## What the loop is not
 
 - **Not a scheduler.** It decides when to wake one agent, not what runs.
-- **Not a leader role.** Alder still stores no leader, generation, or lease.
+- **Not an executor role.** Alder still stores no executor, generation, or lease.
   Two drivers pointed at one log are not an error; each keeps its own notes,
   and the worst case is a duplicate wake, which costs nothing for the same
   reason a crash costs nothing.
