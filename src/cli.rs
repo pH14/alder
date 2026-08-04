@@ -39,8 +39,6 @@ pub enum Command {
     Observation(ObservationArgs),
     /// The driving loop and its controls.
     Loop(LoopArgs),
-    /// Passes: one run of the driving loop.
-    Pass(PassArgs),
     /// Diagnostics kept out of the ordinary workflow.
     Debug(DebugArgs),
 }
@@ -162,7 +160,7 @@ pub enum WorkCommand {
     /// Return terminal work to open with the same identity.
     Reopen(WorkReasonArgs),
     /// Block work on something outside the Alder graph.
-    Block(WorkReasonArgs),
+    Block(WorkBlockArgs),
     /// Return blocked work to open.
     Unblock(WorkReasonArgs),
     /// Ask a human decision, blocking the work.
@@ -244,6 +242,19 @@ pub struct WorkReasonArgs {
     pub work: String,
     #[arg(long)]
     pub why: String,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkBlockArgs {
+    pub work: String,
+    #[arg(long)]
+    pub why: String,
+    /// Review deadline as an RFC 3339 instant, such as 2026-08-04T15:00:00Z.
+    /// Stored on the work item; the driver wakes the leader at that time, and
+    /// an expired deadline surfaces in `status` for review — nothing unblocks
+    /// by itself.
+    #[arg(long, value_name = "RFC3339")]
+    pub until: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -335,37 +346,16 @@ pub struct LoopArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum LoopCommand {
-    /// Open a pass. The loop is the parent, so the loop creates the record.
-    Wake(LoopWakeArgs),
-    /// Ask the driver to stop waking the loop.
+    /// Ask the driver to stop waking the leader.
     Pause(OptionalReasonArgs),
-    /// Ask the driver to resume waking the loop.
+    /// Ask the driver to resume waking the leader.
     Resume,
     /// Set the desired engine name. Alder never validates it.
     Use(LoopUseArgs),
     /// Ask the next wake to start a fresh session.
     Rotate(OptionalReasonArgs),
-    /// Ask the driver to wake the loop now, ahead of any schedule.
+    /// Ask the driver to wake the leader now, ahead of any schedule.
     Nudge(OptionalReasonArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct LoopWakeArgs {
-    #[arg(long)]
-    pub engine: String,
-    #[arg(long, value_name = "KIND:VALUE")]
-    pub handle: String,
-    #[arg(long, value_enum)]
-    pub trigger: Vec<TriggerKind>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-#[value(rename_all = "kebab-case")]
-pub enum TriggerKind {
-    Log,
-    Observations,
-    Due,
-    Manual,
 }
 
 #[derive(Debug, Args)]
@@ -377,41 +367,6 @@ pub struct OptionalReasonArgs {
 #[derive(Debug, Args)]
 pub struct LoopUseArgs {
     pub engine: String,
-}
-
-#[derive(Debug, Args)]
-pub struct PassArgs {
-    #[command(subcommand)]
-    pub command: PassCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum PassCommand {
-    /// Close a pass. The record answers for itself, so the pass ends itself.
-    End(PassEndArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct PassEndArgs {
-    pub pass: Option<String>,
-    #[arg(long, value_enum)]
-    pub outcome: PassOutcomeArg,
-    #[arg(long)]
-    pub report: Option<String>,
-    #[arg(long, value_name = "DURATION")]
-    pub wake: Option<String>,
-    #[arg(long)]
-    pub rotate: bool,
-    #[arg(long)]
-    pub why: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-#[value(rename_all = "kebab-case")]
-pub enum PassOutcomeArg {
-    Ok,
-    Crashed,
-    Timeout,
 }
 
 #[derive(Debug, Args)]

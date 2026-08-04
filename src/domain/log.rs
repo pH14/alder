@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use ulid::Ulid;
 
@@ -9,9 +9,9 @@ use alder_log::{AppendReceipt, Log, LogError};
 
 use super::{
     AttemptDefinition, AttemptOutcome, CheckUpdate, Event, EventDraft, EventPayload,
-    GraphChangeDocument, Head, ObservationDefinition, ObservationKey, PassDefinition, PassOutcome,
-    PassTrigger, PreparedChange, ProjectState, QuestionDefinition, WorkDefinition, WorkOperation,
-    WorkState, WorkStateChange, validate_observation_key,
+    GraphChangeDocument, Head, ObservationDefinition, ObservationKey, PreparedChange, ProjectState,
+    QuestionDefinition, WorkDefinition, WorkOperation, WorkState, WorkStateChange,
+    validate_observation_key,
 };
 
 const ID_ALLOCATION_ATTEMPTS: usize = 16;
@@ -172,6 +172,19 @@ impl<S: Log> ProjectLog<S> {
         at: DateTime<Utc>,
         payload: EventPayload,
     ) -> Result<AppendResult> {
+        // Legacy variants exist to decode history, never to make more of it.
+        // Every mutation reaches the store through this call, so refusing them
+        // here is what makes "decode-only" a property rather than a habit.
+        if payload.is_legacy() {
+            return Err(AlderError::with_context(
+                "legacy_event",
+                format!(
+                    "nothing was appended: `{}` is decode-only history",
+                    payload.type_name()
+                ),
+                json!({"appended": false, "event": payload.type_name()}),
+            ));
+        }
         let draft = self.draft_at(at, payload);
         let candidate = draft.materialize(snapshot.head.sequence().saturating_add(1));
         let mut state = snapshot.state.clone();
@@ -440,9 +453,8 @@ impl<S: Log> ProjectLog<S> {
             &snapshot,
             EventPayload::WorkChanged {
                 why: Some(match &change {
-                    WorkStateChange::Block { reason } | WorkStateChange::Unblock { reason } => {
-                        reason.clone()
-                    }
+                    WorkStateChange::Block { reason, .. }
+                    | WorkStateChange::Unblock { reason } => reason.clone(),
                 }),
                 operations: vec![WorkOperation::Edit {
                     id: work_id.to_owned(),
@@ -457,75 +469,6 @@ impl<S: Log> ProjectLog<S> {
                 }],
             },
         )
-    }
-
-    pub fn wake_loop(
-        &self,
-        engine: String,
-        handle: String,
-        triggers: Vec<PassTrigger>,
-    ) -> Result<(AppendResult, String)> {
-        let snapshot = self.snapshot()?;
-        if let Some(open) = snapshot.state.open_pass() {
-            return Err(AlderError::with_context(
-                "pass_open",
-                format!("pass `{}` is still open", open.id),
-                json!({
-                    "pass_id": open.id,
-                    "engine": open.engine,
-                    "handle": open.handle,
-                    "started_at": open.started_at,
-                }),
-            ));
-        }
-        let ordinal = snapshot.state.passes.len().saturating_add(1);
-        let id = format!("{}-pass-{ordinal}", self.prefix);
-        let result = self.append_payload(
-            &snapshot,
-            EventPayload::PassStarted {
-                pass: PassDefinition {
-                    id: id.clone(),
-                    engine,
-                    handle,
-                    triggers,
-                    at_head: snapshot.head.sequence(),
-                },
-            },
-        )?;
-        Ok((result, id))
-    }
-
-    pub fn end_pass(
-        &self,
-        pass_id: Option<&str>,
-        outcome: PassOutcome,
-        report: Option<String>,
-        wake_after: Option<TimeDelta>,
-        rotate: bool,
-        why: Option<String>,
-    ) -> Result<(AppendResult, String)> {
-        let snapshot = self.snapshot()?;
-        let id = match pass_id {
-            Some(id) => id.to_owned(),
-            None => snapshot
-                .state
-                .open_pass()
-                .map(|pass| pass.id.clone())
-                .ok_or_else(|| {
-                    AlderError::new("no_open_pass", "the loop has no open pass to end")
-                })?,
-        };
-        let at = Utc::now();
-        let payload = EventPayload::PassEnded {
-            pass_id: id.clone(),
-            outcome,
-            report,
-            wake_at: wake_after.map(|after| at + after),
-            rotate,
-            why,
-        };
-        let result = self.append_payload_at(&snapshot, at, payload)?;
-        Ok((result, id))
     }
 
     pub fn pause_loop(&self, why: Option<String>) -> Result<AppendResult> {
@@ -911,62 +854,35 @@ mod tests {
         );
     }
 
+    /// The pass schema is decode-only, and so is every other legacy variant.
+    /// Every mutation reaches the store through one append call, and that call
+    /// refuses a legacy payload before anything is staged — so no append path
+    /// in the workspace can produce a pass event.
     #[test]
-    fn passes_take_serial_ordinals_and_carry_the_head_they_saw() {
+    fn no_append_path_can_produce_a_pass_or_other_legacy_event() {
         let log = ProjectLog::new(MemoryStore::new(), "hm", "alderd");
-        log.add_work("work".to_owned(), None, 0, vec![], vec![])
-            .unwrap();
-
-        let (_, first) = log
-            .wake_loop(
-                "claude".to_owned(),
-                "tmux:alder-leader".to_owned(),
-                vec![PassTrigger::Log],
-            )
-            .unwrap();
-        assert_eq!(first, "hm-pass-1");
-        assert_eq!(log.snapshot().unwrap().state.passes[&first].at_head, 1);
-
-        let conflict = log
-            .wake_loop(
-                "claude".to_owned(),
-                "tmux:alder-leader".to_owned(),
-                vec![PassTrigger::Manual],
-            )
-            .unwrap_err();
-        assert_eq!(conflict.code, "pass_open");
-        assert_eq!(conflict.context["pass_id"], "hm-pass-1");
-
-        let (_, ended) = log
-            .end_pass(
-                None,
-                PassOutcome::Ok,
-                Some("swept the frontier".to_owned()),
-                Some(TimeDelta::minutes(20)),
-                false,
-                None,
-            )
-            .unwrap();
-        assert_eq!(ended, first);
-        let state = log.snapshot().unwrap().state;
-        let wake_at = state.passes[&first].wake_at.expect("a wake time");
-        assert!(wake_at > Utc::now() + TimeDelta::minutes(19));
-
-        assert_eq!(
-            log.end_pass(None, PassOutcome::Ok, None, None, false, None)
-                .unwrap_err()
-                .code,
-            "no_open_pass"
-        );
-
-        let (_, second) = log
-            .wake_loop(
-                "codex".to_owned(),
-                "tmux:alder-leader".to_owned(),
-                vec![PassTrigger::Due],
-            )
-            .unwrap();
-        assert_eq!(second, "hm-pass-2");
+        let legacy = [
+            EventPayload::LegacyPassStarted(json!({"pass": {"id": "hm-pass-1"}})),
+            EventPayload::LegacyPassEnded(json!({"pass_id": "hm-pass-1", "outcome": "ok"})),
+            EventPayload::LegacyHandoffWithdrawn {
+                handoff_id: "hm-handoff-1".to_owned(),
+                why: "reason".to_owned(),
+            },
+        ];
+        for payload in legacy {
+            let name = payload.type_name();
+            let snapshot = log.snapshot().unwrap();
+            let error = log.append_payload(&snapshot, payload).unwrap_err();
+            assert_eq!(error.code, "legacy_event", "{name}");
+            assert_eq!(error.context["appended"], json!(false), "{name}");
+            assert!(
+                error.message.starts_with("nothing was appended: "),
+                "{name}: {}",
+                error.message
+            );
+        }
+        // Nothing reached the store.
+        assert_eq!(log.snapshot().unwrap().head.sequence(), 0);
     }
 
     #[test]
@@ -983,8 +899,8 @@ mod tests {
         let state = log.snapshot().unwrap().state;
         assert!(state.loop_control.paused);
         assert_eq!(state.loop_control.engine.as_deref(), Some("codex"));
-        assert!(state.loop_control.rotate_pending());
-        assert!(state.loop_control.nudge_pending());
+        assert_eq!(state.loop_control.rotate_requested_seq, Some(4));
+        assert_eq!(state.loop_control.nudge_requested_seq, Some(5));
 
         log.resume_loop().unwrap();
         assert!(!log.snapshot().unwrap().state.loop_control.paused);
@@ -993,6 +909,7 @@ mod tests {
             &work,
             WorkStateChange::Block {
                 reason: "credentials missing".to_owned(),
+                until: None,
             },
         )
         .unwrap();
@@ -1016,6 +933,7 @@ mod tests {
                 "hm-missing",
                 WorkStateChange::Block {
                     reason: "reason".to_owned(),
+                    until: None,
                 },
             )
             .unwrap_err()
@@ -1030,7 +948,7 @@ mod tests {
     /// Every event a mutation can append, so the sweep below can prove it
     /// reached all of them. `EventPayload::type_name` is the compiler-checked
     /// list; this is the copy the sweep is measured against.
-    const EVERY_EVENT: [&str; 19] = [
+    const EVERY_EVENT: [&str; 17] = [
         "observation.reported",
         "observation.retired",
         "work.changed",
@@ -1043,8 +961,6 @@ mod tests {
         "attempt.ended",
         "question.asked",
         "question.answered",
-        "pass.started",
-        "pass.ended",
         "loop.paused",
         "loop.resumed",
         "loop.engine_selected",
@@ -1052,9 +968,9 @@ mod tests {
         "loop.nudge_requested",
     ];
 
-    /// `pass end` is only the mutation that happened to collide. Every one of
-    /// them reaches the store through the same call, so every one of them has
-    /// to lose the same way: nothing appended, said so first, and named.
+    /// Every mutation reaches the store through the same call, so every one of
+    /// them has to lose a race the same way: nothing appended, said so first,
+    /// and named.
     #[test]
     fn every_mutation_that_loses_the_race_says_it_appended_nothing() {
         let log = ProjectLog::new(ConflictStore::new(), "hm", "leader");
@@ -1134,6 +1050,7 @@ mod tests {
                         &idle,
                         WorkStateChange::Block {
                             reason: "raced".to_owned(),
+                            until: None,
                         },
                     )
                 }),
@@ -1189,17 +1106,6 @@ mod tests {
                 Box::new(|| log.answer(&question, "path A".to_owned())),
             ),
             (
-                "pass.started",
-                Box::new(|| {
-                    log.wake_loop(
-                        "claude".to_owned(),
-                        "tmux:alder-leader".to_owned(),
-                        vec![PassTrigger::Log],
-                    )
-                    .map(|(result, _)| result)
-                }),
-            ),
-            (
                 "loop.paused",
                 Box::new(|| log.pause_loop(Some("raced".to_owned()))),
             ),
@@ -1231,34 +1137,16 @@ mod tests {
             covered.insert(*event);
         }
 
-        // A pass has to be open for `pass end` to reach its append, and no
-        // pass may be open for `loop wake` to reach its own, so this one is
-        // raced after the fixture opens a pass for real.
-        log.store().arm(false);
-        log.wake_loop(
-            "claude".to_owned(),
-            "tmux:alder-leader".to_owned(),
-            vec![PassTrigger::Log],
-        )
-        .unwrap();
-        log.store().arm(true);
-        let error = log
-            .end_pass(None, PassOutcome::Ok, None, None, false, None)
-            .unwrap_err();
-        assert_eq!(error.code, "head_conflict");
-        assert_eq!(error.context["appended"], json!(false));
-        assert_eq!(error.context["event"], json!("pass.ended"));
-        covered.insert("pass.ended");
-
         assert_eq!(
             covered,
             EVERY_EVENT.into_iter().collect::<BTreeSet<_>>(),
             "every event a mutation can append has to be swept"
         );
-        // Losing changed nothing: only the one pass the sweep opened for real
-        // is on the log, and every raced object is as the fixture left it.
+        // Losing changed nothing: the log stands exactly where the fixture
+        // left it, and every raced object is as the fixture left it.
+        log.store().arm(false);
         let after = log.snapshot().unwrap();
-        assert_eq!(after.head.sequence(), settled.head.sequence() + 1);
+        assert_eq!(after.head.sequence(), settled.head.sequence());
         assert_eq!(
             after.state.work[&work].state,
             settled.state.work[&work].state

@@ -94,6 +94,55 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pass_events_decode_byte_identically_and_fold_inert() {
+        let documents = [
+            json!({
+                "id": "legacy-wake",
+                "seq": 1,
+                "at": "2026-07-27T12:00:00Z",
+                "actor": "alderd",
+                "type": "pass.started",
+                "body": {"pass": {"id": "hm-pass-1", "engine": "claude",
+                          "handle": "tmux:alder-leader", "triggers": ["log", "due"],
+                          "at_head": 0}},
+                "schema": "alder.event.v0"
+            }),
+            json!({
+                "id": "legacy-end",
+                "seq": 2,
+                "at": "2026-07-27T12:05:00Z",
+                "actor": "leader",
+                "type": "pass.ended",
+                "body": {"pass_id": "hm-pass-1", "outcome": "ok",
+                          "report": "swept the frontier", "wake_at": "2026-07-27T12:25:00Z",
+                          "rotate": false, "why": null},
+                "schema": "alder.event.v0"
+            }),
+        ];
+
+        let mut events = Vec::new();
+        for document in documents {
+            let record: Record = serde_json::from_value(document.clone()).unwrap();
+            let event = decode_record(&record).unwrap();
+            // The historical body survives whole: re-encoding the decoded
+            // event reproduces the record byte for byte.
+            let draft = EventDraft {
+                id: event.id.clone(),
+                at: event.at,
+                actor: event.actor.clone(),
+                payload: event.payload.clone(),
+                schema: event.schema.clone(),
+            };
+            let encoded = encode_draft(&draft).unwrap();
+            assert_eq!(encoded.body(), record.body());
+            events.push(event);
+        }
+        let state = crate::domain::ProjectState::fold(&events).unwrap();
+        assert!(state.work.is_empty());
+        assert!(state.loop_control.rotate_requested_seq.is_none());
+    }
+
+    #[test]
     fn legacy_handoff_integration_decodes_and_replays_created_work() {
         let documents = [
             json!({

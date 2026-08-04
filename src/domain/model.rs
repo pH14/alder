@@ -102,17 +102,15 @@ pub enum EventPayload {
     QuestionAsked { question: QuestionDefinition },
     #[serde(rename = "question.answered")]
     QuestionAnswered { question_id: String, answer: String },
+    // Kept solely to decode events written before passes were removed. A pass
+    // was a record of the loop reading its own log; the log carries statements
+    // about work, never about its own readers, so both fold as inert history
+    // with no live state and no append path. The bodies are held opaque:
+    // nothing derives from them, so nothing constrains their shape.
     #[serde(rename = "pass.started")]
-    PassStarted { pass: PassDefinition },
+    LegacyPassStarted(Value),
     #[serde(rename = "pass.ended")]
-    PassEnded {
-        pass_id: String,
-        outcome: PassOutcome,
-        report: Option<String>,
-        wake_at: Option<DateTime<Utc>>,
-        rotate: bool,
-        why: Option<String>,
-    },
+    LegacyPassEnded(Value),
     #[serde(rename = "loop.paused")]
     LoopPaused { why: Option<String> },
     #[serde(rename = "loop.resumed")]
@@ -145,14 +143,28 @@ impl EventPayload {
             Self::AttemptEnded { .. } => "attempt.ended",
             Self::QuestionAsked { .. } => "question.asked",
             Self::QuestionAnswered { .. } => "question.answered",
-            Self::PassStarted { .. } => "pass.started",
-            Self::PassEnded { .. } => "pass.ended",
+            Self::LegacyPassStarted(_) => "pass.started",
+            Self::LegacyPassEnded(_) => "pass.ended",
             Self::LoopPaused { .. } => "loop.paused",
             Self::LoopResumed {} => "loop.resumed",
             Self::LoopEngineSelected { .. } => "loop.engine_selected",
             Self::LoopRotationRequested { .. } => "loop.rotation_requested",
             Self::LoopNudgeRequested { .. } => "loop.nudge_requested",
         }
+    }
+
+    /// Whether this variant is decode-only history. Legacy events replay from
+    /// the log, but no live command may append one: the append layer refuses
+    /// them before anything reaches the store.
+    pub fn is_legacy(&self) -> bool {
+        matches!(
+            self,
+            Self::LegacyHandoffSubmitted { .. }
+                | Self::LegacyHandoffIntegrated { .. }
+                | Self::LegacyHandoffWithdrawn { .. }
+                | Self::LegacyPassStarted(_)
+                | Self::LegacyPassEnded(_)
+        )
     }
 
     pub fn references(&self, id: &str) -> bool {
@@ -186,10 +198,11 @@ impl EventPayload {
             | Self::AttemptEnded { attempt_id, .. } => attempt_id == id,
             Self::QuestionAsked { question } => question.id == id || question.work_id == id,
             Self::QuestionAnswered { question_id, .. } => question_id == id,
-            Self::PassStarted { pass } => pass.id == id,
-            Self::PassEnded { pass_id, .. } => pass_id == id,
-            // Loop controls belong to the singleton loop rather than to a pass,
-            // so they name no object and appear in no object's history.
+            // Legacy pass events named the loop's own runs, which are no
+            // longer objects; they appear in no object's history.
+            Self::LegacyPassStarted(_) | Self::LegacyPassEnded(_) => false,
+            // Loop controls belong to the singleton loop, so they name no
+            // object and appear in no object's history.
             Self::LoopPaused { .. }
             | Self::LoopResumed {}
             | Self::LoopEngineSelected { .. }
@@ -347,8 +360,18 @@ impl WorkState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkStateChange {
-    Block { reason: String },
-    Unblock { reason: String },
+    Block {
+        reason: String,
+        /// An optional review deadline: "come back to this at …". Stored on
+        /// the work item; passing the instant changes nothing in the fold,
+        /// but `status` surfaces the expired deferral for review and the
+        /// driver wakes the leader at that time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<DateTime<Utc>>,
+    },
+    Unblock {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +382,9 @@ pub struct Work {
     pub priority: i64,
     pub state: WorkState,
     pub block_reason: Option<String>,
+    /// The review deadline carried by the latest block, if it stated one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_until: Option<DateTime<Utc>>,
     pub outcome: Option<String>,
     pub opened_seq: u64,
     pub changed_seq: u64,
@@ -468,93 +494,12 @@ pub struct QuestionAnswer {
     pub actor: String,
 }
 
-/// Why the loop was woken. Trigger kinds are informational provenance; they
-/// never limit what the pass must do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PassTrigger {
-    Log,
-    Observations,
-    Due,
-    Manual,
-}
-
-impl PassTrigger {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Log => "log",
-            Self::Observations => "observations",
-            Self::Due => "due",
-            Self::Manual => "manual",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PassState {
-    Open,
-    Ended,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PassOutcome {
-    Ok,
-    Crashed,
-    Timeout,
-}
-
-impl PassOutcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Crashed => "crashed",
-            Self::Timeout => "timeout",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PassDefinition {
-    pub id: String,
-    pub engine: String,
-    pub handle: String,
-    pub triggers: Vec<PassTrigger>,
-    pub at_head: u64,
-}
-
-/// One run of the loop. A pass is to the loop what an attempt is to work.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Pass {
-    pub id: String,
-    pub engine: String,
-    pub handle: String,
-    pub triggers: Vec<PassTrigger>,
-    pub state: PassState,
-    pub outcome: Option<PassOutcome>,
-    pub report: Option<String>,
-    pub wake_at: Option<DateTime<Utc>>,
-    pub rotate: bool,
-    pub why: Option<String>,
-    pub at_head: u64,
-    pub started_at: DateTime<Utc>,
-    pub started_seq: u64,
-    pub ended_at: Option<DateTime<Utc>>,
-    pub ended_seq: Option<u64>,
-}
-
-impl Pass {
-    /// The first line of the iteration report, which is what `status` shows.
-    pub fn report_line(&self) -> Option<&str> {
-        self.report
-            .as_deref()
-            .and_then(|report| report.lines().next())
-    }
-}
-
-/// The desired state of the singleton loop. Every field is a last-writer-wins
-/// fold except rotation, which is derived from event order.
+/// The desired state of the singleton loop. Pause and engine are
+/// last-writer-wins folds; rotation and nudge requests are recorded as the
+/// sequence they were asked at. The log carries no record of its readers, so
+/// "has this request been acted on" is not a log fact: each driver compares
+/// the request sequence with the last head it acted on, which lives in that
+/// driver's machine-local notes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LoopControl {
     pub paused: bool,
@@ -562,29 +507,6 @@ pub struct LoopControl {
     pub engine: Option<String>,
     pub rotate_requested_seq: Option<u64>,
     pub nudge_requested_seq: Option<u64>,
-    pub last_wake_seq: Option<u64>,
-}
-
-impl LoopControl {
-    /// A rotation is pending when its request is later in the log than the
-    /// most recent wake. The next wake consumes it; no stored flag is cleared.
-    pub fn rotate_pending(&self) -> bool {
-        Self::pending(self.rotate_requested_seq, self.last_wake_seq)
-    }
-
-    /// A nudge follows the identical rule: pending between its request and the
-    /// next wake, consumed by log order alone.
-    pub fn nudge_pending(&self) -> bool {
-        Self::pending(self.nudge_requested_seq, self.last_wake_seq)
-    }
-
-    fn pending(requested_seq: Option<u64>, last_wake_seq: Option<u64>) -> bool {
-        match (requested_seq, last_wake_seq) {
-            (Some(requested), Some(woke)) => requested > woke,
-            (Some(_), None) => true,
-            (None, _) => false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -769,29 +691,18 @@ mod tests {
                 vec!["question"],
             ),
             (
-                EventPayload::PassStarted {
-                    pass: PassDefinition {
-                        id: "pass".to_owned(),
-                        engine: "claude".to_owned(),
-                        handle: "tmux:alder-leader".to_owned(),
-                        triggers: vec![PassTrigger::Log],
-                        at_head: 4,
-                    },
-                },
+                EventPayload::LegacyPassStarted(serde_json::json!({
+                    "pass": {"id": "pass", "engine": "claude"},
+                })),
                 "pass.started",
-                vec!["pass"],
+                vec![],
             ),
             (
-                EventPayload::PassEnded {
-                    pass_id: "pass".to_owned(),
-                    outcome: PassOutcome::Ok,
-                    report: None,
-                    wake_at: None,
-                    rotate: false,
-                    why: None,
-                },
+                EventPayload::LegacyPassEnded(serde_json::json!({
+                    "pass_id": "pass", "outcome": "ok",
+                })),
                 "pass.ended",
-                vec!["pass"],
+                vec![],
             ),
             (
                 EventPayload::LoopPaused { why: None },
@@ -861,39 +772,42 @@ mod tests {
     }
 
     #[test]
-    fn rotation_is_pending_only_between_its_request_and_the_next_wake() {
-        let control = |requested, woke| LoopControl {
-            rotate_requested_seq: requested,
-            last_wake_seq: woke,
-            ..LoopControl::default()
-        };
-        assert!(!control(None, None).rotate_pending());
-        assert!(!control(None, Some(4)).rotate_pending());
-        assert!(control(Some(3), None).rotate_pending());
-        assert!(control(Some(5), Some(4)).rotate_pending());
-        assert!(!control(Some(4), Some(4)).rotate_pending());
-        assert!(!control(Some(3), Some(4)).rotate_pending());
-
-        // A nudge is the same derivation over its own request seq.
-        let nudge = |requested, woke| LoopControl {
-            nudge_requested_seq: requested,
-            last_wake_seq: woke,
-            ..LoopControl::default()
-        };
-        assert!(!nudge(None, None).nudge_pending());
-        assert!(!nudge(None, Some(4)).nudge_pending());
-        assert!(nudge(Some(3), None).nudge_pending());
-        assert!(nudge(Some(5), Some(4)).nudge_pending());
-        assert!(!nudge(Some(4), Some(4)).nudge_pending());
-        assert!(!nudge(Some(3), Some(4)).nudge_pending());
-
-        assert_eq!(PassTrigger::Log.as_str(), "log");
-        assert_eq!(PassTrigger::Observations.as_str(), "observations");
-        assert_eq!(PassTrigger::Due.as_str(), "due");
-        assert_eq!(PassTrigger::Manual.as_str(), "manual");
-        assert_eq!(PassOutcome::Ok.as_str(), "ok");
-        assert_eq!(PassOutcome::Crashed.as_str(), "crashed");
-        assert_eq!(PassOutcome::Timeout.as_str(), "timeout");
+    fn exactly_the_handoff_and_pass_variants_are_legacy() {
+        let legacy = [
+            EventPayload::LegacyHandoffSubmitted {
+                handoff: LegacyHandoffDefinition {
+                    id: "handoff".to_owned(),
+                    title: "handoff".to_owned(),
+                    artifact_ref: "ref".to_owned(),
+                    note: None,
+                },
+            },
+            EventPayload::LegacyHandoffIntegrated {
+                handoff_id: "handoff".to_owned(),
+                work: work("work", Vec::new()),
+            },
+            EventPayload::LegacyHandoffWithdrawn {
+                handoff_id: "handoff".to_owned(),
+                why: "reason".to_owned(),
+            },
+            EventPayload::LegacyPassStarted(serde_json::json!({})),
+            EventPayload::LegacyPassEnded(serde_json::json!({})),
+        ];
+        for payload in &legacy {
+            assert!(payload.is_legacy(), "{}", payload.type_name());
+        }
+        let live = [
+            EventPayload::WorkReopened {
+                work_id: "work".to_owned(),
+                why: "reason".to_owned(),
+            },
+            EventPayload::LoopPaused { why: None },
+            EventPayload::LoopRotationRequested { why: None },
+            EventPayload::LoopNudgeRequested { why: None },
+        ];
+        for payload in &live {
+            assert!(!payload.is_legacy(), "{}", payload.type_name());
+        }
     }
 
     #[test]
