@@ -251,6 +251,11 @@ impl Effects for Host {
 
 /// The dispatch path. Same host, same shell-outs, plus the two things only a
 /// spawn needs: a git worktree and a pane started in it.
+///
+/// This block and the inherent one above are the host code a dispatch reaches,
+/// and neither may wait for an engine to come up. `spawn`'s tests read both for
+/// the words that can only mean waiting; a bounded timeout on a command that
+/// can hang is still allowed, spelled with a `Duration`.
 impl SpawnHost for Host {
     fn root(&self) -> &Path {
         &self.root

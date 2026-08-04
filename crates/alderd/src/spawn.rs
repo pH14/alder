@@ -11,11 +11,13 @@
 //! its final argument. Nothing is typed into the pane, so nothing waits for
 //! the engine to boot, nothing can be read as a key name, and a goal
 //! containing quotes or semicolons is just a string. There is no sleep
-//! anywhere on this path. Two tests below hold that, and both are titled for
-//! it: one counts the questions a dispatch puts to the world, the other reads
-//! the source for a duration or a clock it could wait on. Neither times
-//! anything — what elapses here is process creation, so on a busy machine a
-//! clock reports the machine rather than the code.
+//! anywhere on this path. Three tests below hold that, and all three are
+//! titled for it: one counts the questions a dispatch puts to the world, and
+//! two read the source for a duration or a clock it could wait on — this
+//! module's own half, and the two halves of `effects::Host` the dispatch runs
+//! in. None of the three times anything: what elapses here is process
+//! creation, so on a busy machine a clock reports the machine rather than the
+//! code.
 //!
 //! **The pane outlives the engine.** The command ends `; exec bash`, so a
 //! one-shot engine that finishes its turn leaves a live session behind. The
@@ -1645,8 +1647,10 @@ mod tests {
     /// can hang is a limit rather than a wait, and AGENTS.md says so; but it is
     /// a limit on a *command*, and nothing here runs one. Every command goes
     /// out through `effects::Host`, which is where such a timeout would belong
-    /// and where this test would be wrong to forbid it. What the host does is
-    /// checked where the host actually runs, in `tests/spawn_host.rs`.
+    /// and where this test would be wrong to forbid it. The host is read by the
+    /// test after this one, which allows it exactly that and nothing else; what
+    /// the host's commands do once they leave is checked where they really run,
+    /// in `tests/spawn_host.rs`.
     #[test]
     fn this_modules_dispatch_half_can_name_no_clock_and_no_sleep() {
         let code = without_comments(before_the_tests(include_str!("spawn.rs")));
@@ -1673,6 +1677,64 @@ mod tests {
         }
     }
 
+    /// The host the dispatch runs in cannot wait for an engine either.
+    ///
+    /// The test above reads this module; this one reads the other half of the
+    /// same path, `effects::Host` — its inherent block, where every command is
+    /// built and run, and its `SpawnHost` block, the only host code a dispatch
+    /// reaches. A readiness sleep put there would reach no tmux command, so it
+    /// would show in no ledger and in no call list; the source is again what no
+    /// load can make untrue.
+    ///
+    /// Fewer words are banned here than above, and the difference is the whole
+    /// point of scanning the two halves separately. This half runs commands, so
+    /// a bounded timeout on one that can hang is a limit AGENTS.md allows, and
+    /// it needs a `Duration` — which is therefore permitted. What no limit
+    /// needs is a way to stand still or a clock to stand still by, so `sleep`,
+    /// `park`, `yield_now`, `spin_loop`, `Instant` and `elapsed` are refused.
+    ///
+    /// Both halves are read in one place on purpose: narrowing either without
+    /// the other in view is how the host lost its coverage once already.
+    ///
+    /// The scan is lexical and block-scoped, which is its limit: it holds for
+    /// the code these two blocks contain, not for something they call out to.
+    /// The blocks are also where `Effects::sleep` — the driving loop's own
+    /// pacing, which is legitimate and lives in the third block of that file —
+    /// is kept out of scope.
+    #[test]
+    fn the_hosts_spawn_facing_halves_can_name_no_sleep_and_no_clock() {
+        let source = include_str!("effects.rs");
+        for (half, runs_commands) in [
+            ("impl Host {", "fn run("),
+            ("impl SpawnHost for Host {", "fn tmux_new_session("),
+        ] {
+            let code = without_comments(impl_block(source, half));
+            assert!(
+                code.contains(runs_commands),
+                "`{runs_commands}` has left `{half}` in effects.rs, so this scan \
+                 now covers less of the host than it was written to cover"
+            );
+            for waiting in [
+                "sleep",
+                "park",
+                "yield_now",
+                "spin_loop",
+                "Instant",
+                "elapsed",
+            ] {
+                assert!(
+                    !code.contains(waiting),
+                    "`{half}` in effects.rs names `{waiting}`, and standing still \
+                     is the one thing a dispatch may not do: it types nothing at a \
+                     session and waits for no engine to boot. A bounded timeout on \
+                     a command that can hang is a limit rather than a wait — spell \
+                     it with a `Duration`, which this test allows, and not with a \
+                     word that can only mean waiting."
+                );
+            }
+        }
+    }
+
     /// The host effects a dispatch only reads the world with. A wait has to
     /// repeat one of these; the ones that change the world it has no use for.
     const OBSERVING_EFFECTS: [&str; 7] = [
@@ -1690,6 +1752,23 @@ mod tests {
         source
             .split_once("\n#[cfg(test)]\n")
             .expect("a module under test keeps its tests at the end")
+            .0
+    }
+
+    /// The body of one top-level `impl` block, its header line excluded.
+    ///
+    /// A rustfmt'd block is the text between its header and the first line that
+    /// closes at column zero. Both ends are required to be there, so renaming
+    /// or reshaping a block fails this loudly rather than quietly scanning an
+    /// empty string.
+    fn impl_block<'a>(source: &'a str, header: &str) -> &'a str {
+        let opened = source
+            .split_once(&format!("\n{header}\n"))
+            .unwrap_or_else(|| panic!("`{header}` is no longer a block of its own"))
+            .1;
+        opened
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("`{header}` no longer closes at column zero"))
             .0
     }
 
