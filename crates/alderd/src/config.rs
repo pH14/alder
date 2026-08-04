@@ -27,10 +27,11 @@ pub struct Config {
     pub debounce_seconds: u64,
     #[serde(default = "default_max_interval")]
     pub max_interval_seconds: u64,
-    #[serde(default = "default_pass_timeout")]
-    pub pass_timeout_seconds: u64,
-    #[serde(default = "default_max_passes")]
-    pub max_passes_per_session: u32,
+    /// How long one engine session may serve wakes before it is rotated.
+    /// Passes are not counted — nothing durable records them — so session
+    /// rotation is by wall-clock age.
+    #[serde(default = "default_max_session_age")]
+    pub max_session_age_seconds: u64,
     /// Optional shell command invoked with one message argument.
     #[serde(default)]
     pub notify: Option<String>,
@@ -67,12 +68,8 @@ fn default_max_interval() -> u64 {
     1800
 }
 
-fn default_pass_timeout() -> u64 {
-    3600
-}
-
-fn default_max_passes() -> u32 {
-    25
+fn default_max_session_age() -> u64 {
+    21_600
 }
 
 fn default_alder() -> String {
@@ -118,11 +115,8 @@ impl Config {
         if self.hint_poll_seconds == 0 {
             return Err(DriverError::new("hintPollSeconds must be positive"));
         }
-        if self.pass_timeout_seconds == 0 {
-            return Err(DriverError::new("passTimeoutSeconds must be positive"));
-        }
-        if self.max_passes_per_session == 0 {
-            return Err(DriverError::new("maxPassesPerSession must be positive"));
+        if self.max_session_age_seconds == 0 {
+            return Err(DriverError::new("maxSessionAgeSeconds must be positive"));
         }
         Ok(())
     }
@@ -157,8 +151,7 @@ mod tests {
         assert_eq!(config.poll_seconds, 60);
         assert_eq!(config.debounce_seconds, 20);
         assert_eq!(config.max_interval_seconds, 1800);
-        assert_eq!(config.pass_timeout_seconds, 3600);
-        assert_eq!(config.max_passes_per_session, 25);
+        assert_eq!(config.max_session_age_seconds, 21_600);
         assert_eq!(config.alder, "alder");
         assert!(config.notify.is_none());
         assert!(config.engines["claude"].args.is_empty());
@@ -173,8 +166,7 @@ mod tests {
             r#"{"engines": {"c": {"cmd": "c"}}, "passDoc": " "}"#,
             r#"{"engines": {"c": {"cmd": "c"}}, "passDoc": "p", "tmuxSession": " "}"#,
             r#"{"engines": {"c": {"cmd": "c"}}, "passDoc": "p", "pollSeconds": 0}"#,
-            r#"{"engines": {"c": {"cmd": "c"}}, "passDoc": "p", "passTimeoutSeconds": 0}"#,
-            r#"{"engines": {"c": {"cmd": "c"}}, "passDoc": "p", "maxPassesPerSession": 0}"#,
+            r#"{"engines": {"c": {"cmd": "c"}}, "passDoc": "p", "maxSessionAgeSeconds": 0}"#,
             r#"{"engines": {"c": {"cmd": "c"}}, "passDoc": "p", "unknown": 1}"#,
             r#"not json"#,
         ] {

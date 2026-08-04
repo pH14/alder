@@ -1,6 +1,12 @@
-//! The main loop. It reads four things, decides with [`crate::decide`], and
+//! The main loop. It reads the fold, decides with [`crate::decide`], and
 //! performs effects through [`Effects`]. It never inspects work, attempts, or
-//! questions, and it never composes a prompt beyond the injection line.
+//! questions, it never composes a prompt beyond the injection line, and it
+//! appends nothing to the log — the log never mentions its own readers.
+//!
+//! What the driver has to remember — the last head it acted on, and when — is
+//! machine-local [`Notes`] persisted under `.alder/`. Losing them is harmless:
+//! the next poll delivers one wake more than it needed to, the leader reads
+//! the fold, finds nothing new, and idles.
 
 use std::{
     path::{Path, PathBuf},
@@ -12,9 +18,8 @@ use chrono::{DateTime, Utc};
 use crate::{
     config::Config,
     decide::{
-        self, Decision, EngineChoice, Notice, Poll, Session, SessionAction, Trigger, Wait,
-        content_hash, injection, observable_session, pass_timed_out, resolve_engine,
-        session_action,
+        self, Decision, EngineChoice, Notes, Notice, Poll, Session, SessionAction, Trigger, Wait,
+        content_hash, injection, resolve_engine, rotate_pending, session_action,
     },
     effects::Effects,
     error::{DriverError, Result},
@@ -28,9 +33,17 @@ const OUTAGE_NOTICE_AFTER: u32 = 3;
 /// Statting it is not a read of the log; it only shortens the driver's sleep.
 const APPEND_MARKER: &str = ".alder/last-append";
 
+/// Where this driver keeps its notes: the last head it acted on and when.
+/// Machine-local and gitignored, like everything else under `.alder/`.
+const NOTES_FILE: &str = ".alder/alderd-notes.json";
+
 pub struct Driver<E: Effects> {
     effects: E,
     config: Config,
+    /// The last head this driver acted on, and when. Persisted so a restarted
+    /// daemon does not re-deliver a wake for state it already acted on — and
+    /// tolerated when missing, because an extra wake is harmless.
+    notes: Notes,
     /// What the daemon remembers about the session it launched. Forgotten on
     /// restart, which restarts the session rather than adopting a stranger.
     session: Option<Session>,
@@ -45,9 +58,11 @@ pub struct Driver<E: Effects> {
 
 impl<E: Effects> Driver<E> {
     pub fn new(effects: E, config: Config) -> Self {
+        let notes = Self::load_notes(&effects);
         Self {
             effects,
             config,
+            notes,
             session: None,
             pending_since: None,
             bootstrap: false,
@@ -58,6 +73,27 @@ impl<E: Effects> Driver<E> {
 
     pub fn effects(&self) -> &E {
         &self.effects
+    }
+
+    /// Read the notes back, or start fresh. A missing or unreadable file is
+    /// not an error: fresh notes mean one wake the driver did not strictly
+    /// need to deliver, which is the harmless direction.
+    fn load_notes(effects: &E) -> Notes {
+        effects
+            .read_file(Path::new(NOTES_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist the notes. A failed write is logged and tolerated: the worst
+    /// outcome is a duplicate wake after a restart, never a lost fact.
+    fn save_notes(&self) {
+        let bytes = serde_json::to_vec_pretty(&self.notes).expect("notes serialize");
+        if let Err(error) = self.effects.write_file(Path::new(NOTES_FILE), &bytes) {
+            self.effects
+                .log(&format!("cannot persist the driver notes: {error}"));
+        }
     }
 
     /// Run until the process is stopped.
@@ -114,13 +150,9 @@ impl<E: Effects> Driver<E> {
             Err(error) => return Err(error),
         };
 
-        // A pass that is already open owns the loop. Resolving it is the only
-        // thing worth doing, and it is also how a daemon restart recovers.
-        if state.open_pass.is_some() {
-            return self.await_open_pass(&state);
-        }
         if state.paused {
             self.pending_since = None;
+            self.effects.log("idle: the loop is paused");
             return Ok(());
         }
 
@@ -131,7 +163,7 @@ impl<E: Effects> Driver<E> {
             attached_client: self.attached_client(),
         };
 
-        match decide::decide(&self.config, &state, &poll) {
+        match decide::decide(&self.config, &state, &self.notes, &poll) {
             Decision::Idle(reason) => {
                 self.pending_since = None;
                 self.effects.log(&format!("idle: {reason}"));
@@ -202,29 +234,29 @@ impl<E: Effects> Driver<E> {
             }
         };
         let pass_doc_hash = self.pass_doc_hash();
-        // The session is reconciled before the wake on purpose: the wake is
-        // what consumes a pending rotation (by log order), so rotating first
-        // means a crash between the two merely re-rotates next fire, while the
-        // reverse order would consume a rotation without performing it. The
-        // cost — a lost wake race can churn a session — is bounded and rare.
+        // The session is reconciled before the notes move on purpose: acting
+        // is what consumes a pending rotation, so rotating first means a crash
+        // between the restart and the notes write merely re-rotates next fire,
+        // while the reverse order would consume a rotation without performing
+        // it. The cost — an occasional redundant restart — is bounded.
         self.reconcile_session(state, &engine, pass_doc_hash)?;
 
-        // Intent before effects: the wake is durable before anything is typed
-        // into the leader's terminal.
-        let Some(pass_id) = self.wake(&engine, triggers)? else {
-            return Ok(());
-        };
-        if let Some(session) = self.session.as_mut() {
-            session.passes = session.passes.saturating_add(1);
-        }
-
-        let message = injection(self.bootstrap, &self.config.pass_doc, &pass_id, triggers);
-        self.bootstrap = false;
+        let message = injection(self.bootstrap, &self.config.pass_doc, triggers);
         self.effects
             .tmux_send_keys(&self.config.tmux_session, &message)?;
-        self.effects.log(&format!("woke {pass_id}: {message}"));
-        let handle = format!("tmux:{}", self.config.tmux_session);
-        self.await_pass(&pass_id, self.effects.now(), &handle)
+        self.bootstrap = false;
+        self.effects.log(&format!("woke the leader: {message}"));
+
+        // The delivery happened; note it, durably enough for a restart. The
+        // order is deliberate: a crash before this write leaves stale notes,
+        // and the next poll delivers the same wake again — harmless, because
+        // the leader reads the fold and nothing durable records wakes.
+        self.notes = Notes {
+            last_head: state.head,
+            last_wake_at: Some(self.effects.now()),
+        };
+        self.save_notes();
+        Ok(())
     }
 
     /// A standing engine problem is reported once, not once per poll.
@@ -246,13 +278,15 @@ impl<E: Effects> Driver<E> {
         let exists = self
             .effects
             .tmux_session_exists(&self.config.tmux_session)?;
+        let now = self.effects.now();
         let action = session_action(
             &self.config,
-            state,
+            rotate_pending(state, &self.notes),
             engine,
             pass_doc_hash,
             exists,
             self.session.as_ref(),
+            now,
         );
         match action {
             SessionAction::Reuse => return Ok(()),
@@ -272,119 +306,11 @@ impl<E: Effects> Driver<E> {
         self.session = Some(Session {
             engine: engine.to_owned(),
             pass_doc_hash,
-            passes: 0,
+            created_at: now,
         });
         // A fresh engine has read nothing, so the next injection must say
         // where the pass document lives.
         self.bootstrap = true;
-        Ok(())
-    }
-
-    /// Wake the loop, or concede.
-    ///
-    /// This poll's status read showed no open pass, so a `pass_open` conflict
-    /// can only mean another writer — a second driver, or a human at a
-    /// terminal — opened one in the last few seconds. That pass is almost
-    /// certainly alive, and it is not this driver's to end. Conceding is the
-    /// whole exclusion mechanism the loop has: the next poll sees the open
-    /// pass, adopts it, and applies the stale rule with real timeout facts.
-    ///
-    /// A pass genuinely left over from a crash is never seen here, because the
-    /// poll would have found it open and never reached the fire path.
-    fn wake(&self, engine: &str, triggers: &[Trigger]) -> Result<Option<String>> {
-        let handle = format!("tmux:{}", self.config.tmux_session);
-        let mut args = vec!["loop", "wake", "--engine", engine, "--handle", &handle];
-        for trigger in triggers {
-            args.push("--trigger");
-            args.push(trigger.as_str());
-        }
-        match self.effects.alder(&args) {
-            Ok(document) => document
-                .get("pass_id")
-                .and_then(serde_json::Value::as_str)
-                .map(|id| Some(id.to_owned()))
-                .ok_or_else(|| DriverError::new("`alder loop wake` reported no pass ID")),
-            Err(error) if error.is("pass_open") => {
-                self.effects
-                    .log("another writer opened a pass first; conceding this wake");
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Resume a pass this daemon did not start, or did not finish watching.
-    ///
-    /// This is where every leftover pass is resolved, whoever opened it: a
-    /// daemon restart, a crashed engine, or another writer's pass that won a
-    /// wake race. Nothing else in the driver ends a pass it did not open.
-    fn await_open_pass(&mut self, state: &LoopState) -> Result<()> {
-        let open = state.open_pass.as_ref().expect("checked by the caller");
-        self.effects
-            .log(&format!("awaiting the open pass {}", open.id));
-        let (id, started_at, handle) = (open.id.clone(), open.started_at, open.handle.clone());
-        self.await_pass(&id, started_at, &handle)
-    }
-
-    /// Poll until the pass ends, its session dies, or the ceiling is reached.
-    ///
-    /// `handle` is the pass's own recorded handle, not this driver's session
-    /// name. A pass opened by another writer may name a different tmux session
-    /// or no tmux session at all, and calling such a pass `crashed` because
-    /// *this* driver's session is gone would be a lie.
-    fn await_pass(&mut self, pass_id: &str, started_at: DateTime<Utc>, handle: &str) -> Result<()> {
-        let own_session = handle == format!("tmux:{}", self.config.tmux_session);
-        loop {
-            let baseline = self.effects.now();
-            let document = self.effects.alder(&["show", pass_id])?;
-            let ended = document
-                .pointer("/current/state")
-                .and_then(serde_json::Value::as_str)
-                == Some("ended");
-            if ended {
-                let outcome = document
-                    .pointer("/current/outcome")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("ended")
-                    .to_owned();
-                self.effects.log(&format!("{pass_id} ended {outcome}"));
-                if outcome != "ok" {
-                    self.effects
-                        .notify(&format!("pass {pass_id} ended {outcome}"));
-                }
-                return Ok(());
-            }
-            // `crashed` is a claim about an observed dead session, so it is
-            // available only for a tmux handle the driver can actually check.
-            if let Some(session) = observable_session(handle)
-                && !self.effects.tmux_session_exists(session)?
-            {
-                self.end_pass(pass_id, "crashed", "the tmux session is gone")?;
-                if own_session {
-                    self.session = None;
-                }
-                self.effects.notify(&format!(
-                    "pass {pass_id} crashed: the engine session is gone"
-                ));
-                return Ok(());
-            }
-            // Time is the only fact available for a handle the driver cannot
-            // observe, so an unobservable pass can only ever time out.
-            if pass_timed_out(&self.config, started_at, self.effects.now()) {
-                self.end_pass(pass_id, "timeout", "the pass exceeded its time budget")?;
-                self.effects.notify(&format!("pass {pass_id} timed out"));
-                return Ok(());
-            }
-            // The same hint applies while a pass runs: `pass end` is an
-            // append, so a pass ended on this machine is noticed in about a
-            // second rather than a full poll interval.
-            self.sleep_between_polls(baseline);
-        }
-    }
-
-    fn end_pass(&self, pass_id: &str, outcome: &str, why: &str) -> Result<()> {
-        self.effects
-            .alder(&["pass", "end", pass_id, "--outcome", outcome, "--why", why])?;
         Ok(())
     }
 }

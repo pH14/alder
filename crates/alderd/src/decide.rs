@@ -3,15 +3,23 @@
 //! Nothing here talks to tmux, Git, or the Alder CLI. The daemon's judgment
 //! surface is small on purpose, and keeping it here is what makes that
 //! claim checkable.
+//!
+//! The wake rule is one comparison: the head has moved past the last head this
+//! driver acted on. That baseline lives in the driver's machine-local
+//! [`Notes`], never in the log — the log never mentions its own readers — and
+//! losing it is harmless: the driver acts once more, the leader reads the fold,
+//! finds nothing new to do, and idles. Passes are idempotent; a missed or
+//! duplicated wake changes nothing durable.
 
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::{config::Config, loop_state::LoopState};
 
-/// Why the driver would wake the loop. These are Alder's trigger kinds; they
-/// are informational provenance, never a limit on what the pass must do.
+/// Why the driver would wake the leader. These kinds are informational
+/// provenance in the injected line; they never limit what the leader must do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Trigger {
     Manual,
@@ -31,8 +39,25 @@ impl Trigger {
     }
 }
 
+/// What this driver remembers about its own past actions, persisted to a
+/// machine-local file under `.alder/`. This is the generalization of the old
+/// append marker: not "something was appended" but "the last head I acted on".
+///
+/// The file carries zero durable-project weight. A driver that loses it acts
+/// once more than it needed to, and acting on an unchanged state is a no-op.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Notes {
+    /// The head this driver last delivered a wake for.
+    #[serde(default)]
+    pub last_head: u64,
+    /// When this driver last delivered a wake.
+    #[serde(default)]
+    pub last_wake_at: Option<DateTime<Utc>>,
+}
+
 /// Everything the driver observed this poll that is not already in the loop
-/// fold. It remembers nothing about the log: the fold carries that.
+/// fold or its own notes.
 #[derive(Debug, Clone)]
 pub struct Poll {
     pub now: DateTime<Utc>,
@@ -50,78 +75,79 @@ pub enum Decision {
     Idle(&'static str),
     /// The condition holds but the injection waits.
     Hold(&'static str),
-    /// Wake the loop with these trigger kinds.
+    /// Wake the leader, with these trigger kinds as provenance.
     Fire(Vec<Trigger>),
 }
 
+/// A rotation request is outstanding for this driver when it is later in the
+/// log than the last head the driver acted on. Acting consumes it by moving
+/// the noted head past it; no clearing write exists, because the log does not
+/// record its readers.
+pub fn rotate_pending(state: &LoopState, notes: &Notes) -> bool {
+    state
+        .rotate_requested_seq
+        .is_some_and(|requested| requested > notes.last_head)
+}
+
+/// A nudge follows the identical rule over its own request sequence.
+pub fn nudge_pending(state: &LoopState, notes: &Notes) -> bool {
+    state
+        .nudge_requested_seq
+        .is_some_and(|requested| requested > notes.last_head)
+}
+
 /// Which trigger kinds currently hold. Empty means nothing has happened.
-pub fn triggers(config: &Config, state: &LoopState, poll: &Poll) -> Vec<Trigger> {
+pub fn triggers(config: &Config, state: &LoopState, notes: &Notes, poll: &Poll) -> Vec<Trigger> {
     let mut triggers = Vec::new();
-    if state.nudge_pending {
+    if nudge_pending(state, notes) {
         triggers.push(Trigger::Manual);
     }
-    if log_advanced(state) {
+    if state.head > notes.last_head {
         triggers.push(Trigger::Log);
     }
     if poll.refresh_changed {
         triggers.push(Trigger::Observations);
     }
-    if wake_due(state, poll.now) || max_interval_elapsed(config, state, poll.now) {
+    if review_due(state, notes, poll.now) || max_interval_elapsed(config, notes, poll.now) {
         triggers.push(Trigger::Due);
     }
     triggers
 }
 
-/// Something was appended since the last pass ended.
-///
-/// The baseline lives in the log, not in the daemon, so a restarted driver
-/// recovers it for free. The driver's own wake and end events cannot
-/// self-trigger: immediately after a pass ends, the head *is* its `ended_seq`.
-/// Before the first pass there is no baseline, and `max_interval_elapsed`
-/// already fires a fresh project immediately.
-fn log_advanced(state: &LoopState) -> bool {
-    state
-        .last_pass
-        .as_ref()
-        .and_then(|pass| pass.ended_seq)
-        .is_some_and(|ended_seq| state.head > ended_seq)
+/// A deferral's deadline has arrived and this driver has not woken the leader
+/// since it passed. One wake per deadline: a leader that reviews the item
+/// moves the deadline or removes it, and a leader that does not is caught by
+/// the max-interval ceiling rather than woken every poll.
+fn review_due(state: &LoopState, notes: &Notes, now: DateTime<Utc>) -> bool {
+    state.review_at.is_some_and(|review_at| {
+        now >= review_at && notes.last_wake_at.is_none_or(|woke| woke < review_at)
+    })
 }
 
-/// A pass asked to be woken again at a specific time and that time has come.
-fn wake_due(state: &LoopState, now: DateTime<Utc>) -> bool {
-    state
-        .last_pass
-        .as_ref()
-        .and_then(|pass| pass.wake_at)
-        .is_some_and(|wake_at| now >= wake_at)
-}
-
-/// The loop has not run for longer than the configured ceiling. A log with no
-/// pass at all has waited forever, so a fresh project fires immediately.
-fn max_interval_elapsed(config: &Config, state: &LoopState, now: DateTime<Utc>) -> bool {
+/// The leader has not been woken for longer than the configured ceiling. A
+/// driver with no notes has never woken anyone, so a fresh start fires
+/// immediately.
+fn max_interval_elapsed(config: &Config, notes: &Notes, now: DateTime<Utc>) -> bool {
     let ceiling = TimeDelta::seconds(config.max_interval_seconds as i64);
-    match state.last_pass.as_ref().and_then(|pass| pass.ended_at) {
-        Some(ended_at) => now >= ended_at + ceiling,
+    match notes.last_wake_at {
+        Some(woke) => now >= woke + ceiling,
         None => true,
     }
 }
 
 /// The one decision the driver makes each poll.
-pub fn decide(config: &Config, state: &LoopState, poll: &Poll) -> Decision {
+pub fn decide(config: &Config, state: &LoopState, notes: &Notes, poll: &Poll) -> Decision {
     if state.paused {
         return Decision::Idle("the loop is paused");
     }
-    if state.open_pass.is_some() {
-        return Decision::Idle("a pass is already open");
-    }
-    let triggers = triggers(config, state, poll);
+    let triggers = triggers(config, state, notes, poll);
     if triggers.is_empty() {
         return Decision::Idle("nothing changed");
     }
     // The ceiling overrides both deferrals: a loop that never runs is worse
     // than an injection landing under someone's cursor. A pending nudge does
     // the same, because a nudge is the human overriding that politeness.
-    let urgent = max_interval_elapsed(config, state, poll.now) || state.nudge_pending;
+    let urgent = max_interval_elapsed(config, notes, poll.now) || nudge_pending(state, notes);
     if poll.attached_client && !urgent {
         return Decision::Hold("a client is attached to the session");
     }
@@ -196,7 +222,9 @@ pub fn resolve_engine(config: &Config, state: &LoopState) -> EngineChoice {
 pub struct Session {
     pub engine: String,
     pub pass_doc_hash: u64,
-    pub passes: u32,
+    /// When this daemon created the session. Rotation is by wall-clock age:
+    /// nothing durable counts passes, so nothing counts them here either.
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,11 +239,12 @@ pub enum SessionAction {
 
 pub fn session_action(
     config: &Config,
-    state: &LoopState,
+    rotate_pending: bool,
     engine: &str,
     pass_doc_hash: u64,
     exists: bool,
     known: Option<&Session>,
+    now: DateTime<Utc>,
 ) -> SessionAction {
     if !exists {
         return SessionAction::Create;
@@ -228,23 +257,24 @@ pub fn session_action(
     if session.engine != engine {
         return SessionAction::Restart("the desired engine changed");
     }
-    if state.rotate_pending {
+    if rotate_pending {
         return SessionAction::Restart("a rotation is pending");
     }
     if session.pass_doc_hash != pass_doc_hash {
         return SessionAction::Restart("the pass document changed");
     }
-    if session.passes >= config.max_passes_per_session {
-        return SessionAction::Restart("the session reached its pass budget");
+    if now >= session.created_at + TimeDelta::seconds(config.max_session_age_seconds as i64) {
+        return SessionAction::Restart("the session reached its age budget");
     }
     SessionAction::Reuse
 }
 
 /// The message injected into the leader's terminal.
 ///
-/// Trigger kinds ride along as provenance. The pass runs its complete sync
-/// regardless, so the message never says "only look at X".
-pub fn injection(bootstrap: bool, pass_doc: &str, pass_id: &str, triggers: &[Trigger]) -> String {
+/// It carries no identifier, because nothing durable exists to identify: the
+/// leader reads the fold and acts on whatever the state demands. Trigger kinds
+/// ride along as provenance and never say "only look at X".
+pub fn injection(bootstrap: bool, pass_doc: &str, triggers: &[Trigger]) -> String {
     let kinds = triggers
         .iter()
         .map(|trigger| trigger.as_str())
@@ -256,30 +286,10 @@ pub fn injection(bootstrap: bool, pass_doc: &str, pass_id: &str, triggers: &[Tri
         kinds
     };
     if bootstrap {
-        format!("Read {pass_doc}, then run one pass (pass-id: {pass_id}; triggers: {kinds}).")
+        format!("Read {pass_doc}, then read the current Alder state and act on it (triggers: {kinds}).")
     } else {
-        format!("Run one pass (pass-id: {pass_id}; triggers: {kinds}).")
+        format!("Read the current Alder state and act on it (triggers: {kinds}).")
     }
-}
-
-/// Whether an open pass has outlived the configured ceiling.
-pub fn pass_timed_out(config: &Config, started_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    now >= started_at + TimeDelta::seconds(config.pass_timeout_seconds as i64)
-}
-
-/// The tmux session a pass's handle names, if the driver can observe it.
-///
-/// A pass records the handle of the session that runs it. That handle need not
-/// be this driver's session, and need not be tmux at all: another writer may
-/// have woken the loop with `codex:019f…`. `crashed` is a statement about an
-/// observed dead session, so the driver may only make it for a tmux handle it
-/// can actually check. Everything else is unobservable, and the only honest
-/// verdict left is `timeout`.
-pub fn observable_session(handle: &str) -> Option<&str> {
-    handle
-        .split_once(':')
-        .filter(|(kind, value)| *kind == "tmux" && !value.is_empty())
-        .map(|(_, value)| value)
 }
 
 /// Reports a persistent condition once, and again only when it changes or
@@ -342,8 +352,6 @@ pub fn config_for(engines: &[(&str, &str)]) -> Config {
 
 #[cfg(test)]
 mod tests {
-    use crate::loop_state::{LastPass, OpenPass};
-
     use super::*;
 
     fn at(minutes: i64) -> DateTime<Utc> {
@@ -359,19 +367,19 @@ mod tests {
         }
     }
 
-    /// A loop whose one pass ended `minutes` in, at head 40, with nothing
-    /// appended since.
-    fn ran(minutes: i64) -> LoopState {
+    /// A loop at head 40 with no requests and no deferral.
+    fn settled_state() -> LoopState {
         LoopState {
             head: 40,
-            last_pass: Some(LastPass {
-                id: "hm-pass-1".to_owned(),
-                outcome: Some("ok".to_owned()),
-                wake_at: None,
-                ended_at: Some(at(minutes)),
-                ended_seq: Some(40),
-            }),
             ..LoopState::default()
+        }
+    }
+
+    /// A driver that acted on head 40 at `minutes` in.
+    fn acted(minutes: i64) -> Notes {
+        Notes {
+            last_head: 40,
+            last_wake_at: Some(at(minutes)),
         }
     }
 
@@ -379,64 +387,77 @@ mod tests {
     fn each_trigger_kind_has_exactly_one_cause() {
         let config = config_for(&[("claude", "claude")]);
 
-        // The head still stands where the last pass left it.
-        assert!(triggers(&config, &ran(0), &poll(1)).is_empty());
+        // The head still stands where the driver left it.
+        assert!(triggers(&config, &settled_state(), &acted(0), &poll(1)).is_empty());
 
-        let mut moved = ran(0);
+        let mut moved = settled_state();
         moved.head = 41;
-        assert_eq!(triggers(&config, &moved, &poll(1)), vec![Trigger::Log]);
+        assert_eq!(
+            triggers(&config, &moved, &acted(0), &poll(1)),
+            vec![Trigger::Log]
+        );
 
-        // Before any pass there is no baseline, so the log trigger stays
-        // silent and the ceiling is what fires a fresh project.
-        let mut fresh = LoopState {
-            head: 12,
-            ..LoopState::default()
-        };
-        assert_eq!(triggers(&config, &fresh, &poll(0)), vec![Trigger::Due]);
-        // An unended last pass leaves no baseline either.
-        fresh.last_pass = Some(LastPass {
-            id: "hm-pass-1".to_owned(),
-            outcome: None,
-            wake_at: None,
-            ended_at: Some(at(0)),
-            ended_seq: None,
-        });
-        assert!(!triggers(&config, &fresh, &poll(1)).contains(&Trigger::Log));
+        // Fresh notes have never woken anyone: the ceiling fires immediately,
+        // and any nonzero head is also a log trigger.
+        let fresh = Notes::default();
+        assert_eq!(
+            triggers(&config, &settled_state(), &fresh, &poll(0)),
+            vec![Trigger::Log, Trigger::Due]
+        );
+        assert_eq!(
+            triggers(&config, &LoopState::default(), &fresh, &poll(0)),
+            vec![Trigger::Due]
+        );
 
         let mut observed = poll(1);
         observed.refresh_changed = true;
         assert_eq!(
-            triggers(&config, &ran(0), &observed),
+            triggers(&config, &settled_state(), &acted(0), &observed),
             vec![Trigger::Observations]
         );
 
-        let mut due = ran(0);
-        due.last_pass.as_mut().unwrap().wake_at = Some(at(20));
-        assert!(triggers(&config, &due, &poll(19)).is_empty());
-        assert_eq!(triggers(&config, &due, &poll(20)), vec![Trigger::Due]);
-
-        // The ceiling is 1800 seconds by default.
-        assert_eq!(triggers(&config, &ran(0), &poll(30)), vec![Trigger::Due]);
-        assert!(triggers(&config, &ran(0), &poll(29)).is_empty());
-
-        // A log with no pass at all has waited forever.
+        // A deferral deadline is a due trigger once, at its instant.
+        let mut deferred = settled_state();
+        deferred.review_at = Some(at(20));
+        assert!(triggers(&config, &deferred, &acted(0), &poll(19)).is_empty());
         assert_eq!(
-            triggers(&config, &LoopState::default(), &poll(0)),
+            triggers(&config, &deferred, &acted(0), &poll(20)),
             vec![Trigger::Due]
         );
+        // A wake delivered after the deadline consumes it; the ceiling is the
+        // backstop for a leader that never reviews the item.
+        assert!(triggers(&config, &deferred, &acted(21), &poll(22)).is_empty());
 
-        // A pending nudge is the manual trigger, ahead of everything else.
-        let mut nudged = ran(0);
-        nudged.nudge_pending = true;
-        assert_eq!(triggers(&config, &nudged, &poll(1)), vec![Trigger::Manual]);
+        // The ceiling is 1800 seconds by default.
+        assert_eq!(
+            triggers(&config, &settled_state(), &acted(0), &poll(30)),
+            vec![Trigger::Due]
+        );
+        assert!(triggers(&config, &settled_state(), &acted(0), &poll(29)).is_empty());
 
-        let mut all = ran(0);
+        // A nudge request past the noted head is the manual trigger; the
+        // request event itself also moved the head.
+        let mut nudged = settled_state();
+        nudged.head = 41;
+        nudged.nudge_requested_seq = Some(41);
+        assert_eq!(
+            triggers(&config, &nudged, &acted(0), &poll(1)),
+            vec![Trigger::Manual, Trigger::Log]
+        );
+        // One already acted on is consumed: the noted head has passed it.
+        let consumed = Notes {
+            last_head: 41,
+            last_wake_at: Some(at(0)),
+        };
+        assert!(triggers(&config, &nudged, &consumed, &poll(1)).is_empty());
+
+        let mut all = settled_state();
         all.head = 41;
-        all.nudge_pending = true;
+        all.nudge_requested_seq = Some(41);
         let mut everything = poll(30);
         everything.refresh_changed = true;
         assert_eq!(
-            triggers(&config, &all, &everything),
+            triggers(&config, &all, &acted(0), &everything),
             vec![
                 Trigger::Manual,
                 Trigger::Log,
@@ -451,29 +472,42 @@ mod tests {
     }
 
     #[test]
-    fn pause_and_an_open_pass_outrank_every_trigger() {
+    fn requests_are_pending_only_past_the_noted_head() {
+        let state = |rotate, nudge| LoopState {
+            rotate_requested_seq: rotate,
+            nudge_requested_seq: nudge,
+            ..LoopState::default()
+        };
+        let notes = |last_head| Notes {
+            last_head,
+            last_wake_at: None,
+        };
+        assert!(!rotate_pending(&state(None, None), &notes(0)));
+        assert!(rotate_pending(&state(Some(3), None), &notes(0)));
+        assert!(rotate_pending(&state(Some(5), None), &notes(4)));
+        assert!(!rotate_pending(&state(Some(4), None), &notes(4)));
+        assert!(!rotate_pending(&state(Some(3), None), &notes(4)));
+
+        assert!(!nudge_pending(&state(None, None), &notes(0)));
+        assert!(nudge_pending(&state(None, Some(5)), &notes(4)));
+        assert!(!nudge_pending(&state(None, Some(4)), &notes(4)));
+        // Each is consumed independently of the other.
+        assert!(!rotate_pending(&state(None, Some(5)), &notes(4)));
+    }
+
+    #[test]
+    fn pause_outranks_every_trigger() {
         let config = config_for(&[("claude", "claude")]);
-        let mut paused = ran(0);
+        let mut paused = settled_state();
         paused.paused = true;
+        paused.head = 99;
         assert_eq!(
-            decide(&config, &paused, &poll(30)),
+            decide(&config, &paused, &acted(0), &poll(30)),
             Decision::Idle("the loop is paused")
         );
 
-        let mut open = ran(0);
-        open.open_pass = Some(OpenPass {
-            id: "hm-pass-2".to_owned(),
-            engine: "claude".to_owned(),
-            handle: "tmux:alder-leader".to_owned(),
-            started_at: at(1),
-        });
         assert_eq!(
-            decide(&config, &open, &poll(30)),
-            Decision::Idle("a pass is already open")
-        );
-
-        assert_eq!(
-            decide(&config, &ran(0), &poll(1)),
+            decide(&config, &settled_state(), &acted(0), &poll(1)),
             Decision::Idle("nothing changed")
         );
     }
@@ -481,13 +515,13 @@ mod tests {
     #[test]
     fn debounce_and_attachment_hold_the_injection_but_not_past_the_ceiling() {
         let config = config_for(&[("claude", "claude")]);
-        // Another writer appended past the last pass's end.
-        let mut moved = ran(0);
+        // Another writer appended past the noted head.
+        let mut moved = settled_state();
         moved.head = 41;
         let mut fresh = poll(1);
         fresh.pending_since = Some(at(1));
         assert_eq!(
-            decide(&config, &moved, &fresh),
+            decide(&config, &moved, &acted(0), &fresh),
             Decision::Hold("debouncing")
         );
 
@@ -495,14 +529,14 @@ mod tests {
         let mut settled = fresh.clone();
         settled.now = at(2);
         assert_eq!(
-            decide(&config, &moved, &settled),
+            decide(&config, &moved, &acted(0), &settled),
             Decision::Fire(vec![Trigger::Log])
         );
 
         let mut attached = settled.clone();
         attached.attached_client = true;
         assert_eq!(
-            decide(&config, &moved, &attached),
+            decide(&config, &moved, &acted(0), &attached),
             Decision::Hold("a client is attached to the session")
         );
 
@@ -511,16 +545,17 @@ mod tests {
         overdue.now = at(31);
         overdue.pending_since = Some(at(31));
         assert_eq!(
-            decide(&config, &moved, &overdue),
+            decide(&config, &moved, &acted(0), &overdue),
             Decision::Fire(vec![Trigger::Log, Trigger::Due])
         );
     }
 
     #[test]
-    fn a_nudge_fires_through_both_deferrals_but_respects_pause_and_open_pass() {
+    fn a_nudge_fires_through_both_deferrals_but_respects_pause() {
         let config = config_for(&[("claude", "claude")]);
-        let mut nudged = ran(0);
-        nudged.nudge_pending = true;
+        let mut nudged = settled_state();
+        nudged.head = 41;
+        nudged.nudge_requested_seq = Some(41);
 
         // Debounce has not settled and a client is attached; a nudge fires
         // anyway, because it is the human overriding the driver's politeness.
@@ -528,27 +563,16 @@ mod tests {
         held.pending_since = Some(at(1));
         held.attached_client = true;
         assert_eq!(
-            decide(&config, &nudged, &held),
-            Decision::Fire(vec![Trigger::Manual])
+            decide(&config, &nudged, &acted(0), &held),
+            Decision::Fire(vec![Trigger::Manual, Trigger::Log])
         );
 
-        // Pause and an open pass still outrank it.
+        // Pause still outranks it.
         let mut paused = nudged.clone();
         paused.paused = true;
         assert_eq!(
-            decide(&config, &paused, &held),
+            decide(&config, &paused, &acted(0), &held),
             Decision::Idle("the loop is paused")
-        );
-        let mut open = nudged.clone();
-        open.open_pass = Some(OpenPass {
-            id: "hm-pass-2".to_owned(),
-            engine: "claude".to_owned(),
-            handle: "tmux:alder-leader".to_owned(),
-            started_at: at(1),
-        });
-        assert_eq!(
-            decide(&config, &open, &held),
-            Decision::Idle("a pass is already open")
         );
     }
 
@@ -645,84 +669,86 @@ mod tests {
     #[test]
     fn every_era_boundary_restarts_the_session() {
         let config = config_for(&[("claude", "claude")]);
-        let state = LoopState::default();
         let session = Session {
             engine: "claude".to_owned(),
             pass_doc_hash: 7,
-            passes: 3,
+            created_at: at(0),
         };
 
         assert_eq!(
-            session_action(&config, &state, "claude", 7, false, Some(&session)),
+            session_action(&config, false, "claude", 7, false, Some(&session), at(1)),
             SessionAction::Create
         );
         assert_eq!(
-            session_action(&config, &state, "claude", 7, true, None),
+            session_action(&config, false, "claude", 7, true, None, at(1)),
             SessionAction::Restart("the running session is not this daemon's")
         );
         assert_eq!(
-            session_action(&config, &state, "claude", 7, true, Some(&session)),
+            session_action(&config, false, "claude", 7, true, Some(&session), at(1)),
             SessionAction::Reuse
         );
         assert_eq!(
-            session_action(&config, &state, "codex", 7, true, Some(&session)),
+            session_action(&config, false, "codex", 7, true, Some(&session), at(1)),
             SessionAction::Restart("the desired engine changed")
         );
         assert_eq!(
-            session_action(&config, &state, "claude", 9, true, Some(&session)),
+            session_action(&config, false, "claude", 9, true, Some(&session), at(1)),
             SessionAction::Restart("the pass document changed")
         );
-
-        let mut rotating = state.clone();
-        rotating.rotate_pending = true;
         assert_eq!(
-            session_action(&config, &rotating, "claude", 7, true, Some(&session)),
+            session_action(&config, true, "claude", 7, true, Some(&session), at(1)),
             SessionAction::Restart("a rotation is pending")
         );
 
-        let spent = Session {
-            passes: config.max_passes_per_session,
-            ..session
-        };
+        // The default age budget is 21600 seconds: six hours.
         assert_eq!(
-            session_action(&config, &state, "claude", 7, true, Some(&spent)),
-            SessionAction::Restart("the session reached its pass budget")
+            session_action(&config, false, "claude", 7, true, Some(&session), at(359)),
+            SessionAction::Reuse
+        );
+        assert_eq!(
+            session_action(&config, false, "claude", 7, true, Some(&session), at(360)),
+            SessionAction::Restart("the session reached its age budget")
         );
     }
 
     #[test]
-    fn injections_state_the_pass_and_its_provenance() {
+    fn injections_say_to_read_the_state_and_carry_provenance() {
         assert_eq!(
             injection(
                 true,
                 ".agent/skills/pass/SKILL.md",
-                "hm-pass-3",
                 &[Trigger::Log, Trigger::Due]
             ),
-            "Read .agent/skills/pass/SKILL.md, then run one pass (pass-id: hm-pass-3; triggers: log,due)."
+            "Read .agent/skills/pass/SKILL.md, then read the current Alder state and act on it \
+             (triggers: log,due)."
         );
         assert_eq!(
-            injection(
-                false,
-                ".agent/skills/pass/SKILL.md",
-                "hm-pass-4",
-                &[Trigger::Observations]
-            ),
-            "Run one pass (pass-id: hm-pass-4; triggers: observations)."
+            injection(false, ".agent/skills/pass/SKILL.md", &[Trigger::Observations]),
+            "Read the current Alder state and act on it (triggers: observations)."
         );
         assert_eq!(
-            injection(false, ".agent/skills/pass/SKILL.md", "hm-pass-5", &[]),
-            "Run one pass (pass-id: hm-pass-5; triggers: none)."
+            injection(false, ".agent/skills/pass/SKILL.md", &[]),
+            "Read the current Alder state and act on it (triggers: none)."
         );
     }
 
     #[test]
-    fn pass_timeouts_and_content_hashes_are_exact() {
-        let config = config_for(&[("claude", "claude")]);
-        // The default pass timeout is 3600 seconds.
-        assert!(!pass_timed_out(&config, at(0), at(59)));
-        assert!(pass_timed_out(&config, at(0), at(60)));
+    fn notes_round_trip_and_default_to_never_having_acted() {
+        let notes = Notes {
+            last_head: 17,
+            last_wake_at: Some(at(3)),
+        };
+        let bytes = serde_json::to_vec(&notes).unwrap();
+        assert_eq!(serde_json::from_slice::<Notes>(&bytes).unwrap(), notes);
 
+        // Absent fields decode as the fresh state, so a truncated or
+        // hand-edited file degrades to one extra wake rather than an error.
+        let sparse: Notes = serde_json::from_str("{}").unwrap();
+        assert_eq!(sparse, Notes::default());
+    }
+
+    #[test]
+    fn content_hashes_are_exact() {
         // FNV-1a, pinned to its published 64-bit vectors: both the basis and
         // the mixing step are fixed, so a hash that merely varies with its
         // input is not enough to pass.
@@ -731,31 +757,6 @@ mod tests {
         assert_eq!(content_hash(b"foobar"), 0x8594_4171_f739_67e8);
         assert_eq!(content_hash(b"one"), content_hash(b"one"));
         assert_ne!(content_hash(b"one"), content_hash(b"two"));
-    }
-
-    #[test]
-    fn only_a_tmux_handle_names_a_session_the_driver_can_observe() {
-        assert_eq!(
-            observable_session("tmux:alder-leader"),
-            Some("alder-leader")
-        );
-        // Another writer's session is still observable if it is tmux.
-        assert_eq!(observable_session("tmux:other-box"), Some("other-box"));
-        // A value may contain colons; only the kind is parsed.
-        assert_eq!(
-            observable_session("tmux:box-17/alder-hm-9a1"),
-            Some("box-17/alder-hm-9a1")
-        );
-        // Nothing else can be checked, so nothing else may be called crashed.
-        for opaque in [
-            "codex:019f",
-            "github-actions:owner/repo/run/1",
-            "tmux:",
-            "tmux",
-            "",
-        ] {
-            assert_eq!(observable_session(opaque), None, "{opaque}");
-        }
     }
 
     #[test]
