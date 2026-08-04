@@ -1686,12 +1686,24 @@ mod tests {
     /// would show in no ledger and in no call list; the source is again what no
     /// load can make untrue.
     ///
-    /// Fewer words are banned here than above, and the difference is the whole
-    /// point of scanning the two halves separately. This half runs commands, so
-    /// a bounded timeout on one that can hang is a limit AGENTS.md allows, and
-    /// it needs a `Duration` — which is therefore permitted. What no limit
-    /// needs is a way to stand still or a clock to stand still by, so `sleep`,
-    /// `park`, `yield_now`, `spin_loop`, `Instant` and `elapsed` are refused.
+    /// `Duration` is permitted here and banned above, and that difference is
+    /// the whole point of scanning the two halves separately. This half runs
+    /// commands, so a bounded timeout on one that can hang is a limit AGENTS.md
+    /// allows, and a limit needs a duration. What a limit does not need is a
+    /// way to stand still, a clock to stand still by, or another thread to
+    /// stand still until — so two families are refused. Standing still:
+    /// `sleep`, `park`, `yield_now`, `spin_loop`, and the `Instant`/`elapsed`
+    /// pair a hand-rolled deadline reads. Standing still until another thread
+    /// says when: `recv` in every spelling, `Condvar`, `Barrier`.
+    ///
+    /// One of those overlaps the exception, and it is worth knowing which. The
+    /// usual std-only way to bound a command is a watchdog thread and
+    /// `recv_timeout`, so a legitimate limit written that way would fail this.
+    /// That is deliberate: a bounded limit and a bounded readiness wait are the
+    /// same text, and a limit has spellings that name no banned word — a
+    /// `Duration`-taking API such as `Child::wait_timeout`, or a command run
+    /// under one. If that day comes the failure is a decision to make, not a
+    /// bug to route around.
     ///
     /// Both halves are read in one place on purpose: narrowing either without
     /// the other in view is how the host lost its coverage once already.
@@ -1715,12 +1727,19 @@ mod tests {
                  now covers less of the host than it was written to cover"
             );
             for waiting in [
+                // Standing still, and the clock a hand-rolled deadline reads.
                 "sleep",
                 "park",
                 "yield_now",
                 "spin_loop",
                 "Instant",
                 "elapsed",
+                // Standing still until another thread says when. `recv` takes
+                // `recv_timeout` and `try_recv` with it, which is the point: a
+                // bounded receive and a polled one are both waits.
+                "recv",
+                "Condvar",
+                "Barrier",
             ] {
                 assert!(
                     !code.contains(waiting),
@@ -1728,8 +1747,8 @@ mod tests {
                      is the one thing a dispatch may not do: it types nothing at a \
                      session and waits for no engine to boot. A bounded timeout on \
                      a command that can hang is a limit rather than a wait — spell \
-                     it with a `Duration`, which this test allows, and not with a \
-                     word that can only mean waiting."
+                     it with a `Duration`, which this test allows, and with an API \
+                     that takes one, not with a word that can only mean waiting."
                 );
             }
         }
