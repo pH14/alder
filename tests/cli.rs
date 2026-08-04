@@ -531,12 +531,12 @@ fn refresh_keeps_levels_durable_when_configuration_changes_or_a_script_fails() {
     let handle = "tmux:worker";
     project.success(&["attempt", "edit", &attempt, "--handle", handle]);
 
-    let command = format!(
-        "printf '%s\\n' '[{{\"value\":\"worker\",\"attempt_id\":\"{attempt}\",\"metadata\":{{\"state\":\"running\"}}}}]'"
-    );
+    let command =
+        "printf '%s\\n' '[{\"subject\":\"tmux:worker\",\"field\":\"liveness\",\"level\":\"present\"}]'"
+            .to_owned();
     project.config(json!([{"observer": "tmux", "list": command}]));
     let refreshed = project.success(&["refresh"]);
-    assert_eq!(refreshed["result"]["appended"], 2);
+    assert_eq!(refreshed["result"]["appended"], 1);
     assert!(
         project
             .human(&["status", "--full"])
@@ -552,15 +552,16 @@ fn refresh_keeps_levels_durable_when_configuration_changes_or_a_script_fails() {
     // cannot erase a belief already in the shared log.
     project.config(json!([]));
     let snapshot = project.success(&["observations"]);
-    assert_eq!(
-        snapshot["observations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|observation| observation["field"] == "liveness")
-            .unwrap()["level"],
-        "present"
-    );
+    let liveness = snapshot["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|observation| observation["field"] == "liveness")
+        .unwrap()
+        .clone();
+    // The key is the attempt, not the session: the handle stays opaque.
+    assert_eq!(liveness["subject"], attempt);
+    assert_eq!(liveness["level"], "present");
 
     project.config(json!([{"observer": "tmux", "list": "exit 7"}]));
     let failed = project.success(&["refresh"]);
@@ -758,22 +759,33 @@ fn initialization_is_byte_preserving_and_conflicts_are_structured() {
     assert_eq!(fs::read(&manifest).unwrap(), before);
 }
 
+/// A liveness row is a statement about an attempt, matched through the
+/// attempt's opaque handle. A listed handle no live attempt claims is the
+/// runner's business, not the log's, so it appends nothing — and the retired
+/// handle-inventory shape is no longer valid observer output at all.
 #[test]
-fn refresh_adapts_the_existing_handle_observer_to_durable_liveness() {
+fn a_listed_handle_no_attempt_claims_appends_nothing() {
     let project = TestProject::new();
+    project.config(json!([{
+        "observer": "tmux",
+        "list": "printf '%s\\n' '[{\"subject\":\"tmux:stray\",\"field\":\"liveness\",\"level\":\"present\"}]'"
+    }]));
+    let refreshed = project.success(&["refresh"]);
+    assert_eq!(refreshed["result"]["appended"], 0);
+    assert!(
+        project.success(&["observations"])["observations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
     project.config(json!([{
         "observer": "tmux",
         "list": "printf '%s\\n' '[{\"value\":\"stray\"}]'"
     }]));
-    let refreshed = project.success(&["refresh"]);
-    assert_eq!(refreshed["result"]["appended"], 1);
-    let snapshot = project.success(&["observations"]);
-    assert_eq!(snapshot["observations"][0]["observer"], "tmux");
-    assert_eq!(snapshot["observations"][0]["subject"], "stray");
-    assert_eq!(snapshot["observations"][0]["field"], "liveness");
-    assert_eq!(snapshot["observations"][0]["level"], "present");
-    let human = project.human(&["refresh"]);
-    assert!(human.contains("no observation changes"));
+    let legacy = project.success(&["refresh"]);
+    assert_eq!(legacy["result"]["runs"][0]["success"], false);
+    assert_eq!(legacy["result"]["appended"], 0);
 }
 
 #[test]
@@ -1631,8 +1643,66 @@ fn every_confirmed_append_touches_the_local_marker() {
     assert!(mtime(&marker) >= stamped);
 }
 
+/// The tier is the runner's rung name, recorded so a later reader can say
+/// "retry this at a higher rung" from the log alone. Alder stores it opaque:
+/// no table of valid tiers exists anywhere, any non-empty string is legal,
+/// and the serialized attempt carries the key explicitly even when unset.
 #[test]
-fn refresh_reports_change_without_counting_metadata_churn() {
+fn an_attempt_records_its_tier_as_an_opaque_name() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&["work", "add", "--title", "Tiered work"]),
+        "work_id",
+    );
+
+    let blank = project.failure(&["work", "start", &work, "--tier", " "]);
+    assert_eq!(blank["code"], "validation_failed");
+
+    let started = project.success(&["work", "start", &work, "--tier", "luna"]);
+    assert_eq!(started["tier"], "luna");
+    let attempt = string(&started, "attempt_id");
+    assert_eq!(
+        project.success(&["show", &attempt])["current"]["tier"],
+        "luna"
+    );
+
+    // Any non-empty name is legal: the meaning lives outside the log.
+    project.success(&["attempt", "edit", &attempt, "--tier", "Rung 9 / custom"]);
+    assert_eq!(
+        project.success(&["show", &attempt])["current"]["tier"],
+        "Rung 9 / custom"
+    );
+
+    // Binding a handle is exclusive of progress fields, tier included.
+    let conflicting = project.failure(&[
+        "attempt",
+        "edit",
+        &attempt,
+        "--handle",
+        "tmux:worker",
+        "--tier",
+        "terra",
+    ]);
+    assert_eq!(conflicting["code"], "validation_failed");
+
+    // An attempt started without a tier serializes the key as explicit null.
+    project.success(&[
+        "attempt",
+        "end",
+        &attempt,
+        "--outcome",
+        "cancelled",
+        "--why",
+        "fixture over",
+    ]);
+    let untiered = string(&project.success(&["work", "start", &work]), "attempt_id");
+    let current = project.success(&["show", &untiered])["current"].clone();
+    assert!(current.as_object().unwrap().contains_key("tier"));
+    assert!(current["tier"].is_null());
+}
+
+#[test]
+fn refresh_is_quiet_while_the_picture_is_unchanged() {
     let project = TestProject::new();
     let work = string(
         &project.success(&["work", "add", "--title", "Observed"]),
@@ -1641,20 +1711,14 @@ fn refresh_reports_change_without_counting_metadata_churn() {
     let attempt = string(&project.success(&["work", "start", &work]), "attempt_id");
     project.success(&["attempt", "edit", &attempt, "--handle", "tmux:worker"]);
 
-    let ticker = project.work.join("cost");
     project.config(json!([{
         "observer": "tmux",
-        "list": format!(
-            "n=$(cat '{path}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{path}'; \
-             printf '[{{\"value\":\"worker\",\"attempt_id\":\"{attempt}\",\
-             \"metadata\":{{\"estimated_cost\":%s}}}}]' \"$n\"",
-            path = ticker.display(),
-        )
+        "list": "printf '%s\\n' '[{\"subject\":\"tmux:worker\",\"field\":\"liveness\",\"level\":\"present\"}]'"
     }]));
 
     let first = project.success(&["refresh"]);
     assert_eq!(first["changed"], true);
-    assert_eq!(first["result"]["appended"], 2);
+    assert_eq!(first["result"]["appended"], 1);
     for _ in 0..2 {
         assert_eq!(project.success(&["refresh"])["changed"], false);
     }
@@ -1668,7 +1732,7 @@ fn refresh_reports_change_without_counting_metadata_churn() {
     assert!(
         project
             .human(&["refresh"])
-            .contains("recorded 2 observation changes")
+            .contains("recorded 1 observation changes")
     );
     assert_eq!(project.success(&["refresh"])["changed"], false);
 }
@@ -1732,8 +1796,8 @@ fn observations_are_quiet_when_unchanged_and_snapshot_the_newest_level() {
 fn refresh_applies_complete_level_snapshots_through_the_quiet_append_path() {
     let project = TestProject::new();
     project.config(json!([{
-        "observer": "tmux",
-        "list": "printf '%s\\n' '[{\"subject\":\"worker\",\"field\":\"liveness\",\"level\":\"present\"}]'"
+        "observer": "github",
+        "list": "printf '%s\\n' '[{\"subject\":\"owner/repo#171\",\"field\":\"ci\",\"level\":\"running\"}]'"
     }]));
 
     let first = project.success(&["refresh"]);
@@ -1744,17 +1808,17 @@ fn refresh_applies_complete_level_snapshots_through_the_quiet_append_path() {
     assert_eq!(repeated["result"]["appended"], 0);
 
     project.config(json!([{
-        "observer": "tmux",
-        "list": "printf '%s\\n' '[{\"subject\":\"worker\",\"field\":\"liveness\",\"level\":\"absent\"}]'"
+        "observer": "github",
+        "list": "printf '%s\\n' '[{\"subject\":\"owner/repo#171\",\"field\":\"ci\",\"level\":\"passing\"}]'"
     }]));
     let changed = project.success(&["refresh"]);
     assert_eq!(changed["result"]["appended"], 1);
     assert_eq!(
         project.success(&["observations"])["observations"][0]["level"],
-        "absent"
+        "passing"
     );
 
-    project.config(json!([{"observer": "tmux", "list": "printf '[]'"}]));
+    project.config(json!([{"observer": "github", "list": "printf '[]'"}]));
     let retired = project.success(&["refresh"]);
     assert_eq!(retired["result"]["retired"], 1);
     assert!(
@@ -1782,24 +1846,21 @@ fn a_dead_workers_liveness_stays_absent_until_its_attempt_ends() {
 
     project.config(json!([{
         "observer": "tmux",
-        "list": format!(
-            "printf '%s\\n' '[{{\"subject\":\"worker\",\"field\":\"liveness\",\"level\":\"present\"}},{{\"subject\":\"worker\",\"field\":\"attempt-id\",\"level\":\"{attempt}\"}}]'"
-        )
+        "list": "printf '%s\\n' '[{\"subject\":\"tmux:worker\",\"field\":\"liveness\",\"level\":\"present\"}]'"
     }]));
     let first = project.success(&["refresh"]);
-    assert_eq!(first["result"]["appended"], 2, "{first}");
+    assert_eq!(first["result"]["appended"], 1, "{first}");
     assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
 
-    // The session vanishes while the attempt is still active. The liveness
-    // key flips to absent (one append); the attempt-id key retires (another).
+    // The session vanishes while the attempt is still active. The attempt's
+    // liveness key flips to an explicit absent level.
     project.config(json!([{"observer": "tmux", "list": "printf '[]'"}]));
     let died = project.success(&["refresh"]);
-    assert_eq!(died["result"]["appended"], 2);
-    assert_eq!(died["result"]["retired"], 1);
-    assert_eq!(
-        project.success(&["observations"])["observations"][0]["level"],
-        "absent"
-    );
+    assert_eq!(died["result"]["appended"], 1);
+    assert_eq!(died["result"]["retired"], 0);
+    let observation = project.success(&["observations"])["observations"][0].clone();
+    assert_eq!(observation["subject"], attempt);
+    assert_eq!(observation["level"], "absent");
 
     // The fold alone carries the death: attention shows the missing worker.
     let status = project.success(&["status", "--full"]);
