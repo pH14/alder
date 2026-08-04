@@ -211,6 +211,10 @@ pub struct WorkEditArgs {
 #[derive(Debug, Args)]
 pub struct WorkStartArgs {
     pub work: String,
+    /// The runner's rung name for this attempt. Opaque to Alder: any
+    /// non-empty name is legal, and its meaning lives outside the log.
+    #[arg(long, value_name = "NAME")]
+    pub tier: Option<String>,
     #[arg(long, value_name = "KEY=VALUE")]
     pub meta: Vec<String>,
 }
@@ -280,8 +284,13 @@ pub enum AttemptCommand {
 #[derive(Debug, Args)]
 pub struct AttemptEditArgs {
     pub attempt: String,
-    #[arg(long, value_name = "KIND:VALUE")]
+    /// An opaque foreign name for the execution. Alder stores it verbatim
+    /// and never parses it.
+    #[arg(long, value_name = "HANDLE")]
     pub handle: Option<String>,
+    /// The runner's rung name. Opaque to Alder; any non-empty name is legal.
+    #[arg(long, value_name = "NAME")]
+    pub tier: Option<String>,
     #[arg(long, value_name = "KEY=VALUE")]
     pub meta: Vec<String>,
     #[arg(long, value_name = "CHECK")]

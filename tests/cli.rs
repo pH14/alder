@@ -531,12 +531,10 @@ fn refresh_keeps_levels_durable_when_configuration_changes_or_a_script_fails() {
     let handle = "tmux:worker";
     project.success(&["attempt", "edit", &attempt, "--handle", handle]);
 
-    let command = format!(
-        "printf '%s\\n' '[{{\"value\":\"worker\",\"attempt_id\":\"{attempt}\",\"metadata\":{{\"state\":\"running\"}}}}]'"
-    );
-    project.config(json!([{"observer": "tmux", "list": command}]));
+    let command = "case \"$1\" in tmux:worker) echo present;; *) echo unknown;; esac".to_owned();
+    project.config(json!([{"observer": "tmux", "probe": command}]));
     let refreshed = project.success(&["refresh"]);
-    assert_eq!(refreshed["result"]["appended"], 2);
+    assert_eq!(refreshed["result"]["appended"], 1);
     assert!(
         project
             .human(&["status", "--full"])
@@ -544,6 +542,7 @@ fn refresh_keeps_levels_durable_when_configuration_changes_or_a_script_fails() {
     );
     let diagnostics = project.success(&["debug", "observations", "tmux"]);
     assert_eq!(diagnostics["kinds"][0]["configured"], true);
+    assert_eq!(diagnostics["kinds"][0]["mode"], "probe");
     assert_eq!(diagnostics["kinds"][0]["command"], command);
     let reconciled = project.success(&["reconcile"]);
     assert_eq!(reconciled["refreshed"], true);
@@ -552,17 +551,18 @@ fn refresh_keeps_levels_durable_when_configuration_changes_or_a_script_fails() {
     // cannot erase a belief already in the shared log.
     project.config(json!([]));
     let snapshot = project.success(&["observations"]);
-    assert_eq!(
-        snapshot["observations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|observation| observation["field"] == "liveness")
-            .unwrap()["level"],
-        "present"
-    );
+    let liveness = snapshot["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|observation| observation["field"] == "liveness")
+        .unwrap()
+        .clone();
+    // The key is the attempt, not the session: the handle stays opaque.
+    assert_eq!(liveness["subject"], attempt);
+    assert_eq!(liveness["level"], "present");
 
-    project.config(json!([{"observer": "tmux", "list": "exit 7"}]));
+    project.config(json!([{"observer": "tmux", "probe": "exit 7"}]));
     let failed = project.success(&["refresh"]);
     assert_eq!(failed["result"]["appended"], 0);
     assert_eq!(
@@ -758,22 +758,48 @@ fn initialization_is_byte_preserving_and_conflicts_are_structured() {
     assert_eq!(fs::read(&manifest).unwrap(), before);
 }
 
+/// Liveness is a per-handle probe, so a stray execution no attempt claims is
+/// never even asked about: with nothing bound there are no targets and the
+/// sweep appends nothing. A `list` snapshot claiming a liveness row appends
+/// nothing either — the field belongs to probes — and the retired
+/// handle-inventory shape is no longer valid observer output at all.
 #[test]
-fn refresh_adapts_the_existing_handle_observer_to_durable_liveness() {
+fn a_handle_no_attempt_claims_is_never_probed_and_appends_nothing() {
     let project = TestProject::new();
+    project.config(json!([{
+        "observer": "tmux",
+        "probe": "echo present"
+    }]));
+    let refreshed = project.success(&["refresh"]);
+    assert_eq!(refreshed["result"]["appended"], 0);
+    assert!(
+        refreshed["result"]["runs"][0]["executions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        project.success(&["observations"])["observations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    project.config(json!([{
+        "observer": "tmux",
+        "list": "printf '%s\\n' '[{\"subject\":\"tmux:stray\",\"field\":\"liveness\",\"level\":\"present\"}]'"
+    }]));
+    let listed = project.success(&["refresh"]);
+    assert_eq!(listed["result"]["runs"][0]["success"], true);
+    assert_eq!(listed["result"]["appended"], 0);
+
     project.config(json!([{
         "observer": "tmux",
         "list": "printf '%s\\n' '[{\"value\":\"stray\"}]'"
     }]));
-    let refreshed = project.success(&["refresh"]);
-    assert_eq!(refreshed["result"]["appended"], 1);
-    let snapshot = project.success(&["observations"]);
-    assert_eq!(snapshot["observations"][0]["observer"], "tmux");
-    assert_eq!(snapshot["observations"][0]["subject"], "stray");
-    assert_eq!(snapshot["observations"][0]["field"], "liveness");
-    assert_eq!(snapshot["observations"][0]["level"], "present");
-    let human = project.human(&["refresh"]);
-    assert!(human.contains("no observation changes"));
+    let legacy = project.success(&["refresh"]);
+    assert_eq!(legacy["result"]["runs"][0]["success"], false);
+    assert_eq!(legacy["result"]["appended"], 0);
 }
 
 #[test]
@@ -1631,8 +1657,66 @@ fn every_confirmed_append_touches_the_local_marker() {
     assert!(mtime(&marker) >= stamped);
 }
 
+/// The tier is the runner's rung name, recorded so a later reader can say
+/// "retry this at a higher rung" from the log alone. Alder stores it opaque:
+/// no table of valid tiers exists anywhere, any non-empty string is legal,
+/// and the serialized attempt carries the key explicitly even when unset.
 #[test]
-fn refresh_reports_change_without_counting_metadata_churn() {
+fn an_attempt_records_its_tier_as_an_opaque_name() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&["work", "add", "--title", "Tiered work"]),
+        "work_id",
+    );
+
+    let blank = project.failure(&["work", "start", &work, "--tier", " "]);
+    assert_eq!(blank["code"], "validation_failed");
+
+    let started = project.success(&["work", "start", &work, "--tier", "luna"]);
+    assert_eq!(started["tier"], "luna");
+    let attempt = string(&started, "attempt_id");
+    assert_eq!(
+        project.success(&["show", &attempt])["current"]["tier"],
+        "luna"
+    );
+
+    // Any non-empty name is legal: the meaning lives outside the log.
+    project.success(&["attempt", "edit", &attempt, "--tier", "Rung 9 / custom"]);
+    assert_eq!(
+        project.success(&["show", &attempt])["current"]["tier"],
+        "Rung 9 / custom"
+    );
+
+    // Binding a handle is exclusive of progress fields, tier included.
+    let conflicting = project.failure(&[
+        "attempt",
+        "edit",
+        &attempt,
+        "--handle",
+        "tmux:worker",
+        "--tier",
+        "terra",
+    ]);
+    assert_eq!(conflicting["code"], "validation_failed");
+
+    // An attempt started without a tier serializes the key as explicit null.
+    project.success(&[
+        "attempt",
+        "end",
+        &attempt,
+        "--outcome",
+        "cancelled",
+        "--why",
+        "fixture over",
+    ]);
+    let untiered = string(&project.success(&["work", "start", &work]), "attempt_id");
+    let current = project.success(&["show", &untiered])["current"].clone();
+    assert!(current.as_object().unwrap().contains_key("tier"));
+    assert!(current["tier"].is_null());
+}
+
+#[test]
+fn refresh_is_quiet_while_the_picture_is_unchanged() {
     let project = TestProject::new();
     let work = string(
         &project.success(&["work", "add", "--title", "Observed"]),
@@ -1641,20 +1725,14 @@ fn refresh_reports_change_without_counting_metadata_churn() {
     let attempt = string(&project.success(&["work", "start", &work]), "attempt_id");
     project.success(&["attempt", "edit", &attempt, "--handle", "tmux:worker"]);
 
-    let ticker = project.work.join("cost");
     project.config(json!([{
         "observer": "tmux",
-        "list": format!(
-            "n=$(cat '{path}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{path}'; \
-             printf '[{{\"value\":\"worker\",\"attempt_id\":\"{attempt}\",\
-             \"metadata\":{{\"estimated_cost\":%s}}}}]' \"$n\"",
-            path = ticker.display(),
-        )
+        "probe": "echo present"
     }]));
 
     let first = project.success(&["refresh"]);
     assert_eq!(first["changed"], true);
-    assert_eq!(first["result"]["appended"], 2);
+    assert_eq!(first["result"]["appended"], 1);
     for _ in 0..2 {
         assert_eq!(project.success(&["refresh"])["changed"], false);
     }
@@ -1664,11 +1742,11 @@ fn refresh_reports_change_without_counting_metadata_churn() {
             .contains("no observation changes")
     );
 
-    project.config(json!([{"observer": "tmux", "list": "printf '[]'"}]));
+    project.config(json!([{"observer": "tmux", "probe": "echo absent"}]));
     assert!(
         project
             .human(&["refresh"])
-            .contains("recorded 2 observation changes")
+            .contains("recorded 1 observation changes")
     );
     assert_eq!(project.success(&["refresh"])["changed"], false);
 }
@@ -1732,8 +1810,8 @@ fn observations_are_quiet_when_unchanged_and_snapshot_the_newest_level() {
 fn refresh_applies_complete_level_snapshots_through_the_quiet_append_path() {
     let project = TestProject::new();
     project.config(json!([{
-        "observer": "tmux",
-        "list": "printf '%s\\n' '[{\"subject\":\"worker\",\"field\":\"liveness\",\"level\":\"present\"}]'"
+        "observer": "github",
+        "list": "printf '%s\\n' '[{\"subject\":\"owner/repo#171\",\"field\":\"ci\",\"level\":\"running\"}]'"
     }]));
 
     let first = project.success(&["refresh"]);
@@ -1744,17 +1822,17 @@ fn refresh_applies_complete_level_snapshots_through_the_quiet_append_path() {
     assert_eq!(repeated["result"]["appended"], 0);
 
     project.config(json!([{
-        "observer": "tmux",
-        "list": "printf '%s\\n' '[{\"subject\":\"worker\",\"field\":\"liveness\",\"level\":\"absent\"}]'"
+        "observer": "github",
+        "list": "printf '%s\\n' '[{\"subject\":\"owner/repo#171\",\"field\":\"ci\",\"level\":\"passing\"}]'"
     }]));
     let changed = project.success(&["refresh"]);
     assert_eq!(changed["result"]["appended"], 1);
     assert_eq!(
         project.success(&["observations"])["observations"][0]["level"],
-        "absent"
+        "passing"
     );
 
-    project.config(json!([{"observer": "tmux", "list": "printf '[]'"}]));
+    project.config(json!([{"observer": "github", "list": "printf '[]'"}]));
     let retired = project.success(&["refresh"]);
     assert_eq!(retired["result"]["retired"], 1);
     assert!(
@@ -1766,10 +1844,10 @@ fn refresh_applies_complete_level_snapshots_through_the_quiet_append_path() {
 }
 
 /// A dead worker is a statement, not a silence. While its attempt is active,
-/// an omitted liveness key becomes an explicit `absent` level rather than a
-/// retirement, so any reader of the fold — with no observer of its own — sees
-/// the death in `status` attention with the repair. The key retires only once
-/// the attempt has ended.
+/// a probe answering `absent` becomes an explicit `absent` level rather than
+/// a retirement, so any reader of the fold — with no observer of its own —
+/// sees the death in `status` attention with the repair. The key retires only
+/// once the attempt has ended.
 #[test]
 fn a_dead_workers_liveness_stays_absent_until_its_attempt_ends() {
     let project = TestProject::new();
@@ -1782,24 +1860,21 @@ fn a_dead_workers_liveness_stays_absent_until_its_attempt_ends() {
 
     project.config(json!([{
         "observer": "tmux",
-        "list": format!(
-            "printf '%s\\n' '[{{\"subject\":\"worker\",\"field\":\"liveness\",\"level\":\"present\"}},{{\"subject\":\"worker\",\"field\":\"attempt-id\",\"level\":\"{attempt}\"}}]'"
-        )
+        "probe": "echo present"
     }]));
     let first = project.success(&["refresh"]);
-    assert_eq!(first["result"]["appended"], 2, "{first}");
+    assert_eq!(first["result"]["appended"], 1, "{first}");
     assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
 
-    // The session vanishes while the attempt is still active. The liveness
-    // key flips to absent (one append); the attempt-id key retires (another).
-    project.config(json!([{"observer": "tmux", "list": "printf '[]'"}]));
+    // The session vanishes while the attempt is still active. The attempt's
+    // liveness key flips to an explicit absent level.
+    project.config(json!([{"observer": "tmux", "probe": "echo absent"}]));
     let died = project.success(&["refresh"]);
-    assert_eq!(died["result"]["appended"], 2);
-    assert_eq!(died["result"]["retired"], 1);
-    assert_eq!(
-        project.success(&["observations"])["observations"][0]["level"],
-        "absent"
-    );
+    assert_eq!(died["result"]["appended"], 1);
+    assert_eq!(died["result"]["retired"], 0);
+    let observation = project.success(&["observations"])["observations"][0].clone();
+    assert_eq!(observation["subject"], attempt);
+    assert_eq!(observation["level"], "absent");
 
     // The fold alone carries the death: attention shows the missing worker.
     let status = project.success(&["status", "--full"]);
@@ -1830,6 +1905,111 @@ fn a_dead_workers_liveness_stays_absent_until_its_attempt_ends() {
             .unwrap()
             .is_empty()
     );
+    assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
+}
+
+/// A16: an execution outliving its ended attempt must surface through the
+/// DEFAULT refresh-first `alder reconcile`. The probe keeps asking about an
+/// ended attempt's handle while its liveness key is current, so ending the
+/// attempt does not retire the evidence — `present` stays, and reconcile
+/// names the `orphan` with a kill-shaped suggestion. Once the execution is
+/// really gone the key retires and the picture is quiet.
+#[test]
+fn an_execution_outliving_its_ended_attempt_is_an_orphan_through_default_reconcile() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&["work", "add", "--title", "Outlived work"]),
+        "work_id",
+    );
+    let attempt = string(&project.success(&["work", "start", &work]), "attempt_id");
+    project.success(&["attempt", "edit", &attempt, "--handle", "tmux:worker"]);
+
+    project.config(json!([{"observer": "tmux", "probe": "echo present"}]));
+    assert_eq!(project.success(&["refresh"])["result"]["appended"], 1);
+
+    project.success(&[
+        "attempt",
+        "end",
+        &attempt,
+        "--outcome",
+        "cancelled",
+        "--why",
+        "superseded; the session was left running",
+    ]);
+
+    // The default, refresh-first flow: the probe still answers present for
+    // the ended attempt's handle, so the finding surfaces without any manual
+    // observation plumbing.
+    let reconciled = project.success(&["reconcile"]);
+    assert_eq!(reconciled["refreshed"], true);
+    let findings = reconciled["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{reconciled}");
+    assert_eq!(findings[0]["kind"], "orphan");
+    assert_eq!(findings[0]["attempt_id"], attempt);
+    assert_eq!(findings[0]["handle"], "tmux:worker");
+    let suggestion = findings[0]["suggested_command"].as_str().unwrap();
+    assert!(suggestion.contains("kill"), "{suggestion}");
+    assert!(suggestion.contains("tmux:worker"), "{suggestion}");
+
+    // The fold alone carries the orphan: status attention shows it too.
+    let status = project.success(&["status", "--full"]);
+    assert_eq!(status["counts"]["attention"], 1);
+    assert_eq!(status["attention"][0]["kind"], "orphan");
+
+    // The runner killed the session: the next default reconcile retires the
+    // key and reports nothing.
+    project.config(json!([{"observer": "tmux", "probe": "echo absent"}]));
+    let settled = project.success(&["reconcile"]);
+    assert_eq!(settled["refresh_result"]["retired"], 1);
+    assert!(settled["findings"].as_array().unwrap().is_empty());
+    assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
+}
+
+/// A16: a bound worker that died before it was ever observed must still
+/// become `missing` through the DEFAULT refresh-first flow. The probe asks
+/// about every live attempt's handle, so the very first sweep establishes an
+/// explicit `absent` level even though no key existed — never-observed is
+/// not the same silence as unobservable.
+#[test]
+fn a_never_observed_dead_worker_is_missing_through_default_reconcile() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&["work", "add", "--title", "Stillborn work"]),
+        "work_id",
+    );
+    let attempt = string(&project.success(&["work", "start", &work]), "attempt_id");
+    project.success(&["attempt", "edit", &attempt, "--handle", "tmux:worker"]);
+
+    // The session is already gone when the first refresh ever runs.
+    project.config(json!([{"observer": "tmux", "probe": "echo absent"}]));
+    let reconciled = project.success(&["reconcile"]);
+    assert_eq!(reconciled["refreshed"], true);
+    let findings = reconciled["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{reconciled}");
+    assert_eq!(findings[0]["kind"], "missing");
+    assert_eq!(findings[0]["attempt_id"], attempt);
+    assert_eq!(
+        findings[0]["suggested_command"],
+        format!("alder attempt end {attempt} --outcome lost --why \"external handle absent\"")
+    );
+
+    // The death is durable, so a fold-only reader sees it in attention.
+    let status = project.success(&["status", "--full"]);
+    assert_eq!(status["counts"]["attention"], 1);
+    assert_eq!(status["attention"][0]["kind"], "missing");
+
+    // Accepting the suggested repair settles the picture.
+    project.success(&[
+        "attempt",
+        "end",
+        &attempt,
+        "--outcome",
+        "lost",
+        "--why",
+        "external handle absent",
+    ]);
+    let settled = project.success(&["reconcile"]);
+    assert!(settled["findings"].as_array().unwrap().is_empty());
     assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
 }
 

@@ -10,8 +10,10 @@ Events are appended to a shared log stored in a Git remote ref. The remote
 is authoritative, so independent writers coordinate through compare-and-append
 against it rather than through a server. Current state is a deterministic
 fold of those events into a local SQLite database, rebuildable from the log
-at any time. Observations of external systems are refreshed into separate
-local tables and never masquerade as log facts.
+at any time. Observations of external systems — generic `list` snapshots and
+per-handle liveness `probe` answers — are refreshed into durable observation
+levels in the same log, kept apart from the work-and-attempt facts they are
+beliefs about.
 
 The model: work items with dependencies and acceptance checks, attempts at
 that work and questions that park work on a human decision. Human-readable
@@ -45,10 +47,10 @@ Start an attempt, bind its external handle, record a check result with
 evidence, and then end the failed attempt:
 
 ```text
-$ alder work start ex-qq6rkd --meta engine=gpt-5.6-terra --meta reasoning_effort=high
+$ alder work start ex-qq6rkd --tier terra
 ex-qq6rkd-attempt-1
 
-$ alder attempt edit ex-qq6rkd-attempt-1 --handle process:local-4242 --meta host=builder-1
+$ alder attempt edit ex-qq6rkd-attempt-1 --handle process:local-4242
 ex-qq6rkd-attempt-1  bound process:local-4242
 
 $ alder attempt edit ex-qq6rkd-attempt-1 --failed tests --evidence "cargo test --workspace: parser fixture fails" --note "Reproduced the parser failure."

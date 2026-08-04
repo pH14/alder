@@ -211,10 +211,10 @@ A leader may dispatch implementation to worker sessions rather than doing it
 itself — one work item per worker, each in its own git worktree and tmux
 session, stamped with its attempt ID and bound to the attempt through the
 ordinary handle. This is entirely process layer: Alder stores attempts,
-handles, questions, and observations exactly as before, the tmux observer
-lists worker sessions like any other observed object, and `reconcile`
-catches dead ones with the same rules. No Alder mechanism knows the word
-"worker". See the [pass](../../.agent/skills/pass/SKILL.md) and
+handles, questions, and observations exactly as before, the tmux probe
+answers for each bound handle like any other observed object, and
+`reconcile` catches dead ones with the same rules. No Alder mechanism knows
+the word "worker". See the [pass](../../.agent/skills/pass/SKILL.md) and
 [worker](../../.agent/skills/worker/SKILL.md) skills for the process itself,
 and `alderd spawn` for the dispatch.
 

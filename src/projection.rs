@@ -6,7 +6,7 @@ use std::{
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
@@ -17,46 +17,6 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct Projection {
     path: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObservedHandle {
-    pub handle: String,
-    pub attempt_id: Option<String>,
-    pub status: ObservationStatus,
-    pub metadata: Value,
-    pub observed_at: String,
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ObservationStatus {
-    Present,
-    Absent,
-    Unknown,
-}
-
-impl ObservationStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Present => "present",
-            Self::Absent => "absent",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObservationRun {
-    pub kind: String,
-    pub success: bool,
-    pub executions: u32,
-    pub duration_ms: u64,
-    pub stderr: String,
-    pub validation_error: Option<String>,
-    pub observed_at: String,
-    pub object_count: usize,
 }
 
 impl Projection {
@@ -114,58 +74,6 @@ impl Projection {
             "work_rows": work_count,
             "attempt_rows": attempt_count,
         }))
-    }
-
-    pub fn observations(&self) -> Result<Vec<ObservedHandle>> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT handle, attempt_id, status, metadata, observed_at, detail
-             FROM observed_handles ORDER BY handle",
-        )?;
-        let rows = statement.query_map([], |row| {
-            let status: String = row.get(2)?;
-            let metadata: String = row.get(3)?;
-            Ok(ObservedHandle {
-                handle: row.get(0)?,
-                attempt_id: row.get(1)?,
-                status: parse_status(&status),
-                metadata: serde_json::from_str(&metadata).unwrap_or_else(|_| json!({})),
-                observed_at: row.get(4)?,
-                detail: row.get(5)?,
-            })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
-    }
-
-    pub fn observation_runs(&self) -> Result<Vec<ObservationRun>> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT kind, success, executions, duration_ms, stderr, validation_error,
-                    observed_at, object_count
-             FROM observation_runs ORDER BY kind",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(ObservationRun {
-                kind: row.get(0)?,
-                success: row.get::<_, i64>(1)? != 0,
-                executions: row.get::<_, u32>(2)?,
-                duration_ms: row.get(3)?,
-                stderr: row.get(4)?,
-                validation_error: row.get(5)?,
-                observed_at: row.get(6)?,
-                object_count: row.get(7)?,
-            })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
-    }
-
-    pub fn observation_run(&self, kind: &str) -> Result<Option<ObservationRun>> {
-        Ok(self
-            .observation_runs()?
-            .into_iter()
-            .find(|run| run.kind == kind))
     }
 
     pub fn raw_query(&self, sql: &str) -> Result<Value> {
@@ -226,11 +134,10 @@ impl Projection {
 }
 
 /// Tables are created with `IF NOT EXISTS`, so a shape change alone would
-/// leave an old database half-matching the code. Everything here is derived —
-/// from the log, or for observations from the running world — so the honest
-/// response to a schema change is to drop it all and let the next sync and
-/// sweep refill it.
-const SCHEMA_VERSION: i64 = 5;
+/// leave an old database half-matching the code. Everything here is derived
+/// from the log, so the honest response to a schema change is to drop it all
+/// and let the next sync refill it.
+const SCHEMA_VERSION: i64 = 6;
 
 fn reset_if_schema_changed(connection: &Connection) -> Result<()> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -254,6 +161,9 @@ fn reset_if_schema_changed(connection: &Connection) -> Result<()> {
         DROP TABLE IF EXISTS question_answers;
         DROP TABLE IF EXISTS passes;
         DROP TABLE IF EXISTS loop_control;
+        -- Schema v5 kept a local observed-handle inventory and run records.
+        -- Observations are durable log levels now, so the projection no
+        -- longer stores either.
         DROP TABLE IF EXISTS observed_handles;
         DROP TABLE IF EXISTS observation_runs;
         ",
@@ -305,6 +215,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
             work_id TEXT NOT NULL,
             state TEXT NOT NULL,
             outcome TEXT,
+            tier TEXT,
             handle TEXT,
             metadata TEXT NOT NULL,
             note TEXT,
@@ -348,24 +259,6 @@ fn create_schema(connection: &Connection) -> Result<()> {
             engine TEXT,
             rotate_requested_seq INTEGER,
             nudge_requested_seq INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS observed_handles (
-            handle TEXT PRIMARY KEY,
-            attempt_id TEXT,
-            status TEXT NOT NULL,
-            metadata TEXT NOT NULL,
-            observed_at TEXT NOT NULL,
-            detail TEXT
-        );
-        CREATE TABLE IF NOT EXISTS observation_runs (
-            kind TEXT PRIMARY KEY,
-            success INTEGER NOT NULL,
-            executions INTEGER NOT NULL,
-            duration_ms INTEGER NOT NULL,
-            stderr TEXT NOT NULL,
-            validation_error TEXT,
-            observed_at TEXT NOT NULL,
-            object_count INTEGER NOT NULL
         );
 
         DROP VIEW IF EXISTS ready;
@@ -529,14 +422,15 @@ fn insert_state(transaction: &Transaction<'_>, state: &ProjectState) -> Result<(
     for attempt in state.attempts.values() {
         transaction.execute(
             "INSERT INTO attempts
-             (id, work_id, state, outcome, handle, metadata, note, started_seq, bound_seq,
+             (id, work_id, state, outcome, tier, handle, metadata, note, started_seq, bound_seq,
               updated_seq, ended_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 attempt.id,
                 attempt.work_id,
                 enum_json(attempt.state)?,
                 attempt.outcome.map(enum_json).transpose()?,
+                attempt.tier,
                 attempt.handle,
                 serde_json::to_string(&attempt.metadata)?,
                 attempt.note,
@@ -609,14 +503,6 @@ fn enum_json<T: Serialize>(value: T) -> Result<String> {
     Ok(encoded.trim_matches('"').to_owned())
 }
 
-fn parse_status(value: &str) -> ObservationStatus {
-    match value {
-        "present" => ObservationStatus::Present,
-        "absent" => ObservationStatus::Absent,
-        _ => ObservationStatus::Unknown,
-    }
-}
-
 fn sql_value(value: rusqlite::types::ValueRef<'_>) -> Value {
     use rusqlite::types::ValueRef;
     match value {
@@ -632,71 +518,6 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub(crate) fn replace_observation_kind(
-    projection: &Projection,
-    kind: &str,
-    handles: &[ObservedHandle],
-    run: &ObservationRun,
-) -> Result<()> {
-    let mut connection = projection.connection()?;
-    let transaction = connection.transaction()?;
-    transaction.execute(
-        "DELETE FROM observed_handles WHERE handle LIKE ?1 ESCAPE '\\'",
-        [format!(
-            "{}:%",
-            kind.replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        )],
-    )?;
-    for handle in handles {
-        transaction.execute(
-            "INSERT INTO observed_handles
-             (handle, attempt_id, status, metadata, observed_at, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                handle.handle,
-                handle.attempt_id,
-                handle.status.as_str(),
-                serde_json::to_string(&handle.metadata)?,
-                handle.observed_at,
-                handle.detail,
-            ],
-        )?;
-    }
-    upsert_run(&transaction, run)?;
-    transaction.commit()?;
-    Ok(())
-}
-
-fn upsert_run(transaction: &Transaction<'_>, run: &ObservationRun) -> Result<()> {
-    transaction.execute(
-        "INSERT INTO observation_runs
-         (kind, success, executions, duration_ms, stderr, validation_error, observed_at,
-          object_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(kind) DO UPDATE SET
-           success=excluded.success,
-           executions=excluded.executions,
-           duration_ms=excluded.duration_ms,
-           stderr=excluded.stderr,
-           validation_error=excluded.validation_error,
-           observed_at=excluded.observed_at,
-           object_count=excluded.object_count",
-        params![
-            run.kind,
-            run.success as i64,
-            run.executions,
-            run.duration_ms,
-            run.stderr,
-            run.validation_error,
-            run.observed_at,
-            run.object_count,
-        ],
-    )?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -705,13 +526,11 @@ mod tests {
         thread,
     };
 
-    use chrono::Utc;
     use tempfile::TempDir;
 
     use super::*;
     use crate::domain::{
-        AttemptOutcome, CheckDefinition, CheckStatus, CheckUpdate, EventPayload,
-        LegacyHandoffDefinition, ProjectLog, WorkState,
+        AttemptOutcome, CheckDefinition, CheckStatus, CheckUpdate, ProjectLog, WorkState,
     };
     use alder_log::MemoryLog as MemoryStore;
 
@@ -764,12 +583,12 @@ mod tests {
         let (_, work_id) = log
             .add_work("Build".to_owned(), None, 42, Vec::new(), Vec::new())
             .unwrap();
-        let (_, first) = log.start(&work_id, BTreeMap::new()).unwrap();
+        let (_, first) = log.start(&work_id, None, BTreeMap::new()).unwrap();
         log.bind_attempt(&first, "tmux:leader".to_owned(), BTreeMap::new())
             .unwrap();
         log.end_attempt(&first, AttemptOutcome::Lost, "handle absent".to_owned())
             .unwrap();
-        let (_, second) = log.start(&work_id, BTreeMap::new()).unwrap();
+        let (_, second) = log.start(&work_id, None, BTreeMap::new()).unwrap();
         log.bind_attempt(&second, "tmux:leader".to_owned(), BTreeMap::new())
             .unwrap();
         let snapshot = log.snapshot().unwrap();
@@ -787,56 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_preserves_observations() {
-        let temporary = TempDir::new().unwrap();
-        let projection = Projection::new(temporary.path().join("state.db"));
-        let handle = ObservedHandle {
-            handle: "tmux:one".to_owned(),
-            attempt_id: None,
-            status: ObservationStatus::Present,
-            metadata: json!({}),
-            observed_at: Utc::now().to_rfc3339(),
-            detail: None,
-        };
-        let run = ObservationRun {
-            kind: "tmux".to_owned(),
-            success: true,
-            executions: 1,
-            duration_ms: 1,
-            stderr: String::new(),
-            validation_error: None,
-            observed_at: Utc::now().to_rfc3339(),
-            object_count: 1,
-        };
-        replace_observation_kind(&projection, "tmux", &[handle], &run).unwrap();
-        let event = Event {
-            id: "one".to_owned(),
-            seq: 1,
-            at: Utc::now(),
-            actor: "test".to_owned(),
-            payload: EventPayload::LegacyHandoffSubmitted {
-                handoff: LegacyHandoffDefinition {
-                    id: "hm-handoff-a".to_owned(),
-                    title: "handoff".to_owned(),
-                    artifact_ref: "ref".to_owned(),
-                    note: None,
-                },
-            },
-            schema: "alder.event.v0".to_owned(),
-        };
-        let state = ProjectState::fold(std::slice::from_ref(&event)).unwrap();
-        projection
-            .rebuild(
-                &Head::try_from_parts(1, Some("one".to_owned())).unwrap(),
-                &[event],
-                &state,
-            )
-            .unwrap();
-        assert_eq!(projection.observations().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn projection_round_trips_the_complete_fold_and_observation_state() {
+    fn projection_round_trips_the_complete_fold() {
         let log = ProjectLog::new(MemoryStore::new(), "hm", "tester");
         let (_, work_id) = log
             .add_work(
@@ -850,12 +620,13 @@ mod tests {
                 }],
             )
             .unwrap();
-        let (_, attempt_id) = log.start(&work_id, BTreeMap::new()).unwrap();
+        let (_, attempt_id) = log.start(&work_id, None, BTreeMap::new()).unwrap();
         log.bind_attempt(&attempt_id, "tmux:one".to_owned(), BTreeMap::new())
             .unwrap();
         log.update_attempt(
             &attempt_id,
-            BTreeMap::from([("engine".to_owned(), json!("opus"))]),
+            Some("opus".to_owned()),
+            BTreeMap::new(),
             Some("working".to_owned()),
             vec![CheckUpdate {
                 key: "test".to_owned(),
@@ -896,38 +667,13 @@ mod tests {
         assert_eq!(question_rows["rows"][0]["answer"], "Yes");
         assert_eq!(question_rows["rows"][0]["answers"], 1);
 
-        let handle = ObservedHandle {
-            handle: "tmux:one".to_owned(),
-            attempt_id: Some(attempt_id),
-            status: ObservationStatus::Absent,
-            metadata: json!({"state": "gone"}),
-            observed_at: "2026-01-01T00:00:00Z".to_owned(),
-            detail: Some("not found".to_owned()),
-        };
-        let run = ObservationRun {
-            kind: "tmux".to_owned(),
-            success: false,
-            executions: 4,
-            duration_ms: 20,
-            stderr: "failed".to_owned(),
-            validation_error: Some("bad output".to_owned()),
-            observed_at: "2026-01-01T00:00:00Z".to_owned(),
-            object_count: 1,
-        };
-        replace_observation_kind(&projection, "tmux", &[handle], &run).unwrap();
-        let observed = projection.observations().unwrap();
-        assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].status, ObservationStatus::Absent);
-        assert_eq!(observed[0].metadata, json!({"state": "gone"}));
-        let runs = projection.observation_runs().unwrap();
-        assert_eq!(runs.len(), 1);
-        assert!(!runs[0].success);
-        assert_eq!(runs[0].executions, 4);
-        assert_eq!(
-            projection.observation_run("tmux").unwrap().unwrap().stderr,
-            "failed"
-        );
-        assert!(projection.observation_run("other").unwrap().is_none());
+        // The attempt row carries the tier verbatim, as an opaque name.
+        let attempt_rows = projection
+            .raw_query("SELECT id, tier, handle FROM attempts")
+            .unwrap();
+        assert_eq!(attempt_rows["rows"][0]["id"], attempt_id);
+        assert_eq!(attempt_rows["rows"][0]["tier"], "opus");
+        assert_eq!(attempt_rows["rows"][0]["handle"], "tmux:one");
 
         assert!(
             projection
@@ -938,13 +684,82 @@ mod tests {
         );
     }
 
+    /// Observations are part of no live-state table on purpose: status is
+    /// never served from SQLite. Every command refolds the decoded log —
+    /// `ProjectLog::snapshot` — and the projection is a derived query
+    /// surface, so there is no cached `ProjectState` round-trip that could
+    /// drop `observations` and cost a cache-served status its dead-worker
+    /// attention. What the projection does serialize is the event stream
+    /// itself; this pins the round-trip that could actually lose the
+    /// picture: the projected events refold to the same observations,
+    /// including a level held for an ended attempt (the orphan watch).
+    #[test]
+    fn projected_events_refold_to_the_same_observation_picture() {
+        let log = ProjectLog::new(MemoryStore::new(), "hm", "tester");
+        let (_, work_id) = log
+            .add_work("Build".to_owned(), None, 0, Vec::new(), Vec::new())
+            .unwrap();
+        let (_, attempt_id) = log.start(&work_id, None, BTreeMap::new()).unwrap();
+        log.bind_attempt(&attempt_id, "tmux:one".to_owned(), BTreeMap::new())
+            .unwrap();
+        log.report_observation(
+            crate::domain::ObservationKey {
+                observer: "tmux".to_owned(),
+                subject: attempt_id.clone(),
+                field: "liveness".to_owned(),
+            },
+            "present".to_owned(),
+        )
+        .unwrap();
+        log.end_attempt(
+            &attempt_id,
+            AttemptOutcome::Cancelled,
+            "fixture over".to_owned(),
+        )
+        .unwrap();
+        let snapshot = log.snapshot().unwrap();
+        assert_eq!(snapshot.state.observations.len(), 1);
+
+        let temporary = TempDir::new().unwrap();
+        let projection = Projection::new(temporary.path().join("state.db"));
+        projection
+            .sync(&snapshot.head, &snapshot.events, &snapshot.state)
+            .unwrap();
+        assert_eq!(
+            projection.verify(&snapshot.head, &snapshot.state).unwrap()["valid"],
+            true
+        );
+
+        let rows = projection
+            .raw_query("SELECT seq, id, at, actor, body_json FROM events ORDER BY seq")
+            .unwrap();
+        let reloaded: Vec<crate::domain::Event> = rows["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| crate::domain::Event {
+                id: row["id"].as_str().unwrap().to_owned(),
+                seq: row["seq"].as_u64().unwrap(),
+                at: row["at"].as_str().unwrap().parse().unwrap(),
+                actor: row["actor"].as_str().unwrap().to_owned(),
+                payload: serde_json::from_str(row["body_json"].as_str().unwrap()).unwrap(),
+                schema: "alder.event.v0".to_owned(),
+            })
+            .collect();
+        let refolded = ProjectState::fold(&reloaded).unwrap();
+        assert_eq!(refolded.observations, snapshot.state.observations);
+        let key = refolded.observations.keys().next().unwrap();
+        assert_eq!(key.subject, attempt_id);
+        assert_eq!(key.field, "liveness");
+    }
+
     #[test]
     fn verification_detects_each_projection_mismatch() {
         let log = ProjectLog::new(MemoryStore::new(), "hm", "tester");
         let (_, work_id) = log
             .add_work("Build".to_owned(), None, 0, Vec::new(), Vec::new())
             .unwrap();
-        log.start(&work_id, BTreeMap::new()).unwrap();
+        log.start(&work_id, None, BTreeMap::new()).unwrap();
         let snapshot = log.snapshot().unwrap();
         let temporary = TempDir::new().unwrap();
         let projection = Projection::new(temporary.path().join("state.db"));
@@ -1010,9 +825,6 @@ mod tests {
         );
 
         assert_eq!(enum_json(WorkState::Open).unwrap(), "open");
-        assert_eq!(parse_status("present"), ObservationStatus::Present);
-        assert_eq!(parse_status("absent"), ObservationStatus::Absent);
-        assert_eq!(parse_status("anything"), ObservationStatus::Unknown);
         assert_eq!(hex(&[]), "");
         assert_eq!(hex(&[0x00, 0x0f, 0xff]), "000fff");
 
@@ -1057,30 +869,6 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(rows, 0);
-    }
-
-    #[test]
-    fn opening_a_current_schema_preserves_observation_rows() {
-        let temporary = TempDir::new().unwrap();
-        let projection = Projection::new(temporary.path().join("state.db"));
-        let connection = projection.connection().unwrap();
-        connection
-            .execute(
-                "INSERT INTO observed_handles
-                 (handle, attempt_id, status, metadata, observed_at, detail)
-                 VALUES (?1, NULL, ?2, ?3, ?4, NULL)",
-                params!["tmux:worker", "present", "{}", "now"],
-            )
-            .unwrap();
-        drop(connection);
-
-        let connection = projection.connection().unwrap();
-        let rows: u64 = connection
-            .query_row("SELECT count(*) FROM observed_handles", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(rows, 1);
     }
 
     #[test]

@@ -142,6 +142,80 @@ mod tests {
         assert!(state.loop_control.rotate_requested_seq.is_none());
     }
 
+    /// Representative attempt shapes from the real log, written before the
+    /// tier field existed: handles like `tmux:alder-work-…`, engine and
+    /// session-provenance metadata stamps, and a metadata-only progress
+    /// update. All of them decode and fold; the handle survives verbatim as
+    /// opaque text, and the absent tier folds as null.
+    #[test]
+    fn historical_attempt_events_with_engine_and_session_stamps_still_fold() {
+        let documents = [
+            json!({
+                "id": "old-work",
+                "seq": 1,
+                "at": "2026-07-30T12:00:00Z",
+                "actor": "leader",
+                "type": "work.changed",
+                "body": {"why": null, "operations": [{"op": "add", "work": {"id": "al-old", "title": "old", "spec": null, "priority": 0, "requires": [], "checks": []}}]},
+                "schema": "alder.event.v0"
+            }),
+            json!({
+                "id": "old-start",
+                "seq": 2,
+                "at": "2026-07-30T12:00:01Z",
+                "actor": "alderd",
+                "type": "attempt.started",
+                "body": {"attempt": {"id": "al-old-attempt-1", "work_id": "al-old", "metadata": {}}},
+                "schema": "alder.event.v0"
+            }),
+            json!({
+                "id": "old-bind",
+                "seq": 3,
+                "at": "2026-07-30T12:00:02Z",
+                "actor": "alderd",
+                "type": "attempt.bound",
+                "body": {"attempt_id": "al-old-attempt-1", "handle": "tmux:alder-work-al-old",
+                          "metadata": {"engine": "gpt-5.6-terra", "effort": "high", "tier": "terra"}},
+                "schema": "alder.event.v0"
+            }),
+            json!({
+                "id": "old-stamp",
+                "seq": 4,
+                "at": "2026-07-30T12:00:03Z",
+                "actor": "alderd",
+                "type": "attempt.updated",
+                "body": {"attempt_id": "al-old-attempt-1",
+                          "metadata": {"codex-session": "019fb2ef-d507-7201-bc36-79d6d5b82336"},
+                          "note": null, "checks": []},
+                "schema": "alder.event.v0"
+            }),
+        ];
+
+        let events = documents
+            .into_iter()
+            .map(|document| {
+                let record: Record = serde_json::from_value(document).unwrap();
+                decode_record(&record).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let state = crate::domain::ProjectState::fold(&events).unwrap();
+
+        let attempt = &state.attempts["al-old-attempt-1"];
+        assert_eq!(attempt.handle.as_deref(), Some("tmux:alder-work-al-old"));
+        // The event predates the tier field, so the fold carries none — and
+        // the serialized attempt still says so explicitly.
+        assert!(attempt.tier.is_none());
+        assert!(
+            serde_json::to_value(attempt).unwrap()["tier"].is_null(),
+            "tier is an explicit null, not an omitted key"
+        );
+        assert_eq!(attempt.metadata["engine"], "gpt-5.6-terra");
+        assert_eq!(
+            attempt.metadata["codex-session"],
+            "019fb2ef-d507-7201-bc36-79d6d5b82336"
+        );
+    }
+
     #[test]
     fn legacy_handoff_integration_decodes_and_replays_created_work() {
         let documents = [

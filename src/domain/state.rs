@@ -284,6 +284,9 @@ impl ProjectState {
                 *self = next;
             }
             EventPayload::AttemptStarted { attempt } => {
+                if let Some(tier) = attempt.tier.as_deref() {
+                    require_text("attempt tier", tier)?;
+                }
                 if self.attempts.contains_key(&attempt.id) {
                     return Err(AlderError::validation(format!(
                         "attempt `{}` already exists",
@@ -323,6 +326,7 @@ impl ProjectState {
                         work_id: attempt.work_id.clone(),
                         state: AttemptState::Starting,
                         outcome: None,
+                        tier: attempt.tier.clone(),
                         handle: None,
                         metadata: attempt.metadata.clone(),
                         note: None,
@@ -339,7 +343,7 @@ impl ProjectState {
                 handle,
                 metadata,
             } => {
-                validate_handle(handle)?;
+                require_text("attempt handle", handle)?;
                 if self.attempts.values().any(|attempt| {
                     attempt.state != AttemptState::Ended
                         && attempt.handle.as_deref() == Some(handle)
@@ -364,14 +368,18 @@ impl ProjectState {
             }
             EventPayload::AttemptUpdated {
                 attempt_id,
+                tier,
                 metadata,
                 note,
                 checks,
             } => {
+                if let Some(tier) = tier.as_deref() {
+                    require_text("attempt tier", tier)?;
+                }
                 let attempt = self.active_attempt_mut(attempt_id)?;
-                if metadata.is_empty() && note.is_none() && checks.is_empty() {
+                if tier.is_none() && metadata.is_empty() && note.is_none() && checks.is_empty() {
                     return Err(AlderError::validation(
-                        "an attempt update must change metadata, a note, or a check",
+                        "an attempt update must change a tier, metadata, a note, or a check",
                     ));
                 }
                 for update in checks {
@@ -386,6 +394,9 @@ impl ProjectState {
                     check.status = update.status;
                     check.evidence = Some(update.evidence.clone());
                     check.updated_seq = Some(seq);
+                }
+                if let Some(tier) = tier {
+                    attempt.tier = Some(tier.clone());
                 }
                 attempt.metadata.extend(metadata.clone());
                 if let Some(note) = note {
@@ -964,20 +975,6 @@ fn validate_check(check: &super::CheckDefinition) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_handle(handle: &str) -> Result<(&str, &str)> {
-    let (kind, value) = handle.split_once(':').ok_or_else(|| {
-        AlderError::validation(format!(
-            "handle `{handle}` must have the form <kind>:<value>"
-        ))
-    })?;
-    if !valid_name(kind) || value.is_empty() {
-        return Err(AlderError::validation(format!(
-            "handle `{handle}` must have a valid kind and non-empty value"
-        )));
-    }
-    Ok((kind, value))
-}
-
 pub fn valid_name(value: &str) -> bool {
     !value.is_empty()
         && value.chars().all(|character| {
@@ -1063,6 +1060,7 @@ mod tests {
                 2,
                 EventPayload::AttemptStarted {
                     attempt: AttemptDefinition {
+                        tier: None,
                         id: "hm-a-attempt-1".to_owned(),
                         work_id: "hm-a".to_owned(),
                         metadata: BTreeMap::new(),
@@ -1199,6 +1197,7 @@ mod tests {
                 2,
                 EventPayload::AttemptStarted {
                     attempt: AttemptDefinition {
+                        tier: None,
                         id: "hm-a-attempt-1".to_owned(),
                         work_id: "hm-a".to_owned(),
                         metadata: BTreeMap::new(),
@@ -1438,6 +1437,7 @@ mod tests {
                 2,
                 EventPayload::AttemptStarted {
                     attempt: AttemptDefinition {
+                        tier: None,
                         id: "hm-a-attempt-1".to_owned(),
                         work_id: "hm-a".to_owned(),
                         metadata: BTreeMap::new(),
@@ -1449,6 +1449,7 @@ mod tests {
             .apply(&event(
                 3,
                 EventPayload::AttemptUpdated {
+                    tier: None,
                     attempt_id: "hm-a-attempt-1".to_owned(),
                     metadata: BTreeMap::new(),
                     note: Some("working".to_owned()),
@@ -1482,6 +1483,7 @@ mod tests {
                     2,
                     EventPayload::AttemptStarted {
                         attempt: AttemptDefinition {
+                            tier: None,
                             id: "hm-a-attempt-1".to_owned(),
                             work_id: "hm-a".to_owned(),
                             metadata: BTreeMap::new(),
@@ -1497,6 +1499,7 @@ mod tests {
             .apply(&event(
                 3,
                 EventPayload::AttemptUpdated {
+                    tier: None,
                     attempt_id: "hm-a-attempt-1".to_owned(),
                     metadata: BTreeMap::from([("engine".to_owned(), json!("opus"))]),
                     note: None,
@@ -1514,6 +1517,7 @@ mod tests {
             .apply(&event(
                 3,
                 EventPayload::AttemptUpdated {
+                    tier: None,
                     attempt_id: "hm-a-attempt-1".to_owned(),
                     metadata: BTreeMap::new(),
                     note: Some("working".to_owned()),
@@ -1531,6 +1535,7 @@ mod tests {
             .apply(&event(
                 3,
                 EventPayload::AttemptUpdated {
+                    tier: None,
                     attempt_id: "hm-a-attempt-1".to_owned(),
                     metadata: BTreeMap::new(),
                     note: None,
@@ -1553,6 +1558,7 @@ mod tests {
                 .apply(&event(
                     3,
                     EventPayload::AttemptUpdated {
+                        tier: None,
                         attempt_id: "hm-a-attempt-1".to_owned(),
                         metadata: BTreeMap::new(),
                         note: None,
@@ -1561,7 +1567,7 @@ mod tests {
                 ))
                 .unwrap_err()
                 .message,
-            "an attempt update must change metadata, a note, or a check"
+            "an attempt update must change a tier, metadata, a note, or a check"
         );
     }
 
@@ -1582,6 +1588,7 @@ mod tests {
                 2,
                 EventPayload::AttemptStarted {
                     attempt: AttemptDefinition {
+                        tier: None,
                         id: "hm-a-attempt-1".to_owned(),
                         work_id: "hm-a".to_owned(),
                         metadata: BTreeMap::new(),
@@ -1604,6 +1611,7 @@ mod tests {
                 4,
                 EventPayload::AttemptStarted {
                     attempt: AttemptDefinition {
+                        tier: None,
                         id: "hm-b-attempt-1".to_owned(),
                         work_id: "hm-b".to_owned(),
                         metadata: BTreeMap::new(),
@@ -1671,6 +1679,7 @@ mod tests {
                 2,
                 EventPayload::AttemptStarted {
                     attempt: AttemptDefinition {
+                        tier: None,
                         id: "hm-a-attempt-1".to_owned(),
                         work_id: "hm-a".to_owned(),
                         metadata: BTreeMap::new(),
@@ -1692,6 +1701,7 @@ mod tests {
             .apply(&event(
                 3,
                 EventPayload::AttemptUpdated {
+                    tier: None,
                     attempt_id: "hm-a-attempt-1".to_owned(),
                     metadata: BTreeMap::new(),
                     note: None,
@@ -1738,6 +1748,7 @@ mod tests {
                 3,
                 EventPayload::AttemptStarted {
                     attempt: AttemptDefinition {
+                        tier: None,
                         id: "hm-b-attempt-1".to_owned(),
                         work_id: "hm-b".to_owned(),
                         metadata: BTreeMap::new(),
@@ -1825,11 +1836,6 @@ mod tests {
             })
             .is_ok()
         );
-
-        assert_eq!(validate_handle("tmux:worker").unwrap(), ("tmux", "worker"));
-        for invalid in ["tmux", "Bad:worker", "tmux:"] {
-            assert!(validate_handle(invalid).is_err(), "{invalid}");
-        }
     }
 
     /// A historical pass event decoded off the wire, complete with the body

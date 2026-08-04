@@ -31,11 +31,40 @@ pub struct StoreConfig {
     pub reference: String,
 }
 
+/// One configured observer. Exactly one of the two command forms is set:
+///
+/// - `list` prints a complete JSON snapshot of current levels — the generic
+///   contract for non-liveness observers such as CI states;
+/// - `probe` answers for one handle at a time. Alder invokes it once per
+///   relevant handle with the handle as `$1` and reads back exactly one word:
+///   `present`, `absent`, or `unknown`. Execution liveness flows only
+///   through probes, so the handle stays opaque to Alder — recognition of a
+///   runner's own names lives in the runner's script.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObserverConfig {
     pub observer: String,
-    pub list: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<String>,
+}
+
+impl ObserverConfig {
+    pub fn mode(&self) -> &'static str {
+        if self.probe.is_some() {
+            "probe"
+        } else {
+            "list"
+        }
+    }
+
+    pub fn command(&self) -> &str {
+        self.probe
+            .as_deref()
+            .or(self.list.as_deref())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -244,9 +273,14 @@ fn validate_config(config: &Config) -> Result<()> {
     let mut observers = BTreeSet::new();
     for observer in &config.observers {
         validate_name("observer", &observer.observer)?;
-        if observer.list.trim().is_empty() {
+        let valid_command = match (&observer.list, &observer.probe) {
+            (Some(list), None) => !list.trim().is_empty(),
+            (None, Some(probe)) => !probe.trim().is_empty(),
+            _ => false,
+        };
+        if !valid_command {
             return Err(AlderError::validation(format!(
-                "observer `{}` has an empty list command",
+                "observer `{}` must have exactly one non-empty `list` or `probe` command",
                 observer.observer
             )));
         }
@@ -302,7 +336,8 @@ mod tests {
             },
             observers: vec![ObserverConfig {
                 observer: "tmux".to_owned(),
-                list: "printf '[]'".to_owned(),
+                list: Some("printf '[]'".to_owned()),
+                probe: None,
             }],
         }
     }
@@ -332,11 +367,40 @@ mod tests {
         assert!(validate_config(&config).is_err());
 
         let mut config = valid_config();
-        config.observers[0].list = " ".to_owned();
+        config.observers[0].list = Some(" ".to_owned());
         assert!(validate_config(&config).is_err());
 
         let mut config = valid_config();
         config.observers.push(config.observers[0].clone());
+        assert!(validate_config(&config).is_err());
+    }
+
+    /// An observer runs exactly one command form: `list` for complete generic
+    /// snapshots or `probe` for per-handle liveness answers — never both, and
+    /// never neither.
+    #[test]
+    fn an_observer_has_exactly_one_command_form() {
+        let mut config = valid_config();
+        config.observers[0].list = None;
+        config.observers[0].probe = Some("scripts/observe-tmux.sh \"$1\"".to_owned());
+        assert!(validate_config(&config).is_ok());
+        assert_eq!(config.observers[0].mode(), "probe");
+        assert_eq!(
+            config.observers[0].command(),
+            "scripts/observe-tmux.sh \"$1\""
+        );
+
+        let mut config = valid_config();
+        config.observers[0].probe = Some("scripts/observe-tmux.sh \"$1\"".to_owned());
+        assert!(validate_config(&config).is_err());
+
+        let mut config = valid_config();
+        config.observers[0].list = None;
+        assert!(validate_config(&config).is_err());
+
+        let mut config = valid_config();
+        config.observers[0].list = None;
+        config.observers[0].probe = Some(" ".to_owned());
         assert!(validate_config(&config).is_err());
     }
 
