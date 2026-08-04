@@ -2313,7 +2313,10 @@ mod tests {
         assert_eq!(paused["engine"], "codex");
         assert_eq!(paused["rotate_requested_seq"], 3);
         assert_eq!(paused["nudge_requested_seq"], 5);
-        assert_eq!(loop_lines(&state)[0], "paused · release freeze · engine codex");
+        assert_eq!(
+            loop_lines(&state)[0],
+            "paused · release freeze · engine codex"
+        );
 
         // The earliest deferral deadline over all blocked work is the loop's
         // next review rendezvous.

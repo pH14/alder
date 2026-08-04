@@ -237,9 +237,9 @@ fn a_cold_start_creates_the_session_bootstraps_and_notes_the_head_it_acted_on() 
                  Alder state and act on it (triggers: due)."
     }));
     assert!(
-        calls
-            .iter()
-            .all(|call| call == "alder status" || call == "alder refresh" || !call.starts_with("alder")),
+        calls.iter().all(|call| call == "alder status"
+            || call == "alder refresh"
+            || !call.starts_with("alder")),
         "the driver ran an alder command beyond its two reads: {calls:?}"
     );
     // The delivery was noted durably.
@@ -269,10 +269,12 @@ fn a_cold_start_creates_the_session_bootstraps_and_notes_the_head_it_acted_on() 
             .count(),
         1
     );
-    assert!(calls.contains(
-        &"tmux send alder-leader Read the current Alder state and act on it (triggers: log)."
-            .to_owned()
-    ));
+    assert!(
+        calls.contains(
+            &"tmux send alder-leader Read the current Alder state and act on it (triggers: log)."
+                .to_owned()
+        )
+    );
 }
 
 #[test]
@@ -600,8 +602,9 @@ fn an_observation_change_wakes_the_leader_on_its_own() {
     let calls = driver.effects().calls();
     assert!(calls.contains(&"alder refresh".to_owned()));
     assert!(
-        calls.iter().any(|call| call.starts_with("tmux send")
-            && call.contains("(triggers: observations)")),
+        calls
+            .iter()
+            .any(|call| call.starts_with("tmux send") && call.contains("(triggers: observations)")),
         "{calls:?}"
     );
 }

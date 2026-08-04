@@ -286,7 +286,9 @@ pub fn injection(bootstrap: bool, pass_doc: &str, triggers: &[Trigger]) -> Strin
         kinds
     };
     if bootstrap {
-        format!("Read {pass_doc}, then read the current Alder state and act on it (triggers: {kinds}).")
+        format!(
+            "Read {pass_doc}, then read the current Alder state and act on it (triggers: {kinds})."
+        )
     } else {
         format!("Read the current Alder state and act on it (triggers: {kinds}).")
     }
@@ -723,7 +725,11 @@ mod tests {
              (triggers: log,due)."
         );
         assert_eq!(
-            injection(false, ".agent/skills/pass/SKILL.md", &[Trigger::Observations]),
+            injection(
+                false,
+                ".agent/skills/pass/SKILL.md",
+                &[Trigger::Observations]
+            ),
             "Read the current Alder state and act on it (triggers: observations)."
         );
         assert_eq!(

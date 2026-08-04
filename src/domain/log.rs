@@ -453,8 +453,9 @@ impl<S: Log> ProjectLog<S> {
             &snapshot,
             EventPayload::WorkChanged {
                 why: Some(match &change {
-                    WorkStateChange::Block { reason, .. }
-                    | WorkStateChange::Unblock { reason } => reason.clone(),
+                    WorkStateChange::Block { reason, .. } | WorkStateChange::Unblock { reason } => {
+                        reason.clone()
+                    }
                 }),
                 operations: vec![WorkOperation::Edit {
                     id: work_id.to_owned(),

@@ -1872,10 +1872,18 @@ mod tests {
         // Two historical opens in a row were once rejected; as history they
         // are inert and both replay.
         state
-            .apply(&legacy_pass(3, "pass.started", json!({"pass": {"id": "hm-pass-2"}})))
+            .apply(&legacy_pass(
+                3,
+                "pass.started",
+                json!({"pass": {"id": "hm-pass-2"}}),
+            ))
             .unwrap();
         state
-            .apply(&legacy_pass(4, "pass.started", json!({"pass": {"id": "hm-pass-3"}})))
+            .apply(&legacy_pass(
+                4,
+                "pass.started",
+                json!({"pass": {"id": "hm-pass-3"}}),
+            ))
             .unwrap();
     }
 

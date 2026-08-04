@@ -160,11 +160,15 @@ pub struct Daemon {
 pub enum DaemonCtl {
     Idle,
     /// Decided `Fire` and reconciled the session; the injection is next.
-    Fired { head: u64 },
+    Fired {
+        head: u64,
+    },
     /// The line was typed and submitted; the notes write is next. A crash
     /// here is the duplicate-wake window: the leader was handed the line, and
     /// nothing anywhere says so.
-    Injected { head: u64 },
+    Injected {
+        head: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -222,7 +226,9 @@ pub enum ProtocolAction {
     NotesLost,
     /// The woken engine reads the fold and acts: appends one work statement,
     /// or finds nothing demanding and idles.
-    LeaderActs { appends: bool },
+    LeaderActs {
+        appends: bool,
+    },
     /// The leader tmux session dies.
     LeaderCrash,
     PhoneRotationRequest,
@@ -305,7 +311,9 @@ fn typed_draft(id: &str, actor: &str, payload: EventPayload) -> RecordDraft {
 fn append_now(records: &[Record], draft: &RecordDraft) -> Vec<Record> {
     let store = replay(records);
     let head = store.head().expect("a memory head");
-    store.append(&head, draft).expect("an append at the head lands");
+    store
+        .append(&head, draft)
+        .expect("an append at the head lands");
     let head = store.head().expect("a memory head");
     store.read_all(&head).expect("a complete read")
 }

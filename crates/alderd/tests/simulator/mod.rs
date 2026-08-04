@@ -1300,15 +1300,7 @@ impl Simulator {
         if dirty.is_empty() {
             return;
         }
-        let action = session_action(
-            &config(),
-            false,
-            "stub",
-            0,
-            true,
-            None,
-            self.logical_now(),
-        );
+        let action = session_action(&config(), false, "stub", 0, true, None, self.logical_now());
         assert!(
             matches!(action, SessionAction::Restart(_)),
             "panes {dirty:?} hold unsubmitted text, and the next fire would \
