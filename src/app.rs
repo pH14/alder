@@ -10,14 +10,15 @@ use serde_json::{Value, json};
 use crate::{
     cli::{
         AttemptCommand, AttemptEditArgs, Command, DebugCommand, DebugDbCommand, DebugLogCommand,
-        LoopCommand, NonSuccessOutcome, PassCommand, PassOutcomeArg, QuestionCommand,
-        StatusSection, TriggerKind, WorkAddArgs, WorkCommand, WorkEditArgs,
+        LoopCommand, NonSuccessOutcome, ObservationCommand, PassCommand, PassOutcomeArg,
+        QuestionCommand, StatusSection, TriggerKind, WorkAddArgs, WorkCommand, WorkEditArgs,
     },
     config::{Project, initialize},
     domain::{
         AppendResult, Attempt, AttemptOutcome, ChangeMode, CheckDefinition, CheckStatus,
-        CheckUpdate, Event, EventPayload, GraphChangeDocument, Head, NullableString, PassOutcome,
-        PassTrigger, ProjectLog, ProjectState, Question, Snapshot, WorkStateChange, prepare_change,
+        CheckUpdate, Event, EventPayload, GraphChangeDocument, Head, NullableString,
+        ObservationAppend, ObservationKey, PassOutcome, PassTrigger, ProjectLog, ProjectState,
+        Question, Snapshot, WorkStateChange, prepare_change,
     },
     error::{AlderError, Result},
     observer,
@@ -49,6 +50,13 @@ struct Context {
     snapshot: Snapshot,
 }
 
+struct RefreshApplication {
+    runs: Vec<observer::ObserverRunResult>,
+    appended: usize,
+    retired: usize,
+    head: Head,
+}
+
 impl App {
     pub fn run(command: &Command) -> Result<Output> {
         if let Command::Init(args) = command {
@@ -65,6 +73,7 @@ impl App {
             ),
             Command::Next(args) => next(&mut context, args.changes.as_deref()),
             Command::Show(args) => show(&context, &args.id),
+            Command::Observations => observations(&context),
             Command::Refresh => refresh(&context),
             Command::Reconcile(args) => reconcile(&context, !args.no_refresh),
             Command::Work(args) => work(&context, &args.command),
@@ -95,6 +104,40 @@ impl App {
                         format!("{}  answered", args.question),
                     ))
                 }
+            },
+            Command::Observation(args) => match &args.command {
+                ObservationCommand::Report(args) => observation_mutation(
+                    context.log.report_observation(
+                        ObservationKey {
+                            observer: args.observer.clone(),
+                            subject: args.subject.clone(),
+                            field: args.field.clone(),
+                        },
+                        args.level.clone(),
+                    )?,
+                    "alder.observation.report.v0",
+                    "reported",
+                    json!({
+                        "observer": args.observer,
+                        "subject": args.subject,
+                        "field": args.field,
+                        "level": args.level,
+                    }),
+                ),
+                ObservationCommand::Retire(args) => observation_mutation(
+                    context.log.retire_observation(ObservationKey {
+                        observer: args.observer.clone(),
+                        subject: args.subject.clone(),
+                        field: args.field.clone(),
+                    })?,
+                    "alder.observation.retire.v0",
+                    "retired",
+                    json!({
+                        "observer": args.observer,
+                        "subject": args.subject,
+                        "field": args.field,
+                    }),
+                ),
             },
             Command::Loop(args) => loop_command(&context, &args.command),
             Command::Pass(args) => match &args.command {
@@ -662,27 +705,37 @@ fn status(
     sections: &[StatusSection],
 ) -> Result<Output> {
     let (state, hypothetical, source) = overlay_state(context, changes)?;
-    let mut observations = context.projection.observations()?;
-    let runs = context.projection.observation_runs()?;
-    let configured = configured_kinds(context);
-    for observation in &mut observations {
-        let kind = observation
-            .handle
-            .split_once(':')
-            .map(|(kind, _)| kind)
-            .unwrap_or_default();
-        if !configured.contains(kind) {
-            observation.status = crate::projection::ObservationStatus::Unknown;
-            observation.detail =
-                Some("no observation command is configured for this handle kind".to_owned());
-        }
-    }
-    let known: BTreeSet<_> = runs
-        .iter()
-        .filter(|run| run.success)
-        .map(|run| run.kind.clone())
+    let observations: Vec<_> = state.observations.values().cloned().collect();
+    let handles = observed_handles(&state, &BTreeSet::new());
+    let runs: Vec<crate::projection::ObservationRun> = Vec::new();
+    // The log fold, never SQLite, is the current observation picture, and
+    // attention derives from it alone: only findings the fold can decide.
+    // Not-yet-observed stays quiet — a reader learns absence from an explicit
+    // level, never from silence — so kinds needing a local observer run
+    // (unconfigured, unspawned, observation_unknown) never appear here.
+    let configured: BTreeSet<String> = state
+        .attempts
+        .values()
+        .filter(|attempt| {
+            matches!(
+                attempt.state,
+                crate::domain::AttemptState::Starting | crate::domain::AttemptState::Active
+            )
+        })
+        .filter_map(|attempt| attempt.handle.as_deref())
+        .filter_map(|handle| handle.split_once(':'))
+        .map(|(kind, _)| kind.to_owned())
         .collect();
-    let findings = observer::reconcile(&state, &observations, &configured, &known);
+    let findings: Vec<observer::ReconcileFinding> =
+        observer::reconcile(&state, &handles, &configured, &BTreeSet::new())
+            .into_iter()
+            .filter(|finding| {
+                matches!(
+                    finding.kind.as_str(),
+                    "missing" | "orphan" | "identity_mismatch" | "bindable"
+                )
+            })
+            .collect();
     let in_flight = in_flight_attempts(&state);
     let ready: Vec<_> = state.ready().into_iter().cloned().collect();
     let mut all_questions: Vec<_> = state.questions.values().cloned().collect();
@@ -734,7 +787,8 @@ fn status(
         "observations".to_owned(),
         json!({
             "runs": runs,
-            "handles": observations,
+            "handles": handles,
+            "snapshot": observations,
         }),
     );
     object.insert("questions".to_owned(), json!(rendered_questions));
@@ -777,19 +831,6 @@ fn status(
     } else {
         lines.push(format!("head {}", context.snapshot.head.sequence()));
     }
-    if let Some(latest) = runs.iter().map(|run| run.observed_at.as_str()).max() {
-        lines[0].push_str(&format!(" · observations refreshed {latest}"));
-    } else if !context.project.config.observers.is_empty() {
-        lines[0].push_str(" · observations not refreshed");
-    }
-    let failures: Vec<_> = runs
-        .iter()
-        .filter(|run| !run.success)
-        .map(|run| run.kind.as_str())
-        .collect();
-    if !failures.is_empty() {
-        lines.push(format!("observation failures: {}", failures.join(", ")));
-    }
     human_section(&mut lines, "loop", loop_lines(&state));
     let attention_lines = || {
         findings.iter().map(|finding| {
@@ -809,8 +850,7 @@ fn status(
             let status = attempt
                 .handle
                 .as_deref()
-                .and_then(|handle| observations.iter().find(|item| item.handle == handle))
-                .map(|item| item.status.as_str())
+                .and_then(|handle| observation_level(&state, handle))
                 .unwrap_or("unknown");
             format!(
                 "{}  {}  {}  {}",
@@ -1154,69 +1194,239 @@ fn show(context: &Context, id: &str) -> Result<Output> {
     ))
 }
 
-/// The JSON document returned by `alder refresh` after observation has run.
-/// The observation result is already a value at this boundary, so this stays a
-/// pure packer rather than teaching a caller about the projection.
+fn observations(context: &Context) -> Result<Output> {
+    let observations: Vec<_> = context.snapshot.state.observations.values().collect();
+    let human = if observations.is_empty() {
+        "no current observations".to_owned()
+    } else {
+        observations
+            .iter()
+            .map(|observation| {
+                format!(
+                    "{}  {}  {}  {}",
+                    observation.key.observer,
+                    observation.key.subject,
+                    observation.key.field,
+                    observation.level,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(Output::new(
+        json!({
+            "schema": "alder.observations.v0",
+            "head": context.snapshot.head.sequence(),
+            "revision": context.snapshot.head.revision(),
+            "observations": observations,
+        }),
+        human,
+    ))
+}
+
+fn observation_mutation(
+    result: ObservationAppend,
+    schema: &str,
+    verb: &str,
+    observation: Value,
+) -> Result<Output> {
+    let subject = observation["subject"].as_str().unwrap_or_default();
+    let field = observation["field"].as_str().unwrap_or_default();
+    let observer = observation["observer"].as_str().unwrap_or_default();
+    let human = format!("{observer} {subject} {field}  {verb}");
+    match result {
+        ObservationAppend::Appended(result) => Ok(mutation_output(
+            schema,
+            &result,
+            json!({"appended": true, "observation": observation}),
+            human,
+        )),
+        ObservationAppend::Unchanged { head } => Ok(Output::new(
+            json!({
+                "schema": schema,
+                "head": head.sequence(),
+                "revision": head.revision(),
+                "appended": false,
+                "observation": observation,
+            }),
+            format!("{human} (unchanged)"),
+        )),
+    }
+}
+
+/// The small read envelope alderd's simulator uses to model a refresh. A
+/// real refresh now reports whether durable levels were appended; callers
+/// that already own an observation result can still pack the stable envelope.
 pub fn refresh_document(head: &Head, changed: bool, result: &Value) -> Value {
     json!({
         "schema": "alder.refresh.v0",
         "head": head.sequence(),
+        "revision": head.revision(),
         "changed": changed,
         "result": result,
     })
 }
 
 fn refresh(context: &Context) -> Result<Output> {
-    let result = observer::refresh(
-        &context.projection,
-        &context.project.config.observers,
-        &context.snapshot.state,
-    )?;
-    let mut lines = vec![format!(
-        "observed {} handles: {} present, {} absent, {} unknown",
-        result.present + result.absent + result.unknown,
-        result.present,
-        result.absent,
-        result.unknown
-    )];
-    if !result.unbound.is_empty() {
-        lines.push("unbound:".to_owned());
-        lines.extend(
-            result
-                .unbound
-                .iter()
-                .map(|handle| format!("  {}  {}", handle.handle, handle.status.as_str())),
-        );
-    }
-    if result.changed {
-        lines.push("changed since the previous refresh".to_owned());
-    }
-    let result_value = serde_json::to_value(&result)?;
+    let result = apply_refresh(context)?;
+    let changed = result.appended > 0;
     Ok(Output::new(
-        refresh_document(&context.snapshot.head, result.changed, &result_value),
-        lines.join("\n"),
+        refresh_document(&result.head, changed, &refresh_result_value(&result)),
+        if changed {
+            format!(
+                "recorded {} observation changes ({} retired)",
+                result.appended, result.retired
+            )
+        } else {
+            "no observation changes".to_owned()
+        },
     ))
+}
+
+fn refresh_result_value(result: &RefreshApplication) -> Value {
+    let levels = result
+        .runs
+        .iter()
+        .flat_map(|run| run.normalized.iter())
+        .filter(|observation| observation.field == "liveness")
+        .map(|observation| observation.level.as_str());
+    let mut present = 0;
+    let mut absent = 0;
+    let mut unknown = 0;
+    for level in levels {
+        match level {
+            "present" => present += 1,
+            "absent" => absent += 1,
+            _ => unknown += 1,
+        }
+    }
+    json!({
+        "runs": result.runs,
+        "present": present,
+        "absent": absent,
+        "unknown": unknown,
+        "unbound": [],
+        "changed": result.appended > 0,
+        "appended": result.appended,
+        "retired": result.retired,
+    })
+}
+
+fn apply_refresh(context: &Context) -> Result<RefreshApplication> {
+    let runs = observer::observe(&context.project.config.observers)?;
+    let mut appended = 0;
+    let mut retired = 0;
+    for run in &runs {
+        if !run.success {
+            continue;
+        }
+        let mut reported = BTreeSet::new();
+        for object in &run.normalized {
+            let key = ObservationKey {
+                observer: run.kind.clone(),
+                subject: object.subject.clone(),
+                field: object.field.clone(),
+            };
+            reported.insert(key.clone());
+            if matches!(
+                context.log.report_observation(key, object.level.clone())?,
+                ObservationAppend::Appended(_)
+            ) {
+                appended += 1;
+            }
+            if let Some(attempt_id) = object.attempt_id.as_deref() {
+                let key = ObservationKey {
+                    observer: run.kind.clone(),
+                    subject: object.subject.clone(),
+                    field: "attempt-id".to_owned(),
+                };
+                reported.insert(key.clone());
+                if matches!(
+                    context.log.report_observation(key, attempt_id.to_owned())?,
+                    ObservationAppend::Appended(_)
+                ) {
+                    appended += 1;
+                }
+            }
+        }
+        // A successful script is a complete level snapshot for its observer.
+        // Its omissions are an explicit retirement of keys the same observer
+        // previously established, so the folded picture never serves ghosts.
+        // One exception: a liveness key whose handle is bound to an active
+        // attempt becomes an explicit `absent` level instead of retiring. A
+        // dead worker is a statement the fold must carry — a reader with no
+        // observer of its own can only learn the death from a level, never
+        // from silence. The key retires once its attempt ends.
+        let state = context.log.snapshot()?.state;
+        let active_handles: BTreeSet<String> = state
+            .attempts
+            .values()
+            .filter(|attempt| {
+                matches!(
+                    attempt.state,
+                    crate::domain::AttemptState::Starting | crate::domain::AttemptState::Active
+                )
+            })
+            .filter_map(|attempt| attempt.handle.clone())
+            .collect();
+        let existing: Vec<_> = state
+            .observations
+            .keys()
+            .filter(|key| key.observer == run.kind && !reported.contains(*key))
+            .cloned()
+            .collect();
+        for key in existing {
+            let handle = format!("{}:{}", key.observer, key.subject);
+            if key.field == "liveness" && active_handles.contains(&handle) {
+                if matches!(
+                    context.log.report_observation(key, "absent".to_owned())?,
+                    ObservationAppend::Appended(_)
+                ) {
+                    appended += 1;
+                }
+            } else if matches!(
+                context.log.retire_observation(key)?,
+                ObservationAppend::Appended(_)
+            ) {
+                appended += 1;
+                retired += 1;
+            }
+        }
+    }
+    let snapshot = context.log.snapshot()?;
+    Ok(RefreshApplication {
+        runs,
+        appended,
+        retired,
+        head: snapshot.head,
+    })
 }
 
 fn reconcile(context: &Context, refresh_first: bool) -> Result<Output> {
     let refreshed = if refresh_first {
-        Some(observer::refresh(
-            &context.projection,
-            &context.project.config.observers,
-            &context.snapshot.state,
-        )?)
+        Some(apply_refresh(context)?)
     } else {
         None
     };
-    let observations = context.projection.observations()?;
-    let runs = context.projection.observation_runs()?;
+    let snapshot = if refresh_first {
+        context.log.snapshot()?
+    } else {
+        context.snapshot.clone()
+    };
     let configured = configured_kinds(context);
-    let known: BTreeSet<_> = runs
-        .iter()
-        .filter(|run| run.success)
-        .map(|run| run.kind.clone())
-        .collect();
-    let findings = observer::reconcile(&context.snapshot.state, &observations, &configured, &known);
+    let known: BTreeSet<_> = refreshed
+        .as_ref()
+        .map(|result| {
+            result
+                .runs
+                .iter()
+                .filter(|run| run.success)
+                .map(|run| run.kind.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let observations = observed_handles(&snapshot.state, &known);
+    let findings = observer::reconcile(&snapshot.state, &observations, &configured, &known);
     let findings_human = if findings.is_empty() {
         "no reconciliation findings".to_owned()
     } else {
@@ -1240,28 +1450,92 @@ fn reconcile(context: &Context, refresh_first: bool) -> Result<Output> {
             .collect::<Vec<_>>()
             .join("\n\n")
     };
-    let freshness = runs
-        .iter()
-        .map(|run| run.observed_at.as_str())
-        .max()
-        .map(|at| format!("observations from {at}"))
-        .unwrap_or_else(|| "no stored observations".to_owned());
     let human = if refresh_first {
         findings_human
     } else {
-        format!("{freshness}\n\n{findings_human}")
+        format!("folded observation snapshot\n\n{findings_human}")
     };
     Ok(Output::new(
         json!({
             "schema": "alder.reconcile.v0",
-            "head": context.snapshot.head.sequence(),
+            "head": snapshot.head.sequence(),
             "refreshed": refresh_first,
-            "refresh_result": refreshed,
-            "observation_runs": runs,
+            "refresh_result": refreshed.as_ref().map(refresh_result_value),
+            "observation_runs": [],
             "findings": findings,
         }),
         human,
     ))
+}
+
+fn observed_handles(
+    state: &ProjectState,
+    known: &BTreeSet<String>,
+) -> Vec<crate::projection::ObservedHandle> {
+    let mut handles: BTreeMap<_, _> = state
+        .observations
+        .values()
+        .filter(|observation| observation.key.field == "liveness")
+        .map(|observation| {
+            let status = match observation.level.as_str() {
+                "present" => crate::projection::ObservationStatus::Present,
+                "absent" => crate::projection::ObservationStatus::Absent,
+                _ => crate::projection::ObservationStatus::Unknown,
+            };
+            let handle = format!("{}:{}", observation.key.observer, observation.key.subject);
+            (
+                handle.clone(),
+                crate::projection::ObservedHandle {
+                    handle,
+                    attempt_id: None,
+                    status,
+                    metadata: json!({}),
+                    observed_at: observation.reported_seq.to_string(),
+                    detail: None,
+                },
+            )
+        })
+        .collect();
+    for observation in state
+        .observations
+        .values()
+        .filter(|observation| observation.key.field == "attempt-id")
+    {
+        let handle = format!("{}:{}", observation.key.observer, observation.key.subject);
+        if let Some(handle) = handles.get_mut(&handle) {
+            handle.attempt_id = Some(observation.level.clone());
+        }
+    }
+    // A successful complete snapshot establishes that an active handle of
+    // that kind is absent when its liveness key is not current. The local run
+    // record is diagnostic evidence for completeness; the level itself still
+    // comes only from the durable fold.
+    for attempt in state.attempts.values().filter(|attempt| {
+        matches!(
+            attempt.state,
+            crate::domain::AttemptState::Starting | crate::domain::AttemptState::Active
+        )
+    }) {
+        let Some(handle) = attempt.handle.as_ref() else {
+            continue;
+        };
+        let Some((kind, _)) = handle.split_once(':') else {
+            continue;
+        };
+        if known.contains(kind) {
+            handles
+                .entry(handle.clone())
+                .or_insert_with(|| crate::projection::ObservedHandle {
+                    handle: handle.clone(),
+                    attempt_id: None,
+                    status: crate::projection::ObservationStatus::Absent,
+                    metadata: json!({}),
+                    observed_at: String::new(),
+                    detail: None,
+                });
+        }
+    }
+    handles.into_values().collect()
 }
 
 fn debug(context: &Context, command: &DebugCommand) -> Result<Output> {
@@ -1425,8 +1699,13 @@ fn debug_observations(
             serde_json::to_string_pretty(&result)?,
         ));
     }
-    let observations = context.projection.observations()?;
-    let runs = context.projection.observation_runs()?;
+    let observations: Vec<_> = context
+        .snapshot
+        .state
+        .observations
+        .values()
+        .cloned()
+        .collect();
     let configured = configured_kinds(context);
     let referenced: BTreeSet<_> = context
         .snapshot
@@ -1435,11 +1714,15 @@ fn debug_observations(
         .values()
         .filter_map(|attempt| attempt.handle.as_deref())
         .filter_map(|handle| handle.split_once(':').map(|(kind, _)| kind.to_owned()))
+        .chain(
+            observations
+                .iter()
+                .map(|observation| observation.key.observer.clone()),
+        )
         .collect();
     let kinds: BTreeSet<_> = configured
         .iter()
         .chain(referenced.iter())
-        .chain(runs.iter().map(|run| &run.kind))
         .cloned()
         .collect();
     let details: Vec<_> = kinds
@@ -1454,7 +1737,7 @@ fn debug_observations(
                 .find(|observer| &observer.observer == kind);
             let objects: Vec<_> = observations
                 .iter()
-                .filter(|handle| handle.handle.starts_with(&format!("{kind}:")))
+                .filter(|observation| &observation.key.observer == kind)
                 .cloned()
                 .collect();
             json!({
@@ -1464,7 +1747,7 @@ fn debug_observations(
                 "shell": observer.map(|_| "/bin/bash -o pipefail -c"),
                 "timeout_seconds": observer.map(|_| 20),
                 "max_executions": observer.map(|_| 4),
-                "latest_run": runs.iter().find(|run| &run.kind == kind),
+                "latest_run": null,
                 "objects": objects,
             })
         })
@@ -1489,6 +1772,18 @@ fn configured_kinds(context: &Context) -> BTreeSet<String> {
         .iter()
         .map(|observer| observer.observer.clone())
         .collect()
+}
+
+fn observation_level<'a>(state: &'a ProjectState, handle: &str) -> Option<&'a str> {
+    let (observer, subject) = handle.split_once(':')?;
+    state
+        .observations
+        .get(&ObservationKey {
+            observer: observer.to_owned(),
+            subject: subject.to_owned(),
+            field: "liveness".to_owned(),
+        })
+        .map(|observation| observation.level.as_str())
 }
 
 /// The common document envelope emitted by every successful mutation.

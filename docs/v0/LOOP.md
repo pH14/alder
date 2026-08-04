@@ -381,8 +381,9 @@ indistinguishable from a hang.
   Two drivers pointed at one log are not an error; the one-open-pass rule makes
   the second one's wake fail, and it reads the loop fold again next poll. The
   loser concedes; it never ends the winner's pass to take the slot.
-- **Not observation history.** `refresh` reports a local `changed` bool. What
-  was observed stays in the local tables, out of the durable log.
+- **Not a sensor trace.** `refresh` records only changed current levels. The
+  log is the folded observation picture, so a flip and return between observer
+  runs is intentionally absent.
 - **Not a place for driver diagnostics.** A driver that cannot reach the store
   or cannot find its engine says so to its operator. It does not write its own
   troubles into the project's log.

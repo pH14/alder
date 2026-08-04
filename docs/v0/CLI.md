@@ -10,8 +10,8 @@ Five rules decide where a command goes. They are not style preferences; each
 one removes a class of ambiguity that cost a reader a lookup.
 
 **Queries are global.** A reader wants one answer about the project, not one
-answer per noun. `status`, `next`, `show`, `refresh`, and `reconcile` take no
-noun.
+answer per noun. `status`, `next`, `show`, `observations`, `refresh`, and
+`reconcile` take no noun.
 
 **Mutations name their noun.** Every command that appends starts with the thing
 it changes: `alder work start`, `alder attempt end`, `alder loop wake`.
@@ -33,17 +33,17 @@ transcript never requires checking which flags an `edit` carried.
 
 The complete surface:
 
-| Global | Work | Attempt | Question | Loop | Pass |
-| --- | --- | --- | --- | --- | --- |
-| `init` | `add` | `edit` | `answer` | `wake` | `end` |
-| `status` | `edit` | `end` | | `pause` | |
-| `next` | `start` | | | `resume` | |
-| `show` | `finish` | | | `use` | |
-| `refresh` | `drop` | | | `rotate` | |
-| `reconcile` | `reopen` | | | `nudge` | |
-| `debug` | `block` | | | | |
-| | `unblock` | | | | |
-| | `ask` | | | | |
+| Global | Work | Attempt | Question | Observation | Loop | Pass |
+| --- | --- | --- | --- | --- | --- | --- |
+| `init` | `add` | `edit` | `answer` | `report` | `wake` | `end` |
+| `status` | `edit` | `end` | | `retire` | `pause` | |
+| `next` | `start` | | | | `resume` | |
+| `show` | `finish` | | | | `use` | |
+| `observations` | `drop` | | | | `rotate` | |
+| `refresh` | `reopen` | | | | `nudge` | |
+| `reconcile` | `block` | | | | | |
+| `debug` | `unblock` | | | | | |
+| | `ask` | | | | | |
 
 ## Output
 
@@ -154,7 +154,7 @@ tokens instead of the full pack's few thousand:
 
 ```text
 $ alder status
-head 4211 · observations refreshed 38s ago
+head 4211
 
 loop
   engine claude
@@ -187,7 +187,7 @@ list, alongside the counts:
 
 ```text
 $ alder status --section attention
-head 4211 · observations refreshed 38s ago
+head 4211
 
 loop
   engine claude
@@ -215,9 +215,10 @@ way to see `recent_events` — the last ten log entries, dropped from the
 default pack entirely because the five sections already fold events into
 state. If combined with `--section`, `--full` wins.
 
-`status` shows observation times and command failures. Alder does not derive a
-stale-attempt classification; the caller judges elapsed time. A failed refresh
-produces `unknown` rather than presenting an older observation as current.
+`status` includes the durable observation snapshot. The snapshot is the last
+reported belief, not a hidden local inventory; a failed refresh appends no
+replacement belief. Alder does not derive a stale-attempt classification; the
+caller judges elapsed time.
 
 `waiting_on_human` lists the unanswered questions someone can still act on. A
 question whose work has since been dropped or finished is stranded and is
@@ -248,8 +249,8 @@ hypothetical · based on head 4211 · replan.json · not written
 ```
 
 `--with` composes with the rest of `status` exactly as it always has: the
-hypothetical durable state is combined with the current external
-observations, and the resulting counts (or expanded sections, under `--full`
+hypothetical durable state is combined with the current folded observations,
+and the resulting counts (or expanded sections, under `--full`
 or `--section`) reflect it. Nothing is appended, and the hypothetical change
 is not written to the local projection. Ordinary head synchronization may
 first rebuild an out-of-date projection.
@@ -725,61 +726,65 @@ pending nudge as the `manual` trigger and fires through its own deferrals; it
 does not override `loop pause`, and it cannot open a second pass while one is
 open.
 
-## Repair
+## Observations
+
+### `alder observations`
+
+List the folded current picture. This is the snapshot command: it reads the
+shared log and lists one row for every current `(observer, subject, field)`
+key, ordered by that key. It does not run scripts or inspect SQLite.
+
+```text
+$ alder observations
+github  owner/repo#171  ci  passing
+tmux    alder-hm-9a1   liveness  present
+```
+
+### `alder observation report <observer> <subject> <field> <level>`
+
+Report one current level. The command appends `observation.reported` only when
+the current fold has a different level for that key; repeating the exact report
+is successful and returns `"appended": false`. This is the noun-first mutation
+form. The script that discovers a level does not need to remember or compare
+anything.
+
+### `alder observation retire <observer> <subject> <field>`
+
+Retire a key an observer has established no longer exists. Retiring an already
+absent key is also a successful no-op. A retirement removes the key from the
+snapshot; it does not leave a second `absent` state behind.
 
 ### `alder refresh`
 
-Run configured observation commands without appending:
+Run configured observer scripts and apply their complete current snapshots.
+Each `list` command prints a JSON array of level reports:
 
 ```json
-{
-  "schema": "alder.config.v0",
-  "prefix": "hm",
-  "store": {
-    "remote": "origin",
-    "ref": "refs/heads/alder"
-  },
-  "observers": [
-    {
-      "observer": "nimbus",
-      "list": "nimbus ls --json | jq '[.boxes[] | {value: .name, attempt_id: .labels.alder_attempt, metadata: {state: .state, estimated_cost: .estimated_cost}}]'"
-    }
-  ]
-}
+[
+  {"subject":"owner/repo#171", "field":"ci", "level":"passing"},
+  {"subject":"owner/repo#172", "field":"ci", "level":"running"}
+]
 ```
 
-The entries come from `.alder/config.json`. `observer` becomes the handle kind.
-`list` defines its own external scope and must print one complete normalized
-JSON array. Alder runs it through a fixed shell wrapper with pipefail enabled.
-The default timeout is 20 seconds per execution, followed by at most three
-retries. The first valid result wins.
+The manifest entry supplies the first key part:
 
-```text
-$ alder refresh
-observed 7 handles: 5 present, 1 absent, 1 unknown
-unbound:
-  nimbus:box-22  present  state=running  estimated_cost=31.70
-changed since the previous refresh
+```json
+{"observer":"github", "list":"ci list --json | jq '[.[] | {subject: .id, field: \"ci\", level: .state}]'"}
 ```
 
-An exit-zero, valid array is a complete snapshot. Returned values are present;
-omitted durable handles of that kind are absent. After four failed executions,
-the kind is unknown and failed output cannot establish absence. Timeouts
-terminate the complete shell pipeline.
+An exit-zero valid array is complete for that observer: reported keys are
+updated through the append layer, and previously current keys omitted from the
+array are retired. A failure appends no belief. Alder runs the script through a
+fixed `bash -o pipefail` wrapper with a 20-second timeout and up to three
+retries; the first valid result wins.
 
-The result carries `"changed": bool` — whether this snapshot differs from the
-stored one. The comparison covers handle identity, presence or absence, and
-attempt binding only. Observation metadata is non-semantic by design, so a
-moving cost ticker or a changing uptime must never report change. This bool is
-what a driver polls to decide whether the world moved.
-
-The inventory includes unbound objects, which is how leaked cloud boxes or
-sessions become visible. Removing an observation command does not invalidate
-existing handles. They remain replayable but have no fresh observation.
+`refresh` returns `changed`, the number of appended changes, and retired-key
+count. It is the normal scheduled ingestion command for alderd or cron. A
+head advance from it therefore always means a belief changed.
 
 ### `alder reconcile`
 
-Refresh by default, compare durable attempts with the observed inventory, and
+Refresh by default, compare durable attempts with folded liveness levels, and
 propose repairs:
 
 ```text
@@ -787,32 +792,15 @@ $ alder reconcile
 hm-2b7-attempt-1  recorded active, observed absent
   suggested: alder attempt end hm-2b7-attempt-1 --outcome lost --why "external handle absent"
 
-hm-9a1-attempt-1  recorded starting
-  found: tmux:nimbus-box-17/alder-hm-9a1-attempt-1
-  suggested: alder attempt edit hm-9a1-attempt-1 --handle tmux:nimbus-box-17/alder-hm-9a1-attempt-1
-
-hm-6e3-attempt-2  recorded active, observation unknown
-  no destructive action suggested
-
 hm-4c8-attempt-1  an open attempt has never been bound to a handle; no worker was launched
   suggested: alderd spawn hm-4c8
-
-hm-5d1-attempt-1  a live Codex worker has a session UUID but its attempt is missing codex-session metadata
-  suggested: alder attempt edit hm-5d1-attempt-1 --meta codex-session=019f...
-
-nimbus:box-22  present, no associated attempt
-  attention: unclaimed environment handle
 ```
 
-Reconcile does not treat `unknown` as absent. It is durably read-only: it
-refreshes local observations and prints findings and suggested ordinary
-commands, but never appends an event or acts on a provider. A caller performs
-any accepted repair separately. A suggestion is a string for a human or an
-agent to run: `alderd spawn` appears in one of them, and Alder still never
-calls `alderd`.
-
-Use `alder reconcile --no-refresh` to compare against the current local
-inventory.
+Reconcile does not treat an unknown level as absent. It refreshes by default,
+so its observation changes are ordinary `observation.*` appends; it never
+performs a provider action. A caller performs any suggested repair separately.
+Use `alder reconcile --no-refresh` to compare against the folded snapshot
+without running scripts.
 
 ## Diagnostics
 
@@ -843,16 +831,15 @@ named reads and `--json`.
 ### `alder debug observations [<kind>] [--run]`
 
 Without a kind, list configured and durably referenced observation kinds with
-their latest refresh result, object count, executions, duration, and
-freshness. Kinds referenced by handles but lacking configuration are shown as
-`unconfigured`.
+their folded current keys. Kinds referenced by handles but lacking
+configuration are shown as `unconfigured`.
 
 With a kind, show its configured command, effective shell, timeout and retry
-settings, latest normalized snapshot, validation error, and bounded stderr.
+settings, and folded current keys.
 
 `--run` executes that kind alone and shows every execution plus the normalized
-result. It is diagnostic: it does not update observation tables. Use
-`alder refresh` to store observations.
+result. It is diagnostic: it does not append. Use `alder refresh` to apply
+reported levels.
 
 All forms support `--json`.
 

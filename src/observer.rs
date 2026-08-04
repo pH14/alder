@@ -73,13 +73,48 @@ pub struct ExecutionResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NormalizedObject {
+    /// Kept for the legacy handle inventory adapter below. New observer
+    /// scripts use `subject` directly.
     pub value: String,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub field: String,
+    #[serde(default)]
+    pub level: String,
+    /// Legacy inventory fields remain accepted while repository observers
+    /// move to level reports. They are not part of the durable observation
+    /// key or level.
     #[serde(default)]
     pub attempt_id: Option<String>,
     #[serde(default = "empty_object")]
     pub metadata: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ObserverOutput {
+    Level(LevelOutput),
+    Legacy(LegacyOutput),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LevelOutput {
+    subject: String,
+    field: String,
+    level: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyOutput {
+    value: String,
+    #[serde(default)]
+    attempt_id: Option<String>,
+    #[serde(default = "empty_object")]
+    metadata: Value,
 }
 
 pub fn refresh(
@@ -146,6 +181,18 @@ pub fn refresh(
             .collect(),
         runs: run_results,
     })
+}
+
+/// Run every configured observer. The returned normalized reports are
+/// deliberately not folded here: the application append path owns newness
+/// and is the sole writer of the durable observation picture.
+pub fn observe(observers: &[ObserverConfig]) -> Result<Vec<ObserverRunResult>> {
+    let mut runs = Vec::new();
+    for observer in observers {
+        let run = run_observer(observer, EXECUTION_TIMEOUT, MAX_EXECUTIONS)?;
+        runs.push(run);
+    }
+    Ok(runs)
 }
 
 pub fn diagnose(observer: &ObserverConfig) -> Result<ObserverRunResult> {
@@ -283,20 +330,58 @@ fn handle_kill_result(result: rustix::io::Result<()>) -> Result<()> {
 }
 
 fn validate_output(bytes: &[u8]) -> Result<Vec<NormalizedObject>> {
-    let objects: Vec<NormalizedObject> = serde_json::from_slice(bytes).map_err(|error| {
+    let output: Vec<ObserverOutput> = serde_json::from_slice(bytes).map_err(|error| {
         AlderError::with_context(
             "invalid_observation",
             format!("standard output is not one normalized JSON array: {error}"),
             json!({"line": error.line(), "column": error.column()}),
         )
     })?;
+    let objects: Vec<NormalizedObject> = output
+        .into_iter()
+        .map(|object| match object {
+            ObserverOutput::Level(LevelOutput {
+                subject,
+                field,
+                level,
+            }) => NormalizedObject {
+                value: subject.clone(),
+                subject,
+                field,
+                level,
+                attempt_id: None,
+                metadata: json!({}),
+            },
+            // Existing handle observers report an inventory. Treat each
+            // returned object as the present liveness level while consumers
+            // transition to the explicit current-level shape.
+            ObserverOutput::Legacy(LegacyOutput {
+                value,
+                attempt_id,
+                metadata,
+            }) => NormalizedObject {
+                subject: value.clone(),
+                value,
+                field: "liveness".to_owned(),
+                level: "present".to_owned(),
+                attempt_id,
+                metadata,
+            },
+        })
+        .collect();
     let mut values = BTreeSet::new();
     let mut attempts = BTreeSet::new();
     for object in &objects {
-        if object.value.is_empty() {
+        if object.subject.trim().is_empty() {
             return Err(AlderError::new(
                 "invalid_observation",
-                "an observed value cannot be empty",
+                "an observation subject cannot be empty",
+            ));
+        }
+        if object.field.trim().is_empty() || object.level.trim().is_empty() {
+            return Err(AlderError::new(
+                "invalid_observation",
+                "an observation field and level cannot be empty",
             ));
         }
         if !object.metadata.is_object() {
@@ -305,11 +390,14 @@ fn validate_output(bytes: &[u8]) -> Result<Vec<NormalizedObject>> {
                 "observation metadata must be a JSON object",
             ));
         }
-        if !values.insert(&object.value) {
+        if !values.insert((&object.subject, &object.field)) {
             return Err(AlderError::with_context(
                 "invalid_observation",
-                format!("duplicate observed value `{}`", object.value),
-                json!({"value": object.value}),
+                format!(
+                    "duplicate observation key `{}` / `{}`",
+                    object.subject, object.field
+                ),
+                json!({"subject": object.subject, "field": object.field}),
             ));
         }
         if let Some(attempt_id) = object.attempt_id.as_deref()

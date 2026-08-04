@@ -1,0 +1,1 @@
+.agent/skills/pass/SKILL.md

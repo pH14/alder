@@ -23,7 +23,9 @@ pub enum Command {
     Next(OverlayArgs),
     /// Current state and history for any Alder object.
     Show(ShowArgs),
-    /// Run configured observation commands without appending.
+    /// The folded current observation picture.
+    Observations,
+    /// Run configured observation commands and append changed levels.
     Refresh,
     /// Compare durable attempts with observed reality.
     Reconcile(ReconcileArgs),
@@ -33,6 +35,8 @@ pub enum Command {
     Attempt(AttemptArgs),
     /// Questions: an asynchronous human decision one work item needs.
     Question(QuestionArgs),
+    /// Observations: current external beliefs keyed by observer, subject, and field.
+    Observation(ObservationArgs),
     /// The driving loop and its controls.
     Loop(LoopArgs),
     /// Passes: one run of the driving loop.
@@ -106,6 +110,35 @@ pub struct ShowArgs {
 pub struct ReconcileArgs {
     #[arg(long)]
     pub no_refresh: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ObservationArgs {
+    #[command(subcommand)]
+    pub command: ObservationCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ObservationCommand {
+    /// Report one current level. Repeating it unchanged appends nothing.
+    Report(ObservationReportArgs),
+    /// Retire a key that no longer exists. Repeating it appends nothing.
+    Retire(ObservationRetireArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ObservationReportArgs {
+    pub observer: String,
+    pub subject: String,
+    pub field: String,
+    pub level: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ObservationRetireArgs {
+    pub observer: String,
+    pub subject: String,
+    pub field: String,
 }
 
 #[derive(Debug, Args)]
