@@ -19,11 +19,11 @@ elsewhere, each fact where it belongs:
 - crash forensics live in session transcripts;
 - the loop's heartbeat lives in the driver's own local log.
 
-The payoff is the crash story. A wake is delivered by typing one line into a
-terminal and noting, machine-locally, which head it was for. Nothing durable
-records it, so there is nothing for a crash to half-say: a missed wake is made
-up by the next poll, a duplicated wake finds an executor with nothing new to do,
-and both cost nothing because **passes are idempotent** — the executor rebuilds
+The payoff is the crash story. A wake is delivered by running one command and
+noting, machine-locally, which head it was for. Nothing durable records it,
+so there is nothing for a crash to half-say: a missed wake is made up by the
+next poll, a duplicated wake finds an executor with nothing new to do, and
+both cost nothing because **passes are idempotent** — the executor rebuilds
 its picture from the fold every time.
 
 The loop is a singleton per log. There is one loop, so it needs no ID, and
