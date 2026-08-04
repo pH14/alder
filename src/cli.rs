@@ -33,8 +33,6 @@ pub enum Command {
     Attempt(AttemptArgs),
     /// Questions: an asynchronous human decision one work item needs.
     Question(QuestionArgs),
-    /// Handoffs: the asynchronous inbox for later admission.
-    Handoff(HandoffArgs),
     /// The driving loop and its controls.
     Loop(LoopArgs),
     /// Passes: one run of the driving loop.
@@ -74,14 +72,13 @@ pub struct StatusArgs {
     pub section: Vec<StatusSection>,
 }
 
-/// The six sections `status` counts by default. Names match the JSON keys
+/// The five sections `status` counts by default. Names match the JSON keys
 /// they expand, not the CLI's usual kebab-case, so a caller can round-trip
 /// `--section <name>` straight from a `counts` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "snake_case")]
 pub enum StatusSection {
     Attention,
-    Handoffs,
     InFlight,
     Ready,
     WaitingOnHuman,
@@ -92,7 +89,6 @@ impl StatusSection {
     pub fn as_str(self) -> &'static str {
         match self {
             StatusSection::Attention => "attention",
-            StatusSection::Handoffs => "handoffs",
             StatusSection::InFlight => "in_flight",
             StatusSection::Ready => "ready",
             StatusSection::WaitingOnHuman => "waiting_on_human",
@@ -120,7 +116,7 @@ pub struct WorkArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum WorkCommand {
-    /// Admit work, optionally from a handoff or a graph-change document.
+    /// Admit work, optionally from a graph-change document.
     Add(WorkAddArgs),
     /// Change fields, dependencies, or checks. Never changes state.
     Edit(WorkEditArgs),
@@ -144,8 +140,6 @@ pub enum WorkCommand {
 pub struct WorkAddArgs {
     #[arg(long, value_name = "FILE")]
     pub from: Option<String>,
-    #[arg(long, value_name = "HANDOFF")]
-    pub handoff: Option<String>,
     #[arg(long)]
     pub title: Option<String>,
     #[arg(long)]
@@ -298,37 +292,6 @@ pub enum QuestionCommand {
 pub struct QuestionAnswerArgs {
     pub question: String,
     pub answer: String,
-}
-
-#[derive(Debug, Args)]
-pub struct HandoffArgs {
-    #[command(subcommand)]
-    pub command: HandoffCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum HandoffCommand {
-    /// Submit an asynchronous handoff for later admission.
-    Add(HandoffAddArgs),
-    /// Retire a submitted handoff without admitting it.
-    Withdraw(HandoffWithdrawArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct HandoffAddArgs {
-    #[arg(long)]
-    pub title: String,
-    #[arg(long = "ref")]
-    pub artifact_ref: String,
-    #[arg(long)]
-    pub note: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct HandoffWithdrawArgs {
-    pub handoff: String,
-    #[arg(long)]
-    pub why: String,
 }
 
 #[derive(Debug, Args)]

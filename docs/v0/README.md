@@ -19,10 +19,9 @@ project's engineering doctrine, or attempt to be a general scheduler.
 
 ## Product boundary
 
-The durable model contains six core structures:
+The durable model contains five core structures:
 
 - events;
-- handoffs;
 - work;
 - dependencies;
 - attempts;
@@ -34,7 +33,7 @@ work or a general messaging system.
 
 It also records the driving loop itself: passes, which are the loop's run
 records, and a small set of loop controls. Work is to an attempt what the loop
-is to a pass. These are namespaced separately from the six core structures
+is to a pass. These are namespaced separately from the five core structures
 because they describe how the project is being driven rather than what the
 project owes. [LOOP.md](LOOP.md) defines them.
 
@@ -56,12 +55,11 @@ remains the default. V0 has no YAML, TOML, or generic output-format switch.
 One bounded pass is:
 
 1. Read `alder status`.
-2. Integrate submitted handoffs.
-3. Refresh observations and reconcile active attempts.
-4. Resolve completed, failed, or missing attempts.
-5. Surface open questions, blocked work, and observation failures.
-6. Start the highest-priority actionable work that fits current judgment.
-7. Stop.
+2. Refresh observations and reconcile active attempts.
+3. Resolve completed, failed, or missing attempts.
+4. Surface open questions, blocked work, and observation failures.
+5. Start the highest-priority actionable work that fits current judgment.
+6. Stop.
 
 Alder supplies the state needed for this loop. It does not contain the loop's
 engineering judgment.
@@ -79,36 +77,20 @@ belongs to the agent.
 
 Nothing is Alder work until a writer runs `alder work add`. Alder does not
 authorize one writer over another. Repository skills decide which agent may
-admit work and should direct workers and side sessions to the handoff path.
+admit work.
 
-Alder provides a small asynchronous inbox for side sessions:
-
-- `alder handoff add` records a title, artifact reference, and optional note;
-- the handoff is `submitted`, not work, and does not participate in readiness
-  or dependencies;
-- the driving agent drains submitted handoffs before selecting more work;
-- `alder work add --handoff` atomically creates admitted work and marks the
-  handoff `integrated`;
-- `alder handoff withdraw` retires a submitted handoff without admitting it,
-  marking it `withdrawn`.
-
-These are the only three handoff states, and `integrated` and `withdrawn` are
-both terminal. If integration cannot validate, the handoff remains submitted
-and visible.
-
-Submission is intentionally weaker than admission. A repository-tuned handoff
-skill should invoke it only after an explicit human request such as "handoff
-to leader." Alder does not pretend that a free-form claim of human delegation
-is enforceable; even an unwanted submission cannot enter the work graph until
-a writer explicitly admits it with `work add`.
+To hand an idea off operationally, file ordinary work whose `spec` carries the
+raw idea. It stays open while the driving agent turns that idea into any
+structured follow-up work. The work item's ordinary open-until-finished
+lifecycle supplies the crash recovery: redo the derivation if necessary, and
+duplicate follow-ups are harmless.
 
 ### IDs carry context
 
 Each repository chooses a short ID prefix, such as `hm` for Harmony. Work uses
 a generated ID such as `hm-9a1`; attempts and questions extend their work ID
 with a never-reused ordinal, such as `hm-9a1-attempt-1` and
-`hm-9a1-question-1`. A handoff has no work yet, so it uses a
-repository-scoped ID such as `hm-handoff-f27`.
+`hm-9a1-question-1`.
 
 ### Graph changes are atomic
 
@@ -164,8 +146,6 @@ appends to it. If another writer advances the log before the append, the
 mutation changes nothing and the caller must reread and reconsider it.
 
 Ordinary mutations are never silently replayed against the new head.
-`handoff add` is the exception because submission is inert and uniquely
-identified, making reconsideration automatic and safe.
 
 A caller can only reconsider a loss it recognizes, so losing is reported as a
 fact about the command — nothing was appended, and here is the event that was
@@ -275,7 +255,7 @@ The project root contains one user-facing manifest at
 
 The manifest contains repository identity, shared-log location, and executable
 observation commands. The prefix becomes immutable after the first work item
-or handoff is appended; later commands verify it against the log. Observer
+is appended; later commands verify it against the log. Observer
 configuration may change without appending an event.
 
 The configured remote ref is authoritative, not a local branch or
@@ -361,9 +341,6 @@ V0 does not include:
 
 An attempt may record an external handle and open-ended metadata. They provide
 reconciliation and provenance without becoming a resource scheduler.
-
-The handoff inbox is not a general proposal tracker. It exists only to deliver
-explicit asynchronous handoffs for later admission.
 
 ## Success criterion
 

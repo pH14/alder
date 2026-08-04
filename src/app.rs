@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use crate::{
     cli::{
         AttemptCommand, AttemptEditArgs, Command, DebugCommand, DebugDbCommand, DebugLogCommand,
-        HandoffCommand, LoopCommand, NonSuccessOutcome, PassCommand, PassOutcomeArg,
-        QuestionCommand, StatusSection, TriggerKind, WorkAddArgs, WorkCommand, WorkEditArgs,
+        LoopCommand, NonSuccessOutcome, PassCommand, PassOutcomeArg, QuestionCommand,
+        StatusSection, TriggerKind, WorkAddArgs, WorkCommand, WorkEditArgs,
     },
     config::{Project, initialize},
     domain::{
@@ -93,33 +93,6 @@ impl App {
                         &result,
                         json!({"question_id": args.question}),
                         format!("{}  answered", args.question),
-                    ))
-                }
-            },
-            Command::Handoff(args) => match &args.command {
-                HandoffCommand::Add(args) => {
-                    let (result, id) = context.log.add_handoff(
-                        args.title.clone(),
-                        args.artifact_ref.clone(),
-                        args.note.clone(),
-                    )?;
-                    Ok(mutation_output(
-                        "alder.handoff.add.v0",
-                        &result,
-                        json!({"handoff_id": id, "state": "submitted"}),
-                        format!("{id}  submitted"),
-                    ))
-                }
-                HandoffCommand::Withdraw(args) => {
-                    require_reason("--why", Some(&args.why))?;
-                    let result = context
-                        .log
-                        .withdraw_handoff(&args.handoff, args.why.clone())?;
-                    Ok(mutation_output(
-                        "alder.handoff.withdraw.v0",
-                        &result,
-                        json!({"handoff_id": args.handoff, "state": "withdrawn"}),
-                        format!("{}  withdrawn", args.handoff),
                     ))
                 }
             },
@@ -444,22 +417,6 @@ fn work_add(context: &Context, args: &WorkAddArgs) -> Result<Output> {
         ));
     }
     let checks = parse_checks(&args.check)?;
-    if let Some(handoff) = args.handoff.as_deref() {
-        let (result, id) = context.log.integrate_handoff(
-            handoff,
-            args.title.clone(),
-            args.spec.clone(),
-            args.priority,
-            args.requires.clone(),
-            checks,
-        )?;
-        return Ok(mutation_output(
-            "alder.work.add.v0",
-            &result,
-            json!({"work_id": id, "handoff_id": handoff}),
-            format!("{id}  integrated from {handoff}"),
-        ));
-    }
     let title = args
         .title
         .clone()
@@ -474,14 +431,13 @@ fn work_add(context: &Context, args: &WorkAddArgs) -> Result<Output> {
     Ok(mutation_output(
         "alder.work.add.v0",
         &result,
-        json!({"work_id": id, "handoff_id": null}),
+        json!({"work_id": id}),
         id,
     ))
 }
 
 fn ensure_no_direct_work_fields(args: &WorkAddArgs) -> Result<()> {
-    if args.handoff.is_some()
-        || args.title.is_some()
+    if args.title.is_some()
         || args.spec.is_some()
         || args.priority != 0
         || !args.requires.is_empty()
@@ -727,13 +683,6 @@ fn status(
         .map(|run| run.kind.clone())
         .collect();
     let findings = observer::reconcile(&state, &observations, &configured, &known);
-    let mut handoffs: Vec<_> = state
-        .handoffs
-        .values()
-        .filter(|handoff| handoff.state == crate::domain::HandoffState::Submitted)
-        .cloned()
-        .collect();
-    handoffs.sort_by_key(|handoff| handoff.submitted_seq);
     let in_flight = in_flight_attempts(&state);
     let ready: Vec<_> = state.ready().into_iter().cloned().collect();
     let mut all_questions: Vec<_> = state.questions.values().cloned().collect();
@@ -769,7 +718,6 @@ fn status(
     blocked.sort_by_key(|work| work.opened_seq);
     let counts = json!({
         "attention": findings.len(),
-        "handoffs": handoffs.len(),
         "in_flight": in_flight.len(),
         "ready": ready.len(),
         "waiting_on_human": questions.len(),
@@ -793,7 +741,6 @@ fn status(
     object.insert("counts".to_owned(), counts);
     if full {
         object.insert("attention".to_owned(), json!(findings));
-        object.insert("handoffs".to_owned(), json!(handoffs));
         object.insert("in_flight".to_owned(), json!(in_flight));
         object.insert("ready".to_owned(), json!(ready));
         object.insert("waiting_on_human".to_owned(), json!(questions));
@@ -812,7 +759,6 @@ fn status(
         for section in selected_status_sections(sections) {
             let value = match section {
                 StatusSection::Attention => json!(findings),
-                StatusSection::Handoffs => json!(handoffs),
                 StatusSection::InFlight => json!(in_flight),
                 StatusSection::Ready => json!(ready),
                 StatusSection::WaitingOnHuman => json!(questions),
@@ -858,14 +804,6 @@ fn status(
             )
         })
     };
-    let handoffs_lines = || {
-        handoffs.iter().map(|handoff| {
-            format!(
-                "{}  {}  {}",
-                handoff.id, handoff.title, handoff.artifact_ref
-            )
-        })
-    };
     let in_flight_lines = || {
         in_flight.iter().map(|attempt| {
             let status = attempt
@@ -904,7 +842,6 @@ fn status(
     };
     if full {
         human_section(&mut lines, "attention", attention_lines());
-        human_section(&mut lines, "handoffs", handoffs_lines());
         human_section(&mut lines, "in flight", in_flight_lines());
         human_section(&mut lines, "ready", ready_lines());
         human_section(&mut lines, "waiting on human", waiting_on_human_lines());
@@ -927,7 +864,6 @@ fn status(
                 StatusSection::Attention => {
                     human_section(&mut lines, "attention", attention_lines())
                 }
-                StatusSection::Handoffs => human_section(&mut lines, "handoffs", handoffs_lines()),
                 StatusSection::InFlight => {
                     human_section(&mut lines, "in flight", in_flight_lines())
                 }
@@ -944,7 +880,6 @@ fn status(
             "counts",
             [
                 format!("attention  {}", findings.len()),
-                format!("handoffs  {}", handoffs.len()),
                 format!("in flight  {}", in_flight.len()),
                 format!("ready  {}", ready.len()),
                 format!("waiting on human  {}", questions.len()),
@@ -960,7 +895,6 @@ fn selected_status_sections(
 ) -> impl Iterator<Item = StatusSection> + '_ {
     [
         StatusSection::Attention,
-        StatusSection::Handoffs,
         StatusSection::InFlight,
         StatusSection::Ready,
         StatusSection::WaitingOnHuman,
@@ -1164,12 +1098,6 @@ pub fn show_document(
             (
                 "question",
                 question_value(state, value)?,
-                BTreeSet::from([id.to_owned()]),
-            )
-        } else if let Some(value) = state.handoffs.get(id) {
-            (
-                "handoff",
-                serde_json::to_value(value)?,
                 BTreeSet::from([id.to_owned()]),
             )
         } else if let Some(value) = state.passes.get(id) {
@@ -1864,7 +1792,6 @@ mod tests {
     fn blank_add_work_args() -> WorkAddArgs {
         WorkAddArgs {
             from: None,
-            handoff: None,
             title: None,
             spec: None,
             priority: 0,
@@ -1892,10 +1819,6 @@ mod tests {
     #[test]
     fn bulk_add_rejects_every_direct_work_field() {
         assert!(ensure_no_direct_work_fields(&blank_add_work_args()).is_ok());
-
-        let mut args = blank_add_work_args();
-        args.handoff = Some("hm-handoff-1".to_owned());
-        assert!(ensure_no_direct_work_fields(&args).is_err());
 
         let mut args = blank_add_work_args();
         args.title = Some("title".to_owned());

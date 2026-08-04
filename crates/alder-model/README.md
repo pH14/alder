@@ -1,7 +1,7 @@
 # alder-model
 
 A [stateright](https://docs.rs/stateright) model of Alder's protocol core.
-It checks four properties of the loop protocol under **every interleaving**
+It checks the loop protocol under **every interleaving**
 of a small cast — the shared CAS log, the daemon's decide loop, the leader
 engine, and an optional second writer (a phone session) — including crash
 transitions. It is a dev-only crate: nothing depends on it, and it ships
@@ -27,19 +27,18 @@ new behavior with no edits here.
 | Log interpretation | `alder::domain::ProjectState::fold` on every state |
 | The daemon's read | `alder::app::loop_section` + `alderd::loop_state::LoopState::from_status` |
 | The daemon's judgment | `alderd::decide::{decide, resolve_engine, session_action, observable_session}` |
-| The safety predicates | `alder::domain::invariants` — the same five the crash simulator asserts |
+| The safety predicates | `alder::domain::invariants` — the same four the crash simulator asserts |
 | **Modeled by hand (the drift surface)** | each actor's atomic steps: where a process can be interrupted between reading and writing, and what a crash erases |
 
 The safety predicates are shared on purpose. Two harnesses check this
 protocol from opposite directions — this model explores every interleaving of
 a small cast, the simulator tears every effect every way its footprint allows
-— and they check the same five things about a log and the state it folds to.
+— and they check the same four things about a log and the state it folds to.
 Stated twice they drift invisibly, both green while meaning different things
 by "correct"; stated once in `alder::domain::invariants`, both assert the same
-sentence. Two of the five compare the log against a fact no log can hold — a
-crash that really happened, an append whose writer is owed a record — so the
-caller passes that witness in. Here the witnesses are the model's own injected
-session deaths and the phone's handoff state.
+sentence. One compares the log against a fact no log can hold — a crash that
+really happened — so the caller passes that witness in. Here the witness is
+the model's own injected session deaths.
 
 Liveness, the `sometimes` properties, and one audit of the model's own ghost
 bookkeeping stay local, and that is deliberate rather than an omission: they
@@ -75,9 +74,8 @@ the contract does not have.
   session it can see is gone, `timeout` otherwise.
 - **The leader** ends the open pass `ok`, optionally with `rotate: true`,
   or crashes (the tmux session dies).
-- **The phone** optionally races a wake, requests a rotation, pauses the
-  loop with a stated reason, or submits a handoff — including losing the
-  append's response and retrying the identical draft.
+- **The phone** optionally races a wake, requests a rotation, or pauses the
+  loop with a stated reason.
 - **Crashes**: the daemon process can die (forgetting its session memory),
   and the leader session can die, each under a scenario budget.
 
@@ -116,7 +114,7 @@ era apart from a pass still running needs real time rather than a fairness
 step. The crash injection stops short of `DaemonCtl::Appending` for that
 reason and no other.
 
-## The four properties
+## Core properties
 
 1. **At most one open pass** under concurrent wake attempts, with the loser
    conceding rather than ending the winner's pass. Encoded as `always`
@@ -135,15 +133,7 @@ reason and no other.
    (a fresh session) first, whatever crashed in between. Checked in
    `crashes_never_silently_consume_a_rotation` with a daemon crash and a
    session crash injected at every point.
-3. **CAS append loses no updates under interleaved writers.** The log stays
-   a cleanly folding total order, and the shared
-   `acknowledged_handoffs_are_never_lost` requires that a submission the
-   writer is owed appears in the history exactly once *and* folded into a
-   handoff the state still knows about — with every other submission held to
-   the no-duplicates half. A lost response retried with the identical draft
-   is absorbed as `AlreadyPresent`. Checked in
-   `interleaved_writers_lose_no_updates`.
-4. **Liveness under fairness: from any crash state the system reaches
+3. **Liveness under fairness: from any crash state the system reaches
    progressing, or blocked-and-named.** Encoded as safety over the bounded
    graph: every *terminal* state (no action enabled) has no open pass —
    in particular none stranded by a crash, so every crashed pass got its
@@ -158,8 +148,8 @@ reason and no other.
 ## State-space bounds
 
 Budgets bound the space: total passes (`max_passes`, ±1 under a lost wake
-race), one phone wake, one rotation request per source, one pause, one
-handoff, and per-scenario crash counts. The log length is bounded by
+race), one phone wake, one rotation request per source, one pause, and
+per-scenario crash counts. The log length is bounded by
 2·passes + 4 control events. Counts from `cargo test -- --nocapture`:
 
 | Scenario (test) | Faults and writers | Unique states |
@@ -167,11 +157,10 @@ handoff, and per-scenario crash counts. The log length is bounded by
 | codex engine | none, one pass, Codex-configured | 7 |
 | lone daemon | none | 19 |
 | wake race | phone wake | 152 |
-| CAS writers | handoff + lost response | 659 |
 | rotation race | phone wake + phone rotation | 1,393 |
 | rotation under crashes | rotate + pause + 1 daemon crash + 1 session crash | 8,826 |
 
-Complete exploration of all six scenarios takes about five seconds.
+Complete exploration of all five scenarios takes about five seconds.
 
 Each test asserts its own number exactly, so this table and the suite are one
 claim rather than two: a count that moves fails a test, and the number here is
@@ -222,11 +211,9 @@ append instead of CAS) is caught by the shared `log_folds_cleanly` with a
 10-step counterexample ending in a log the real fold rejects as a duplicate
 pass.
 
-Three more confirm the shared predicates did not go vacuous when the
-closures started delegating to them, each mutation aimed at one sentence:
-dropping the handoff append instead of only its response is caught by
-`acknowledged_handoffs_are_never_lost`; making the fold's `rotate_pending`
-ignore the consuming wake is caught by
+Two more confirm the shared predicates did not go vacuous when the closures
+started delegating to them, each mutation aimed at one sentence: making the
+fold's `rotate_pending` ignore the consuming wake is caught by
 `rotate_pending_mirrors_the_request_log`; writing a clean pass end as a
 `crashed` verdict is caught by `crashed_verdicts_follow_real_crashes` in
 every scenario, including the fault-free one.
@@ -239,9 +226,6 @@ each of these mutations restores a defect this model once had:
   wake records a configured engine". A literal that matches the only engine
   anybody configured is invisible until somebody configures another one,
   which is why that scenario exists.
-- Hard-coding `triggers: vec![Due]` again fails "a wake records the log
-  trigger that woke it" in the CAS-writers scenario, where a handoff
-  advances the log and the wake it provokes must say `log`.
 - Removing `DaemonResolveTimeout` fails **liveness** — "every terminal state
   is progressing or blocked-and-named" — with a 16-step counterexample: the
   pass stranded by a crash between the wake and the injection has no repair,
@@ -267,7 +251,7 @@ never made has no counterexample to find.
   registers, and an unregistered `sometimes` cannot fail — a gate that stops
   registering one makes the run go green *faster*. So
   `each_scenario_registers_exactly_the_properties_its_flags_ask_for` pins the
-  set, in order, for all six scenarios.
+  set, in order, for all five scenarios.
 - **A question that answers itself.** A `sometimes` property claims the model
   can *reach* something, and one that already holds in the initial state
   claims nothing: it is witnessed by the empty log, and it stays witnessed

@@ -34,9 +34,6 @@ attempt to append them concurrently.
   decision;
 - every existing active attempt must remain intact.
 
-Repeat with a uniquely identified `handoff add` submission. Its inert append
-may be reconsidered automatically and must not be duplicated.
-
 The expected head must remain internal to each command. No mutation accepts a
 public `--if-head`, and Alder exposes no leader takeover or generation.
 
@@ -191,14 +188,10 @@ and explicitly return it to open with
 
 Have workers and side sessions produce many possible follow-ups.
 
-None becomes work merely by being mentioned, observed, or submitted as a
-handoff. A side session explicitly told "handoff to leader" may create a
-submitted handoff, but that handoff must not affect work counts, readiness,
-dependencies, or attempts.
-
-Only an explicit `work add` invocation may turn a requirement or handoff into
-work. Repository skills must reserve that invocation for the agent responsible
-for admission; Alder itself must not claim to enforce writer roles.
+None becomes work merely by being mentioned or observed. Only an explicit
+`work add` invocation creates work. Repository skills must reserve that
+invocation for the agent responsible for admission; Alder itself must not
+claim to enforce writer roles.
 
 ### A16. World and record disagree
 
@@ -337,29 +330,7 @@ the latest execution summary. Its `<kind> --run` form must show executions,
 validation, normalized output, and bounded stderr without updating observation
 tables.
 
-### A24. Asynchronous handoff
-
-While the driving agent is busy in a long-running turn, run
-`alder handoff add` from a side session.
-
-- its ID must use the repository-scoped form `<prefix>-handoff-<token>` and
-  must not imply a work relationship before integration;
-- submission must complete without waiting for the driving agent;
-- submission must reject priority, dependency, and check fields;
-- the handoff must be durable and visible as `submitted`;
-- restarting or replacing the driving agent must not lose it;
-- `next` and `ready` must ignore it;
-- `alder work add --handoff` must atomically create exactly one work item
-  and link its ID;
-- repeating either append by event ID must not duplicate the handoff or work;
-- the resulting state must be `integrated`, with no intermediate handoff
-  state.
-
-If integration fails validation, the handoff must remain submitted. There
-must be no bare `add` command: `handoff add` and `work add` are distinct
-commands under distinct nouns rather than one command inferring its resource.
-
-### A25. Atomic graph change
+### A24. Atomic graph change
 
 Create one structured change that adds several work items, refers to the new
 items by local name, and rewires several existing dependencies.
@@ -383,7 +354,7 @@ additions atomically but rejects an `edit` section. `work edit --from` must
 require at least one edit, leaving no synonymous command for an additions-only
 document, and must reject a state field such as `block` in the document.
 
-### A26. Structured command output
+### A25. Structured command output
 
 Run representative reads, successful mutations, rejected mutations, and
 diagnostic commands with `--json`.
@@ -403,7 +374,7 @@ diagnostic commands with `--json`.
 Without `--json`, the same commands retain concise human-readable output.
 There is no YAML or TOML output and no generic output-format option in v0.
 
-### A27. Idempotent initialization
+### A26. Idempotent initialization
 
 In an uninitialized project, run:
 
@@ -431,14 +402,14 @@ existing log:
 
 If the manifest is absent but a compatible Alder log already exists, `init`
 may adopt it only after validating its format and prefix. After the first work
-item or handoff exists, changing the prefix is rejected. Editing observer
+item exists, changing the prefix is rejected. Editing observer
 configuration does not append a domain event.
 
 If the shared Git head cannot be read, an ordinary read or mutation fails with
 `store_unavailable`; Alder does not present cached SQLite data as current. A
 failed observation command instead makes only that observer kind `unknown`.
 
-### A28. Crashed pass
+### A27. Crashed pass
 
 Wake the loop, then destroy the engine session without recording a pass end.
 
@@ -455,7 +426,7 @@ Repeat with a pass that outlived its time budget. The honest outcome is
 `timeout`; nothing in Alder decides that threshold, and a driver that ends the
 pass must supply the outcome itself.
 
-### A29. Driver restart mid-pass
+### A28. Driver restart mid-pass
 
 Stop and restart the driver while a pass is open.
 
@@ -467,7 +438,7 @@ Stop and restart the driver while a pass is open.
   may be lost, and losing it must only cause a session restart, never a second
   pass.
 
-### A30. Engine swap while a pass is open
+### A29. Engine swap while a pass is open
 
 Run `alder loop use <other-engine>` while a pass is open.
 
@@ -478,7 +449,7 @@ Run `alder loop use <other-engine>` while a pass is open.
 - the next wake must record the new engine, and the driver must replace the
   session rather than injecting into one running the old engine.
 
-### A31. Rotate and pause interleaving
+### A30. Rotate and pause interleaving
 
 Exercise these in order, checking the fold after each step:
 
@@ -495,7 +466,7 @@ No step may write a flag that a later step must clear. Rotation must remain
 derivable from event order alone, so replaying the log from empty must produce
 the same answer at every point.
 
-### A32. Wake head conflict
+### A31. Wake head conflict
 
 Have two drivers read the same head and attempt `loop wake` concurrently.
 
@@ -509,7 +480,7 @@ Have two drivers read the same head and attempt `loop wake` concurrently.
 The same must hold when one driver wakes while a human is running commands: the
 loop needs no lease, because one open pass is the whole exclusion mechanism.
 
-### A33. Pass end concurrent with an ordinary mutation
+### A32. Pass end concurrent with an ordinary mutation
 
 While a pass is open, have the leader run `pass end` at the same moment another
 writer appends an ordinary mutation such as `work finish`.
@@ -529,7 +500,7 @@ writer appends an ordinary mutation such as `work finish`.
 
 Resolving an unknown push outcome by event ID must not duplicate the pass end.
 
-### A34. Refresh change detection
+### A33. Refresh change detection
 
 Configure an observation command whose metadata moves on every execution — a
 cost ticker, an uptime — while its handles, presence, and attempt bindings stay
@@ -593,7 +564,7 @@ The v0 model may freeze when:
 - every acceptance case has a written replay;
 - the representative week requires no manual state outside Alder;
 - a fresh agent can resume using only `status`, `show`, and reconciliation;
-- no candidate or handoff becomes work without an explicit `work add`;
+- no candidate becomes work without an explicit `work add`;
 - the event vocabulary has no synonym pairs;
 - every durable field is required by at least one acceptance case;
 - deleting any table or command would fail a named case.

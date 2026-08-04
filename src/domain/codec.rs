@@ -92,4 +92,68 @@ mod tests {
             .unwrap();
         assert_eq!(serde_json::to_value(persisted.record).unwrap(), document);
     }
+
+    #[test]
+    fn legacy_handoff_integration_decodes_and_replays_created_work() {
+        let documents = [
+            json!({
+                "id": "legacy-integrate",
+                "seq": 1,
+                "at": "2026-07-27T12:00:00Z",
+                "actor": "tester",
+                "type": "handoff.integrated",
+                "body": {"handoff_id": "hm-handoff-old", "work": {"id": "hm-old", "title": "old", "spec": null, "priority": 0, "requires": [], "checks": []}},
+                "schema": "alder.event.v0"
+            }),
+            json!({
+                "id": "dependent-work",
+                "seq": 2,
+                "at": "2026-07-27T12:00:00Z",
+                "actor": "tester",
+                "type": "work.changed",
+                "body": {"why": null, "operations": [{"op": "add", "work": {"id": "hm-dependent", "title": "dependent", "spec": null, "priority": 0, "requires": ["hm-old"], "checks": []}}]},
+                "schema": "alder.event.v0"
+            }),
+            json!({
+                "id": "legacy-attempt-started",
+                "seq": 3,
+                "at": "2026-07-27T12:00:00Z",
+                "actor": "tester",
+                "type": "attempt.started",
+                "body": {"attempt": {"id": "hm-old-attempt-1", "work_id": "hm-old", "metadata": {}}},
+                "schema": "alder.event.v0"
+            }),
+            json!({
+                "id": "legacy-attempt-updated",
+                "seq": 4,
+                "at": "2026-07-27T12:00:00Z",
+                "actor": "tester",
+                "type": "attempt.updated",
+                "body": {"attempt_id": "hm-old-attempt-1", "metadata": {}, "note": "working", "checks": []},
+                "schema": "alder.event.v0"
+            }),
+            json!({
+                "id": "legacy-work-finished",
+                "seq": 5,
+                "at": "2026-07-27T12:00:00Z",
+                "actor": "tester",
+                "type": "work.finished",
+                "body": {"work_id": "hm-old", "attempt_id": "hm-old-attempt-1", "external": false, "evidence": null},
+                "schema": "alder.event.v0"
+            }),
+        ];
+
+        let events = documents
+            .into_iter()
+            .map(|document| {
+                let record: Record = serde_json::from_value(document).unwrap();
+                decode_record(&record).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let state = crate::domain::ProjectState::fold(&events).unwrap();
+
+        assert_eq!(state.work["hm-old"].state, crate::domain::WorkState::Done);
+        assert!(state.work.contains_key("hm-dependent"));
+        state.validate_graph().unwrap();
+    }
 }

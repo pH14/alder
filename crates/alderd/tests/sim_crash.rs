@@ -430,7 +430,7 @@ fn a_worktree_torn_before_its_admin_entry_still_converges() {
         host.recover(true);
         host.assert_invariant(true);
         // The residue was real, and it took the harness's own sweep to clear
-        // it. Production has no such step; that is handoff `al-handoff-vpzdqw`,
+        // it. Production has no such step; that is work `al-3pph8m` (formerly handoff al-handoff-vpzdqw),
         // and this assertion is what keeps the gap from being papered over by
         // a convergence proof that never had to face it.
         assert!(

@@ -9,7 +9,7 @@ use alder_model::Scenario;
 use alderd::decide::config_for;
 use stateright::{Checker, Expectation, Model};
 
-/// The correct scenarios generate 7, 19, 185, 892, 1,804, and 11,845 total
+/// The correct scenarios generate 7, 19, 185, 892, and 11,845 total
 /// states (including repeats). Stop at the first count beyond that measured
 /// maximum so a mutation that makes the graph unbounded gets a verdict.
 const EXPLORATION_STATE_LIMIT: usize = 11_846;
@@ -91,14 +91,6 @@ fn rotation_under_crashes() -> Scenario {
     }
 }
 
-/// A handoff submission interleaved with the daemon's appends.
-fn cas_writers() -> Scenario {
-    Scenario {
-        phone_handoff: true,
-        ..Scenario::new()
-    }
-}
-
 /// A rotation request racing a phone wake.
 fn rotation_race() -> Scenario {
     Scenario {
@@ -115,7 +107,6 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
         ("lone daemon", lone_daemon()),
         ("codex engine", codex_engine()),
         ("wake race", wake_race()),
-        ("CAS writers", cas_writers()),
         ("rotation race", rotation_race()),
         ("rotation under crashes", rotation_under_crashes()),
     ]
@@ -165,15 +156,6 @@ fn crashes_never_silently_consume_a_rotation() {
     check(rotation_under_crashes(), "rotation under crashes", 8826);
 }
 
-/// Property 3: interleaved writers lose no updates. A handoff submission
-/// races the daemon's pass appends, loses its response once, and retries the
-/// identical draft; the log stays a clean total order holding the update
-/// exactly once.
-#[test]
-fn interleaved_writers_lose_no_updates() {
-    check(cas_writers(), "CAS writers", 659);
-}
-
 /// A deliberate discovery, not a pass/fail property: when a rotation request
 /// races a wake, the wake can consume the request without any restart having
 /// happened. The checker proves the wart is reachable; README.md discusses
@@ -194,14 +176,13 @@ fn a_racing_wake_can_swallow_a_rotation() {
     assert_eq!(states, 1393, "the rotation-race space changed");
 }
 
-/// The eight statements every scenario makes, in the order `properties`
+/// The seven statements every scenario makes, in the order `properties`
 /// builds them.
-const CORE: [&str; 8] = [
+const CORE: [&str; 7] = [
     "every reachable log folds cleanly",
     "at most one pass is ever open",
     "a crashed verdict follows a real crash",
     "rotate_pending mirrors the request log",
-    "an acknowledged handoff is never lost",
     "every terminal state is progressing or blocked-and-named",
     "the rotation ghost tracks the fold",
     "a daemon wake records a configured engine",
@@ -237,15 +218,6 @@ fn each_scenario_registers_exactly_the_properties_its_flags_ask_for() {
         core_and(&[
             "a lost wake race is conceded",
             "a wake append loses the CAS race",
-        ])
-    );
-    assert_eq!(
-        registered(&cas_writers()),
-        core_and(&[
-            "a wake records the log trigger that woke it",
-            SINGLE_WAKER,
-            "a lost response is absorbed idempotently",
-            "a handoff append loses the CAS race and retries",
         ])
     );
     assert_eq!(

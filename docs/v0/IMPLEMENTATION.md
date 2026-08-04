@@ -19,7 +19,7 @@ documents intentionally leave open.
 - Git commit IDs are internal revisions. Stable JSON results expose the
   event-sequence head as an integer and also include the Git revision where it
   is useful for diagnostics.
-- Work and handoff tokens use six lowercase characters drawn from a ULID.
+- Work tokens use six lowercase characters drawn from a ULID.
   Event envelopes retain the complete uppercase ULID. Attempts and questions
   use the specified never-reused per-work ordinal.
 - The SQLite projection stores normalized durable base tables and defines the

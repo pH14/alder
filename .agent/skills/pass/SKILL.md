@@ -75,7 +75,7 @@ flag without its own operator ruling.
 ## The pass
 
 1. **Sync.** `alder status --json` reads as an index: the loop line plus a
-   count for `attention`, `handoffs`, `in_flight`, `ready`,
+   count for `attention`, `in_flight`, `ready`,
    `waiting_on_human`, and `blocked`. Any nonzero count obligates fetching
    that section — `alder status --section <name>` (repeatable for several,
    in canonical order), or `--full` for all — before this pass may end.
@@ -155,9 +155,9 @@ flag without its own operator ruling.
    in flight until the helper reports one delivery; the next pass observes
    the later `attempt.updated`. An unconfirmed send is not an invitation to
    replay it.
-6. **Drain handoffs.** Admit each coherent submitted handoff
-   (`alder work add --handoff <id>` with real priority/checks). Workers
-   cannot admit work; you are the only gate.
+6. **Triage ordinary work.** Raw ideas are ordinary work items. Derive any
+   structured follow-ups before finishing the source item. Workers cannot
+   admit work; you are the only gate.
 7. **Dispatch.** While fewer than 2 workers are live, take the top item from
    `alder next`, then: `alderd spawn <id> [tier]`. That one command records
    the attempt, cuts the worktree and branch, and launches the worker on its

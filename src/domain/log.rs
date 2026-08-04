@@ -9,9 +9,8 @@ use alder_log::{AppendReceipt, Log, LogError};
 
 use super::{
     AttemptDefinition, AttemptOutcome, CheckUpdate, Event, EventDraft, EventPayload,
-    GraphChangeDocument, HandoffDefinition, Head, PassDefinition, PassOutcome, PassTrigger,
-    PreparedChange, ProjectState, QuestionDefinition, WorkDefinition, WorkOperation, WorkState,
-    WorkStateChange,
+    GraphChangeDocument, Head, PassDefinition, PassOutcome, PassTrigger, PreparedChange,
+    ProjectState, QuestionDefinition, WorkDefinition, WorkOperation, WorkState, WorkStateChange,
 };
 
 const ID_ALLOCATION_ATTEMPTS: usize = 16;
@@ -148,100 +147,6 @@ impl<S: Log> ProjectLog<S> {
             },
         )?;
         Ok((result, id))
-    }
-
-    pub fn integrate_handoff(
-        &self,
-        handoff_id: &str,
-        title: Option<String>,
-        spec: Option<String>,
-        priority: i64,
-        requires: Vec<String>,
-        checks: Vec<super::CheckDefinition>,
-    ) -> Result<(AppendResult, String)> {
-        let snapshot = self.snapshot()?;
-        let handoff = snapshot
-            .state
-            .handoffs
-            .get(handoff_id)
-            .ok_or_else(|| AlderError::not_found("handoff", handoff_id))?;
-        let id = self.new_work_id(&snapshot.state)?;
-        let work = WorkDefinition {
-            id: id.clone(),
-            title: title.unwrap_or_else(|| handoff.title.clone()),
-            spec: spec.or_else(|| Some(handoff.artifact_ref.clone())),
-            priority,
-            requires,
-            checks,
-        };
-        let result = self.append_payload(
-            &snapshot,
-            EventPayload::HandoffIntegrated {
-                handoff_id: handoff_id.to_owned(),
-                work,
-            },
-        )?;
-        Ok((result, id))
-    }
-
-    pub fn withdraw_handoff(&self, handoff_id: &str, why: String) -> Result<AppendResult> {
-        let snapshot = self.snapshot()?;
-        self.append_payload(
-            &snapshot,
-            EventPayload::HandoffWithdrawn {
-                handoff_id: handoff_id.to_owned(),
-                why,
-            },
-        )
-    }
-
-    pub fn add_handoff(
-        &self,
-        title: String,
-        artifact_ref: String,
-        note: Option<String>,
-    ) -> Result<(AppendResult, String)> {
-        let initial = self.snapshot()?;
-        let id = self.new_handoff_id(&initial.state)?;
-        let draft = self.draft(EventPayload::HandoffSubmitted {
-            handoff: HandoffDefinition {
-                id: id.clone(),
-                title,
-                artifact_ref,
-                note,
-            },
-        });
-        let mut snapshot = initial;
-        for _ in 0..16 {
-            let candidate = draft.materialize(snapshot.head.sequence().saturating_add(1));
-            let mut state = snapshot.state.clone();
-            state.apply(&candidate)?;
-            match self
-                .store
-                .append(&snapshot.head, &super::encode_draft(&draft)?)
-            {
-                Ok(result) => return Ok((append_result(result)?, id)),
-                Err(LogError::HeadConflict { .. }) => {
-                    snapshot = self.snapshot()?;
-                    if let Some(event) = snapshot.events.iter().find(|event| event.id == draft.id) {
-                        return Ok((
-                            AppendResult {
-                                head: snapshot.head,
-                                event: event.clone(),
-                            },
-                            id,
-                        ));
-                    }
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(AlderError::with_context(
-            "head_conflict",
-            "nothing was appended: handoff submission could not settle after repeated \
-             concurrent appends; reread and run the command again",
-            json!({"appended": false, "event": "handoff.submitted", "handoff_id": id}),
-        ))
     }
 
     pub fn start(
@@ -565,10 +470,6 @@ impl<S: Log> ProjectLog<S> {
         self.append_payload(&snapshot, EventPayload::LoopNudgeRequested { why })
     }
 
-    fn draft(&self, payload: EventPayload) -> EventDraft {
-        self.draft_at(Utc::now(), payload)
-    }
-
     fn draft_at(&self, at: DateTime<Utc>, payload: EventPayload) -> EventDraft {
         EventDraft {
             id: Ulid::new().to_string(),
@@ -588,17 +489,6 @@ impl<S: Log> ProjectLog<S> {
             }
         }
         Err(id_allocation_error("work"))
-    }
-
-    fn new_handoff_id(&self, state: &ProjectState) -> Result<String> {
-        for _ in 0..ID_ALLOCATION_ATTEMPTS {
-            let token = random_token();
-            let id = format!("{}-handoff-{token}", self.prefix);
-            if !state.handoffs.contains_key(&id) {
-                return Ok(id);
-            }
-        }
-        Err(id_allocation_error("handoff"))
     }
 
     pub fn allocate_change(
@@ -628,7 +518,7 @@ impl<S: Log> ProjectLog<S> {
 
 /// Name the event a losing writer did not append.
 ///
-/// Every mutation but `add_handoff` reaches the store through one call, so
+/// Every mutation reaches the store through one call, so
 /// this is the single place a lost compare-and-append is described — and it
 /// describes the command's effect, not the log's. Retrying here is deliberately
 /// not an option: the draft was validated against one projection and
@@ -683,37 +573,20 @@ mod tests {
         AppendReceipt, Log as Store, LogError, MemoryLog as MemoryStore, Record, RecordDraft,
     };
 
-    #[derive(Debug, Clone, Copy)]
-    enum ConflictBehavior {
-        Once,
-        CommitThenReport,
-        Always,
-        OtherError,
-        /// Append normally until armed, then lose every compare-and-append.
-        /// This is how a fixture gets built and then raced.
-        WhenArmed,
-    }
-
     #[derive(Debug)]
     struct ConflictStore {
         inner: MemoryStore,
-        behavior: ConflictBehavior,
         append_calls: Mutex<usize>,
         armed: Mutex<bool>,
     }
 
     impl ConflictStore {
-        fn new(behavior: ConflictBehavior) -> Self {
+        fn new() -> Self {
             Self {
                 inner: MemoryStore::new(),
-                behavior,
                 append_calls: Mutex::new(0),
                 armed: Mutex::new(false),
             }
-        }
-
-        fn calls(&self) -> usize {
-            *self.append_calls.lock().unwrap()
         }
 
         fn arm(&self, armed: bool) {
@@ -744,22 +617,12 @@ mod tests {
         ) -> std::result::Result<AppendReceipt, LogError> {
             let mut calls = self.append_calls.lock().unwrap();
             *calls += 1;
-            let call = *calls;
             drop(calls);
             let armed = *self.armed.lock().unwrap();
-            match (self.behavior, call) {
-                (ConflictBehavior::WhenArmed, _) if armed => Err(Self::conflict()),
-                (ConflictBehavior::WhenArmed, _) => self.inner.append(expected, draft),
-                (ConflictBehavior::Once, 1) => Err(Self::conflict()),
-                (ConflictBehavior::CommitThenReport, 1) => {
-                    self.inner.append(expected, draft)?;
-                    Err(Self::conflict())
-                }
-                (ConflictBehavior::Always, _) => Err(Self::conflict()),
-                (ConflictBehavior::OtherError, _) => Err(LogError::Unavailable {
-                    message: "simulated outage".to_owned(),
-                }),
-                _ => self.inner.append(expected, draft),
+            if armed {
+                Err(Self::conflict())
+            } else {
+                self.inner.append(expected, draft)
             }
         }
     }
@@ -966,131 +829,6 @@ mod tests {
     }
 
     #[test]
-    fn handoff_submission_retries_only_head_conflicts_and_recovers_ambiguity() {
-        let retry = ProjectLog::new(
-            ConflictStore::new(ConflictBehavior::Once),
-            "hm",
-            "side-channel",
-        );
-        let (result, id) = retry
-            .add_handoff(
-                "candidate".to_owned(),
-                "branch:topic".to_owned(),
-                Some("ready".to_owned()),
-            )
-            .unwrap();
-        assert_eq!(retry.store().calls(), 2);
-        assert_eq!(result.head.sequence(), 1);
-        assert!(id.starts_with("hm-handoff-"));
-        assert_eq!(id.len(), "hm-handoff-".len() + 6);
-        assert_eq!(result.event.actor, "side-channel");
-        assert_eq!(result.event.schema, "alder.event.v0");
-
-        let ambiguous = ProjectLog::new(
-            ConflictStore::new(ConflictBehavior::CommitThenReport),
-            "hm",
-            "side-channel",
-        );
-        let (result, id) = ambiguous
-            .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
-            .unwrap();
-        assert_eq!(ambiguous.store().calls(), 1);
-        assert_eq!(result.event.id, ambiguous.snapshot().unwrap().events[0].id);
-        assert_eq!(
-            ambiguous.snapshot().unwrap().state.handoffs[&id].artifact_ref,
-            "branch:topic"
-        );
-
-        let unavailable = ProjectLog::new(
-            ConflictStore::new(ConflictBehavior::OtherError),
-            "hm",
-            "side-channel",
-        );
-        assert_eq!(
-            unavailable
-                .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
-                .unwrap_err()
-                .code,
-            "store_unavailable"
-        );
-
-        let exhausted = ProjectLog::new(
-            ConflictStore::new(ConflictBehavior::Always),
-            "hm",
-            "side-channel",
-        );
-        let error = exhausted
-            .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
-            .unwrap_err();
-        assert_eq!(error.code, "head_conflict");
-        assert_eq!(exhausted.store().calls(), 16);
-    }
-
-    #[test]
-    fn integration_uses_handoff_defaults_and_is_single_use() {
-        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
-        let (_, handoff) = log
-            .add_handoff(
-                "candidate".to_owned(),
-                "branch:topic".to_owned(),
-                Some("ready".to_owned()),
-            )
-            .unwrap();
-        let (_, work) = log
-            .integrate_handoff(&handoff, None, None, 7, vec![], vec![])
-            .unwrap();
-        let snapshot = log.snapshot().unwrap();
-        assert_eq!(snapshot.state.work[&work].title, "candidate");
-        assert_eq!(
-            snapshot.state.work[&work].spec.as_deref(),
-            Some("branch:topic")
-        );
-        assert_eq!(snapshot.state.work[&work].priority, 7);
-
-        let error = log
-            .integrate_handoff(
-                &handoff,
-                Some("replacement".to_owned()),
-                Some("new spec".to_owned()),
-                0,
-                vec![],
-                vec![],
-            )
-            .unwrap_err();
-        assert_eq!(error.code, "invalid_transition");
-    }
-
-    #[test]
-    fn withdrawing_a_handoff_retires_it_and_frees_nothing_to_integrate() {
-        let log = ProjectLog::new(MemoryStore::new(), "hm", "test");
-        let (_, handoff) = log
-            .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
-            .unwrap();
-
-        let result = log
-            .withdraw_handoff(&handoff, "superseded by a follow-up".to_owned())
-            .unwrap();
-        let snapshot = log.snapshot().unwrap();
-        assert_eq!(
-            snapshot.state.handoffs[&handoff].state,
-            crate::domain::HandoffState::Withdrawn
-        );
-        assert_eq!(result.event.payload.type_name(), "handoff.withdrawn");
-
-        // Rejection: an already-withdrawn handoff cannot be integrated.
-        let error = log
-            .integrate_handoff(&handoff, None, None, 0, vec![], vec![])
-            .unwrap_err();
-        assert_eq!(error.code, "invalid_transition");
-
-        // Rejection: an already-withdrawn handoff cannot be withdrawn again.
-        let error = log
-            .withdraw_handoff(&handoff, "again".to_owned())
-            .unwrap_err();
-        assert_eq!(error.code, "invalid_transition");
-    }
-
-    #[test]
     fn passes_take_serial_ordinals_and_carry_the_head_they_saw() {
         let log = ProjectLog::new(MemoryStore::new(), "hm", "alderd");
         log.add_work("work".to_owned(), None, 0, vec![], vec![])
@@ -1209,10 +947,7 @@ mod tests {
     /// Every event a mutation can append, so the sweep below can prove it
     /// reached all of them. `EventPayload::type_name` is the compiler-checked
     /// list; this is the copy the sweep is measured against.
-    const EVERY_EVENT: [&str; 20] = [
-        "handoff.submitted",
-        "handoff.integrated",
-        "handoff.withdrawn",
+    const EVERY_EVENT: [&str; 17] = [
         "work.changed",
         "work.finished",
         "work.dropped",
@@ -1237,11 +972,7 @@ mod tests {
     /// to lose the same way: nothing appended, said so first, and named.
     #[test]
     fn every_mutation_that_loses_the_race_says_it_appended_nothing() {
-        let log = ProjectLog::new(
-            ConflictStore::new(ConflictBehavior::WhenArmed),
-            "hm",
-            "leader",
-        );
+        let log = ProjectLog::new(ConflictStore::new(), "hm", "leader");
         // A fixture rich enough that every mutation gets past its own
         // preconditions and fails only on the append.
         let add = |title: &str| {
@@ -1258,9 +989,6 @@ mod tests {
         log.finish(&finished, Some(done_attempt), false, None)
             .unwrap();
         let (_, question) = log.ask(&asked, "which path?".to_owned()).unwrap();
-        let (_, handoff) = log
-            .add_handoff("candidate".to_owned(), "branch:topic".to_owned(), None)
-            .unwrap();
         let settled = log.snapshot().unwrap();
         let addition = GraphChangeDocument {
             why: Some("replan".to_owned()),
@@ -1293,17 +1021,6 @@ mod tests {
                         },
                     )
                 }),
-            ),
-            (
-                "handoff.integrated",
-                Box::new(|| {
-                    log.integrate_handoff(&handoff, None, None, 0, vec![], vec![])
-                        .map(|(result, _)| result)
-                }),
-            ),
-            (
-                "handoff.withdrawn",
-                Box::new(|| log.withdraw_handoff(&handoff, "raced".to_owned())),
             ),
             (
                 "attempt.started",
@@ -1417,17 +1134,6 @@ mod tests {
         assert_eq!(error.context["event"], json!("pass.ended"));
         covered.insert("pass.ended");
 
-        // `handoff add` is the one mutation allowed to reconsider on its own,
-        // because its submission is inert and uniquely identified. It still
-        // has to fail loudly once it has exhausted that, and it still may not
-        // report an append it did not make.
-        let error = log
-            .add_handoff("raced".to_owned(), "branch:raced".to_owned(), None)
-            .unwrap_err();
-        assert_eq!(error.code, "head_conflict");
-        assert_eq!(error.context["appended"], json!(false));
-        covered.insert("handoff.submitted");
-
         assert_eq!(
             covered,
             EVERY_EVENT.into_iter().collect::<BTreeSet<_>>(),
@@ -1446,10 +1152,6 @@ mod tests {
         assert_eq!(after.state.work[&finished].state, WorkState::Done);
         assert!(after.state.attempts[&attempt].outcome.is_none());
         assert!(after.state.questions[&question].answer.is_none());
-        assert_eq!(
-            after.state.handoffs[&handoff].state,
-            crate::domain::HandoffState::Submitted
-        );
     }
 
     #[test]

@@ -14,8 +14,8 @@ at any time. Observations of external systems are refreshed into separate
 local tables and never masquerade as log facts.
 
 The model: work items with dependencies and acceptance checks, attempts at
-that work, questions that park work on a human decision, and handoffs
-submitted from outside. Human-readable output is the default; every command
+that work and questions that park work on a human decision. Human-readable
+output is the default; every command
 also takes `--json`, the stable agent-facing surface.
 
 ## A worked session

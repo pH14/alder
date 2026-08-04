@@ -33,17 +33,17 @@ transcript never requires checking which flags an `edit` carried.
 
 The complete surface:
 
-| Global | Work | Attempt | Question | Handoff | Loop | Pass |
-| --- | --- | --- | --- | --- | --- | --- |
-| `init` | `add` | `edit` | `answer` | `add` | `wake` | `end` |
-| `status` | `edit` | `end` | | `withdraw` | `pause` | |
-| `next` | `start` | | | | `resume` | |
-| `show` | `finish` | | | | `use` | |
-| `refresh` | `drop` | | | | `rotate` | |
-| `reconcile` | `reopen` | | | | `nudge` | |
-| `debug` | `block` | | | | | |
-| | `unblock` | | | | | |
-| | `ask` | | | | | |
+| Global | Work | Attempt | Question | Loop | Pass |
+| --- | --- | --- | --- | --- | --- |
+| `init` | `add` | `edit` | `answer` | `wake` | `end` |
+| `status` | `edit` | `end` | | `pause` | |
+| `next` | `start` | | | `resume` | |
+| `show` | `finish` | | | `use` | |
+| `refresh` | `drop` | | | `rotate` | |
+| `reconcile` | `reopen` | | | `nudge` | |
+| `debug` | `block` | | | | |
+| | `unblock` | | | | |
+| | `ask` | | | | |
 
 ## Output
 
@@ -79,8 +79,8 @@ Examples below illustrate intent; detailed JSON schemas remain to be frozen by
 paper replay.
 
 The examples assume the repository prefix `hm`. Work IDs use that prefix;
-attempt and question IDs extend their work ID, while handoff and pass IDs
-extend only the repository prefix because they belong to no work item.
+attempt and question IDs extend their work ID, while pass IDs extend only the
+repository prefix because they belong to the singleton loop.
 
 ## Initialization
 
@@ -109,7 +109,7 @@ Alder log, `init` may create the manifest and adopt it. A conflicting prefix,
 remote, ref, schema, malformed manifest, or incompatible existing log changes
 nothing and returns `config_conflict`.
 
-The prefix becomes immutable after the first work item or handoff is appended.
+The prefix becomes immutable after the first work item is appended.
 Changing observer entries does not append an event. `init` also supports
 `--json`.
 
@@ -138,8 +138,7 @@ standard Git transport and requires no GitHub API integration.
 
 The expected head is not a public command argument. V0 has no `--if-head`
 option. A change already present when the command begins is part of the state
-against which the command is validated. `handoff add` alone may automatically
-retry after a conflict because its uniquely identified submission is inert.
+against which the command is validated.
 
 Every ordinary named read and mutation first establishes the current shared
 head. If that fails, the command returns `store_unavailable`; it does not
@@ -150,7 +149,7 @@ present the local projection as current.
 ### `alder status [--with <changes>] [--full] [--section <name> ...]`
 
 The default output is an index, not a report: the loop line plus a count for
-each of six sections. A drained log — nothing anywhere — costs a few dozen
+each of five sections. A drained log — nothing anywhere — costs a few dozen
 tokens instead of the full pack's few thousand:
 
 ```text
@@ -163,20 +162,19 @@ loop
 
 counts
   attention  2
-  handoffs   1
   in flight  1
   ready      2
   waiting on human  1
   blocked    0
 ```
 
-The six counted sections are `attention`, `handoffs`, `in_flight`, `ready`,
+The five counted sections are `attention`, `in_flight`, `ready`,
 `waiting_on_human`, and `blocked`. In `--json` they sit under a `counts`
 object at the top level, present on every call regardless of `--full` or
 `--section`:
 
 ```json
-{"counts": {"attention": 2, "handoffs": 1, "in_flight": 1, "ready": 2, "waiting_on_human": 1, "blocked": 0}, ...}
+{"counts": {"attention": 2, "in_flight": 1, "ready": 2, "waiting_on_human": 1, "blocked": 0}, ...}
 ```
 
 Counts are full current state, just summarized — level-triggered like the
@@ -184,7 +182,7 @@ rest of Alder, never a delta. A nonzero count is not itself the detail; a
 caller that needs to act on one still fetches the section before treating the
 pass as done.
 
-`--section <name>` expands exactly one of the six sections back to its full
+`--section <name>` expands exactly one of the five sections back to its full
 list, alongside the counts:
 
 ```text
@@ -197,7 +195,6 @@ loop
 
 counts
   attention  2
-  handoffs   1
   in flight  1
   ready      2
   waiting on human  1
@@ -209,13 +206,13 @@ attention
 ```
 
 In `--json`, that adds a matching top-level key — here, `attention` — holding
-the array. The other five section keys stay absent. Repeat `--section` to add
+the array. The other four section keys stay absent. Repeat `--section` to add
 several keys at once; they are rendered in canonical order and duplicate names
 are ignored.
 
 `--full` expands every section, matching today's full pack, and is the only
 way to see `recent_events` — the last ten log entries, dropped from the
-default pack entirely because the six sections already fold events into
+default pack entirely because the five sections already fold events into
 state. If combined with `--section`, `--full` wins.
 
 `status` shows observation times and command failures. Alder does not derive a
@@ -231,7 +228,7 @@ work returns them to the list. The `--json` `questions` array, always present
 regardless of `--full` or `--section`, carries every question with a derived
 `stranded` field.
 
-The `loop` section is not one of the six counted sections and is never
+The `loop` section is not one of the five counted sections and is never
 gated: it reports the loop's desired state and its two interesting passes —
 whether it is paused and why, the desired engine, whether a rotation is
 pending, the open pass, and the last ended pass with its outcome, the first
@@ -286,75 +283,9 @@ head. `--with` also composes with `--json`.
 
 ### `alder show <id>`
 
-Show current state and compact history for a handoff, work item, attempt,
-question, or pass. `show` is global because a reader with an ID in hand should
+Show current state and compact history for a work item, attempt, question, or
+pass. `show` is global because a reader with an ID in hand should
 not have to know which kind it is.
-
-## Handoffs
-
-### `alder handoff add`
-
-Submit an asynchronous handoff without waiting for the driving agent:
-
-```text
-$ alder handoff add \
-    --title "Frame index v2" \
-    --ref specs/frame-index-v2.md \
-    --note "Scoped in the side session; integrate behind hm-9a1"
-hm-handoff-f27  submitted
-```
-
-Submission changes no work or dependency state. The command completes once the
-handoff is durably appended; the driving agent may be busy.
-
-Repository-tuned handoff skills should call this only after an explicit human
-request such as "handoff to leader." Even if an agent submits one
-unexpectedly, it cannot become actionable work without an explicit
-`work add --handoff`.
-
-`handoff add` does not accept work-shaping fields such as priority,
-dependencies, or checks. Those are admission decisions made if the handoff is
-admitted. The handoff's note may convey urgency or other context without
-affecting scheduling.
-
-Submitted handoffs appear in `alder status`; `alder show <handoff>` provides
-their detail.
-
-### `alder work add --handoff <handoff>`
-
-A writer admits the handoff. The noun is `work` because the command creates
-work; `--handoff` names its source.
-
-```text
-$ alder work add --handoff hm-handoff-f27 \
-    --priority 70 \
-    --requires hm-9a1 \
-    --check report:"findings documented"
-hm-a22  integrated from hm-handoff-f27
-```
-
-The handoff's title and reference become the defaults for the new work.
-Integration atomically creates the work and changes the handoff from
-`submitted` to `integrated`. Failed validation changes nothing.
-
-### `alder handoff withdraw <handoff> --why <reason>`
-
-Retire a submitted handoff without admitting it:
-
-```text
-$ alder handoff withdraw hm-handoff-f27 --why "superseded by hm-handoff-f31"
-hm-handoff-f27  withdrawn
-```
-
-Withdrawal is the noun-preserving verb: it never becomes a `work` command
-because it does not create work. `--why` is required, mirroring `work drop`
-and `work reopen`.
-
-Only a `submitted` handoff can be withdrawn; an already-`integrated` or
-already-`withdrawn` handoff rejects with `invalid_transition`. Withdrawal is
-terminal in v0 — there is no un-withdraw — and a withdrawn handoff remains
-visible through `show` but drops out of `status`'s handoff inbox the same way
-an integrated one does.
 
 ## Admission and editing
 
@@ -375,9 +306,8 @@ Running `work add` is the admission decision. There is no `propose` command in
 v0.
 
 Alder does not authorize one writer over another. Repository skills should
-reserve `work add` for the agent responsible for admission and direct workers
-and side sessions to `handoff add`. This is workflow policy rather than a
-durable Alder role.
+reserve `work add` for the agent responsible for admission. This is workflow
+policy rather than a durable Alder role.
 
 To admit several related items atomically:
 
@@ -729,7 +659,7 @@ the open pass; with no open pass the command returns `no_open_pass`.
 
 ```text
 $ alder pass end --outcome ok \
-    --report "Integrated hm-handoff-f27; started hm-9a1; ARM lane still blocked." \
+    --report "Added follow-up work; started hm-9a1; ARM lane still blocked." \
     --wake 20m
 hm-pass-19  ended ok
 ```
@@ -931,7 +861,6 @@ All forms support `--json`.
 ```text
 $ alder status
 $ alder reconcile
-# Status includes submitted handoffs; admit them before selecting more work.
 $ alder next
 $ alder work start hm-9a1 --meta engine=opus-5 --meta requested_host=box-a
 hm-9a1-attempt-1
