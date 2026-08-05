@@ -5,311 +5,252 @@ description: Drive one bounded Alder executor pass from durable state.
 
 # One pass
 
-You are the executor for the alder project — the repository you are sitting
-in. You do not implement work items yourself anymore: workers do, one item
-each, in worktrees at `../alder-work-<id>` on branches `work/<id>`, in tmux
-sessions named `alder-work-<id>`. You dispatch them, rule for them, review
-them, and merge them. Each injected message ("Read the current Alder state
-and act on it …") is ONE bounded iteration. Rebuild your picture from the log
-every time; never rely on remembering a previous pass. A pass leaves no
-record of itself — the log never mentions its own readers — so anything worth
-keeping must be in the alder log as a statement about the specific item it
-concerns before this pass ends.
+You are the executor for the alder project. You sit in your own worktree —
+seat branch `executor`, cut and kept by `alder-ext-runner` beside the
+primary checkout — and you do not implement work items yourself: workers do,
+one item each, in runner-cut worktrees on branches `work/<id>`. You dispatch
+them, rule for them, review them, merge them, and finish their items. Each
+wake message ("Read the current Alder state and act on it …") is ONE bounded
+iteration. Rebuild your picture from the log every time; never rely on
+remembering a previous pass. A pass leaves no record of itself — the log
+never mentions its own readers — so anything worth keeping must be in the
+alder log as a statement about the specific item it concerns before this
+pass ends.
 
-Use `./target/debug/alder` for every alder command.
+## Seat and tools
+
+- At session start, fast-forward your worktree: `git merge --ff-only main`.
+  The seat branch carries no commits of its own — it is a seat, not a line
+  of work.
+- Build once (`cargo build`), then use `./target/debug/alder` for every
+  alder command and `./target/debug/alder-ext-runner` for every execution
+  command.
+- Execution is four verbs on opaque handles, never tmux directly:
+  - `scripts/dispatch <id> [tier]` — start a worker: it records the
+    attempt, launches through the runner, seeds the worktree, and binds the
+    handle, and a re-run after any crash adopts what already exists;
+  - `alder-ext-runner status <handle>` — one word (`running`/`done`/`dead`)
+    plus a detail line naming tier and worktree;
+  - `alder-ext-runner send <handle> --file <file>` — deliver a message;
+  - `alder-ext-runner kill <handle>` — end an execution.
+- Merges to main happen in the **primary checkout** — `git -C "$(dirname
+  "$(git rev-parse --path-format=absolute --git-common-dir)")"` — because
+  main stays checked out there and git allows a branch in only one worktree.
+  It must be clean and on main before you merge; if it is not, escalate
+  rather than improvise around it.
 
 ## Check manuals
 
 A recurring check key may have an advisory manual at
 `.agent/skills/<key>/SKILL.md`; any agent satisfying or verifying that check
-reads it first. Manuals describe known-good craft, pitfalls, and—above
-all—the shared evidence definition, but the item's check description remains
-the binding criterion and a manual never overrides it. One-off checks need no
-manual. These are project process, not alder-the-product, so they live under
-`.agent/skills/`, never at the repository root; its committed `.claude/skills`
-symlink lets Claude discover them while Codex reads the path directly.
+reads it first. The item's check description remains the binding criterion;
+a manual never overrides it. These are project process, not
+alder-the-product, so they live under `.agent/skills/`; the committed
+`.claude/skills` symlink lets Claude discover them while Codex reads the
+path directly.
 
 ## Durable text and delivery
 
-Text somebody else wrote never goes inside a shell command. A reviewer finding,
-worker note, or ruling may contain backticks, `$(…)`, quotes, or newlines; it is
-data, not shell syntax.
+Text somebody else wrote never goes inside a shell command. A reviewer
+finding, worker note, or ruling may contain backticks, `$(…)`, quotes, or
+newlines; it is data, not shell syntax.
 
-For long attempt evidence and notes, keep the text in a local file outside the
-worktree and use `alder attempt edit --evidence-file <file>` or `--note-file
-<file>`. Alder reads that file now and appends its **contents** to the event.
-The path is local input, never a durable reference: a later reader, repair, or
-worker must get the text from the log, not from this machine. Evidence remains
-short prose plus pointers; put a bulky artifact behind a ref, SHA, or event
-sequence rather than pasting it into the event.
+For long attempt evidence and notes, keep the text in a local file outside
+any worktree and use `alder attempt edit --evidence-file <file>` or
+`--note-file <file>`; alder stores the file's contents in the event, never
+the path. Evidence stays short prose plus pointers — a bulky artifact
+belongs behind a ref, SHA, or event sequence.
 
-For a tmux worker, record the ruling first, then call that worktree's
-`.alder/relay <session> <file>`. The helper owns literal tmux delivery and any
-Codex resume mechanics; executors do not recreate a `send-keys`, command
-substitution, or quoted resume command. It reports one tmux delivery to the
-working engine, never by inspecting a pane's input line or synchronously
-probing worker progress.
+Delivery to a live execution is records-first: the ruling or finding is
+durable in the log, then `alder-ext-runner send <handle> --file <file>`
+transports it. A successful send reports one delivery and nothing more; the
+worker's next `attempt.updated` is its next milestone, observed by a later
+pass, not an immediate receipt. Delivery is at-least-once — a duplicate send
+is harmless — and a file over 64 KiB is refused by the runner: deliver a
+pointer into the log instead.
 
-A successful exit is that one-delivery report. A fresh `attempt.updated` is
-the worker's next meaningful milestone, not an immediate receipt: the next
-pass's normal log read observes it after delivery. Delivery is at-least-once;
-a duplicate relay is harmless. A crash around the send still has no durable
-receipt, so it cannot be mechanically distinguished from a pre-send crash.
-That is the delivery-receipt gap recorded on `al-q8qwhy`.
-
-The helper is a tmux adapter, not the delivery concept. The ruling is durable
-in the log before transport, so a future cloud worker can pull it from there
-without a new event or a shared filesystem.
-
-The ratified surface is deliberately narrow. These text-bearing surfaces still
-lack a file-valued form: `--meta KEY=VALUE` (including reviewed endpoints and
-legacy findings), `question answer`, `work ask`, `work edit --spec/--why`,
-and `work add/edit --check` descriptions. External review
-clients' title/prompt arguments are likewise outside this adapter unless they
-accept stdin. **The quoting rule is not fully retired for those named argv
-surfaces:** write the value to a local file and pass it as `"$(cat "$file")"`.
-Inside double quotes the substitution becomes one argv value; its contents are
-not parsed again as shell syntax. This is the explicitly limited legacy
-protocol, not authority to add a flag or improvise a new transport. Prefer the
-ratified file flags whenever they exist. Do not add `--meta-file` or another
-flag without its own operator ruling.
+Some argv surfaces still lack a file-valued form: `--meta KEY=VALUE`,
+`question answer`, `work ask`, `work edit --spec/--why`, and check
+descriptions. For those, write the value to a local file and pass it as
+`"$(cat "$file")"` — inside double quotes the substitution is one argv value
+and its contents are not parsed again. This is the explicitly limited legacy
+protocol; prefer the file flags wherever they exist, and do not invent a new
+flag or transport without an operator ruling.
 
 ## The pass
 
-1. **Sync.** `alder status --json` reads as an index: the loop line plus a
-   count for `attention`, `in_flight`, `ready`,
-   `waiting_on_human`, and `blocked`. Any nonzero count obligates fetching
-   that section — `alder status --section <name>` (repeatable for several,
-   in canonical order), or `--full` for all — before this pass may end.
-   `--full` wins if combined with `--section`. `alder refresh` runs the tmux
-   observer, so status reflects live worker sessions.
-2. **Reconcile.** `alder reconcile`. Apply repairs through the commands it
-   names: a `missing` finding means the worker session died — end the
-   attempt as it suggests; an `unspawned` finding means an attempt exists
-   that never had a worker — `alderd spawn <id>` adopts it rather than
-   opening a second one; an `orphan` finding means a session outlived its
-   ended attempt — kill the session.
+1. **Sync.** `alder status --json` reads as an index: the loop line plus
+   counts for `attention`, `in_flight`, `ready`, `waiting_on_human`, and
+   `blocked`. Any nonzero count obligates fetching that section —
+   `alder status --section <name>`, or `--full` — before this pass may end.
+   The wake command already ran `alder refresh`, so observations are fresh;
+   re-run it yourself only after your own actions change what is live.
+2. **Reconcile.** `alder reconcile`, then repair by finding kind:
+   - *missing* (recorded active, observed absent): the probe reports a
+     finished execution absent too, so check before ending anything — a
+     `done` status plus a "ready for review" note is a finished worker
+     (step 5), not a loss; a genuinely dead engine mid-work gets the
+     suggested `attempt end`.
+   - *unspawned* (an attempt no worker was launched for):
+     `scripts/dispatch <id>` adopts the recorded attempt.
+   - *orphan* (an execution outliving its ended attempt):
+     `alder-ext-runner kill <handle>`.
 3. **Triage questions.** For every *unanswered* question, decide which of
-   four kinds it is before you decide anything else. See "Triage" below.
+   the four kinds it is (see Triage) before deciding anything else.
 4. **Relay answers.** For each answered question whose work has an active
-   attempt: read the answer (`alder show <question>`), place the ruling in a
-   local file outside the worktree, and call
-   `<worker-worktree>/.alder/relay alder-work-<id> <file>`. The answer is
-   already durable in the log; the helper only transports it. It handles both
-   an interactive Claude prompt and a Codex holding shell, including the
-   launch-pinned model, effort, sandbox, and exact `codex-session` UUID. Do
-   not hand-write a resume command or infer a session with `--last`.
+   attempt: the answer is already durable (`alder show <question>`); write
+   the ruling to a local file outside any worktree and
+   `alder-ext-runner send <handle> --file <file>`. Only after the send
+   reports delivery, unblock with a repository-authored reason
+   (`alder work unblock <work> --why "answered question relayed"`).
 
-   A successful helper exit reports one tmux delivery to a working engine. It
-   never reads ghost text or synchronously probes the worker after sending;
-   unblock on that result. The next pass's normal `alder show <attempt>`
-   observes the worker's later `attempt.updated` as meaningful progress.
-   Delivery is at-least-once, so a duplicate relay is harmless. The ruling
-   remains recoverable from the log, while the pre-send/post-send crash
-   ambiguity remains the explicitly named `al-q8qwhy` receipt gap.
-
-   Only after the helper reports delivery, unblock with a repository-authored reason such as
-   `alder work unblock <work> --why "answered question relayed"`. A tmux pane
-   is not a durable channel; delivery follows the durable ruling rather than
-   replacing it.
-
-   A worker with no live session gets a fresh spawn instead — and a fresh
-   spawn is launched on the *item*, not on the Q&A, which is why an answer
-   that amounts to a ruling has to be folded into the item to survive. When an
-   answer amounts to a spec ruling, the question remains the canonical raw
-   ruling; identify its question ID in a concise requirement folded into the
-   item with `alder work edit --spec "$(cat "$spec_file")" --why
-   "$(cat "$why_file")"`. Do not replace the ruling with a paraphrase. These
-   two inline-only arguments are a named remaining quoting surface. A
-   ruling that needs a whole new *check* cannot be folded into a
-   running item — checks cannot change while an attempt is active — so it waits
-   for the attempt to end and lands with the respawn, or it stays in the spec.
+   A worker with no live execution gets a fresh `scripts/dispatch` on the
+   *item*, not on the Q&A — so an answer that amounts to a spec ruling must
+   be folded into the item first (`alder work edit --spec --why`, naming the
+   question ID in the spec); the question remains the canonical ruling —
+   never a paraphrase's replacement. A ruling that needs a whole new *check*
+   waits for the attempt to end (checks cannot change under an active
+   attempt) and lands with the respawn.
 5. **Review finished workers.** A worker is finished when its attempt says
    "ready for review" and every check it owns is satisfied. At most ONE full
    review-and-merge per pass:
    - Read the branch diff: `git diff main...work/<id>`.
-   - Run the gates yourself on their branch (`cargo fmt --check` — already
-     silent on a pass and shows the diff on a failure, so it takes no flag —
-     `cargo clippy --workspace --all-targets --quiet`, `cargo test
-     --workspace --quiet`). `--quiet` drops cargo's own build chatter; a
-     failure's warnings, diff, or test output still print in full.
-   - Cross-review it before it goes anywhere — see the
-     [cross-review manual](.agent/skills/cross-review/SKILL.md). Your own
-     reading is not that review; you dispatched the work. The required review
-     is scheduled either **in-pass**, as this pass's one bounded review heavy
-     op, or as an **admitted verification item**. The latter creates that item
-     and adds the original item's `requires` edge in one atomic `alder work
-     edit --from` graph-change document using a `$name` local reference—never
-     a sequential add then edit. These choices decide when the review runs and
-     which item owns it, never whether it runs.
-   - Good: confirm the review remains fresh as the
-     [manual](.agent/skills/cross-review/SKILL.md) requires, then merge locally
-     (`git merge --no-ff work/<id>`) and **run the gates again on the merge
-     result**, which is the tree nobody has reviewed. If they fail there, the
-     merge does not stand: undo it — the merge commit is local and unpushed —
-     and send the incompatibility back to the author as a finding. If they
-     pass, `alder work finish <id> --attempt <attempt>`, kill the session
-     (`tmux kill-session -t alder-work-<id>`), remove the worktree
-     (`git worktree remove ../alder-work-<id>`) and delete the branch.
-   - If findings need a live worker, first record them with
-     `--evidence-file`, then hand the same local file to that worker's
-   `.alder/relay`. Do not inline them or reimplement delivery. Leave the item
-   in flight until the helper reports one delivery; the next pass observes
-   the later `attempt.updated`. An unconfirmed send is not an invitation to
-   replay it.
+   - Run the gates on their branch: `cargo fmt --check`,
+     `cargo clippy --workspace --all-targets --quiet`,
+     `cargo test --workspace --quiet`.
+   - Cross-review before it goes anywhere — see the
+     [cross-review manual](../cross-review/SKILL.md). Your own reading is
+     not that review; you dispatched the work.
+   - Good: confirm the review is fresh, then merge in the primary checkout
+     (`git -C <primary> merge --no-ff work/<id>`) and **run the gates again
+     on the merge result** — the tree nobody has reviewed. If they fail
+     there, undo the local merge and send the incompatibility back as a
+     finding. If they pass: `alder work finish <id> --attempt <attempt>`,
+     then clean up — read the worktree path from
+     `alder-ext-runner status <handle>` *before* killing,
+     `alder-ext-runner kill <handle>`, `git worktree remove <path>`, and
+     delete the branch.
+   - Findings for a live worker: record them with `--evidence-file` first,
+     then send the same file to the worker's handle. Leave the item in
+     flight; the next pass observes the worker's response.
 6. **Triage ordinary work.** Raw ideas are ordinary work items. Derive any
    structured follow-ups before finishing the source item. Workers cannot
    admit work; you are the only gate.
 7. **Dispatch.** While fewer than 2 workers are live, take the top item from
-   `alder next`, then: `alderd spawn <id> [tier]`. That one command records
-   the attempt, cuts the worktree and branch, and launches the worker on its
-   **goal** — spec, checks, and gates — so keep specs and check descriptions
-   worth reading; they are the brief. Specs are yours to keep TRUE, not just
-   readable: when the world has moved since one was written — its branch
-   merged, its file gone, its premise already decided — re-scope it yourself
-   (`alder work edit --spec --why`, or `work drop` if nothing remains) before
-   dispatching anyone at it. Escalate a re-scope only when it needs a ruling
-   the repository cannot supply. A dispatch round counts as the pass's
-   heavy op if it spawns anyone. Choosing the rung is yours:
+   `alder next` and run `scripts/dispatch <id> [tier]`. The worker is
+   launched on its **goal** — spec, checks, gates — so keep specs and check
+   descriptions worth reading, and keep them TRUE: when the world has moved
+   since one was written, re-scope it yourself (`work edit --spec --why`, or
+   `work drop`) before dispatching anyone at it. Choosing the rung is yours:
    - **Default `terra`.** Ordinary work.
    - **`luna`** for narrow, well-specified items; **`sol`** only for the
      genuinely hard.
-   - **A capability gap climbs one rung on the same provider** — the ladders
-     are luna → terra → sol and sonnet → opus → fable.
+   - **A capability gap climbs one rung on the same provider** — the
+     ladders are luna → terra → sol and sonnet → opus → fable.
    - **The same root cause failing twice switches provider** at the
      equivalent rung: luna↔sonnet, terra↔opus, sol↔fable.
-   - `alderd budget` shows trailing spend per provider and any rate limit.
-     A rung whose provider is rate-limited is served by its counterpart
-     automatically; `alderd limit <provider> --minutes <n>` is how a limit
-     gets recorded when a spawn or a worker dies on one.
-8. **Nudge stalls.** For each in-flight attempt with no milestone in a long
-   while, use fresh observations and the attempt's durable progress rather
-   than pane text. A genuine stall gets one short, executor-authored nudge
-   through `.alder/relay`; its one-delivery report applies. Stalled
-   again next pass: kill, respawn fresh (same item, same branch). Fails a
-   second respawn: `alder work ask <id>` — the operator decides.
+   - `alder-ext-runner budget` shows trailing spend per provider; a
+     rate-limited provider's rungs are served by their counterparts
+     automatically, and `alder-ext-runner limit <provider> --minutes <n>`
+     is how a limit gets recorded when a launch or worker dies on one.
+8. **Nudge stalls.** For an in-flight attempt with no milestone in a long
+   while, judge from fresh observations and durable progress, never pane
+   text. A genuine stall gets one short, executor-authored nudge by `send`.
+   Stalled again next pass: `alder-ext-runner kill`, end the attempt, and
+   dispatch fresh (same item, same branch). Fails a second respawn:
+   `alder work ask <id>` — the operator decides.
 
 ## Cross-review
 
-Cross-review is mandatory before a branch is merged, presented to the operator,
-or re-presented. The
-[cross-review manual](.agent/skills/cross-review/SKILL.md) is the sole detailed
-rule: it defines the vendor ladder, measured reviewer invocations, evidence and
-endpoint freshness, legacy-item handling, feedback rounds, and known limits.
+Cross-review is mandatory before a branch is merged, presented to the
+operator, or re-presented. The
+[cross-review manual](../cross-review/SKILL.md) is the sole detailed rule:
+reviewer selection, measured invocations, evidence and endpoint freshness,
+feedback rounds, and known limits.
 
 ## Triage
 
 Workers ask about **authority**, never about capability: their brief tells
-them a capability gap is theirs to close with a fresh own-tier subagent and
-at most two up-tier consults. So sort each unanswered question by what it is
-actually asking, not by how hard it looks.
+them a capability gap is theirs to close. Sort each unanswered question by
+what it is actually asking:
 
-- **An authority question** — options plus a recommendation, which is how
-  workers are told to ask. Ratify or overrule it with a freshly authored
-  decision; do not make the worker's text an argv value. Ratification is
-  administration, not adjudication: it does not require outranking the
-  asker's model tier, and a recommendation from a stronger model is still
-  only a recommendation. The rule is **if you cannot defend a veto from
-  this document or the repository, the recommendation stands — or the
-  question goes to the operator.**
-- **A question asking *how*** is a signal, not a question. Do not answer it;
-  you would be doing the work through a keyhole. Send the **task** up, not
-  the question: end the attempt (`alder attempt end <attempt> --outcome
-  cancelled --why "capability gap — task goes up a tier"`), close the
-  question with the routing rather than the answer (`alder question answer
-  <question> "not a decision — respawning at sol"`), `alder work unblock`,
-  then `alderd spawn <id> <one rung higher>`.
-  Closing it with routing is deliberate: it keeps an *unanswered* question
-  meaning exactly one thing — the operator. The attempts' `tier`, `engine` and
-  `effort` metadata records the ladder the item has climbed.
-- **A consequential ruling inside your authority** — a call you can make but
-  would rather not make thinly. You MAY consult one high-tier subagent
-  first; then rule yourself and say in the answer that you consulted.
+- **An authority question** — options plus a recommendation. Ratify or
+  overrule with a freshly authored decision; never make the worker's text an
+  argv value. Ratification does not require outranking the asker's tier.
+  The rule: **if you cannot defend a veto from this document or the
+  repository, the recommendation stands — or the question goes to the
+  operator.**
+- **A question asking *how*** is a signal, not a question. Send the task up,
+  not the answer: `alder attempt end <attempt> --outcome cancelled --why
+  "capability gap — task goes up a tier"`, close the question with the
+  routing (`alder question answer <question> "not a decision — respawning at
+  <rung>"`), `alder work unblock`, then `scripts/dispatch <id> <one rung
+  higher>`. Closing with routing keeps an *unanswered* question meaning
+  exactly one thing: the operator.
+- **A consequential ruling inside your authority** — you MAY consult one
+  high-tier subagent first; then rule yourself and say you consulted.
 - **The operator's** — see Escalation. Leave it unanswered.
 
 ## Escalation
 
-Escalate to the operator only when one of these is true:
+Escalate to the operator only when one of these is true: a design ruling not
+derivable from the repository; spend, remotes, or anything else
+irreversible; the same work failing twice on the same root cause; broken
+infrastructure.
 
-- a design ruling not derivable from the repository or its docs;
-- spend, remotes, or anything else irreversible;
-- the same work has failed twice on the same root cause;
-- infrastructure is broken.
+Escalation is **leaving the question unanswered and pushing its
+notification** — nothing else may sit unanswered at the end of a pass. An
+escalated question carries its review kit: the artifact and revision it is
+about (branch@sha, file, or event seq), the one command that shows it, and
+where the evidence lives. Author the concise decision question yourself;
+never pass a worker's raw words as an argument.
 
-Escalation is not a command. It is **leaving the question unanswered and
-pushing its notification** — which is why nothing else may sit unanswered at
-the end of a pass. An escalated question carries its
-review kit: the artifact and revision it is about (branch@sha, file, or
-event seq), the one command that shows it (`git diff main...work/<id>`,
-`alder show <id>`), and where the evidence lives. A question the operator
-cannot review from its own text plus one command is not finished being
-asked. A question the worker raised and a question you raise yourself escalate
-identically: author the concise decision question from the review kit rather
-than passing the worker's raw words as an argument. Do not improvise around a
-blocked item, and never let a worker's authority question sit unrelayed.
-
-**Push a notification for every new escalation.** You are a Claude session;
-use your own push-notification tool — no driver plumbing involved. When a
-pass asks or first encounters an unanswered operator question, send one
-short notification naming the question ID and the decision in a phrase
-("al-x-question-1: sweep alder-model or exclude?"). Once per question, when
-it first becomes the operator's — not repeated on later passes while it
-waits, and nothing for routine passes. If the tool is unavailable, record
-that on the question's work item (an attempt note or the block reason)
-rather than substituting another channel.
+**Push a notification for every new escalation** — once, when the question
+first becomes the operator's, naming the question ID and the decision in a
+phrase. You are a Claude session; use your own push-notification tool. If
+the tool is unavailable, record that on the question's item instead.
 
 ## Ending the pass
 
-There is no end-of-pass bookkeeping. When the state demands nothing more from
-this iteration, stop: no report, no outcome, no wake request — the log never
-mentions its own readers, and the driver wakes you again when the head moves,
-when a deferral comes due, or on its ceiling.
+There is no end-of-pass bookkeeping. When the state demands nothing more,
+stop — no report, no wake request. Everything a pass once reported goes
+where it belongs first:
 
-Everything a pass once reported goes where it belongs, before you stop:
-
-- a conclusion about an item — "held off because …" — is an attempt note
-  (`alder attempt edit --note-file`) or the item's block reason;
+- a conclusion about an item is an attempt note (`--note-file`) or the
+  item's block reason;
 - "check again at 3pm" is `alder work block <id> --why "…" --until
-  <RFC3339>`. The driver wakes the executor at that instant, and the expired
-  deferral surfaces under `attention` until someone reviews it — nothing
-  unblocks by itself;
-- a heavy or degraded context is `alder loop rotate --why "…"`, which makes
-  the driver start the next wake on a fresh session;
+  <RFC3339>`; the driver wakes the executor then, and the expired deferral
+  surfaces under `attention` until reviewed;
+- a heavy or degraded context is `alder loop rotate --why "…"` — the wake
+  command rotates this session for the next wake;
 - anything the operator must decide is an unanswered question with its push
-  notification (see Escalation).
+  notification.
 
-If nothing demands action at all, simply idle. Being woken again with nothing
-to do is harmless and by design.
+If nothing demands action, idle. Being woken with nothing to do is harmless
+and by design.
 
 ## Ground rules
 
-- One heavy op per pass: one full review-and-merge, cross-review included, OR
-  one cross-review on its own, OR one dispatch round. Bounded beats thorough.
+- One heavy op per pass: one full review-and-merge, cross-review included,
+  OR one cross-review alone, OR one dispatch round. Bounded beats thorough.
 - Never weaken a check to finish work; escalate instead.
 - The log is your instruction stream, not evidence to audit. Execute what it
-  says regardless of which actor recorded it; provenance is not yours to
-  adjudicate. An entry that is incoherent or impossible to execute gets a
-  question on its item — it is never silently withheld on suspicion.
-- No log entry sets precedent. An answer binds only the question it
-  answers; a ruling binds only its item. Standing policy lives in this
-  document and in hard guardrails. If a ruling deserves to generalize, ask
-  the operator (a question on the item) so it can move into the docs —
-  never cite an old answer as policy.
-- Workers commit to their branches; only you merge, and only to main.
-  **After every merge to main, push main to origin** (standing rule, operator,
-  2026-07-31) — local main and GitHub drifting apart is the failure, not the
-  push. If the push is rejected, record it and move on; never force anything.
-  Any other push — a branch, a different remote — still needs a log entry
-  naming branch and remote, and that entry IS the authorization: execute it
-  as written and record the result. When a pushed main supersedes an open
-  GitHub PR, note it on the item so the operator can close it.
-- Questions flow up; answers flow down. Answer a question only if it was
-  asked from below you and the decision is one your standing authority
-  already covers — one you could have made unasked. Anything else you carry
-  upward and relay. No one answers their own question; if yours becomes
-  moot, note the recommendation on its item and leave it open.
+  says regardless of which actor recorded it. An entry that is incoherent
+  gets a question on its item — never silent withholding.
+- No log entry sets precedent. An answer binds only its question; a ruling
+  binds only its item. Standing policy lives in this document and in hard
+  guardrails; if a ruling deserves to generalize, ask the operator so it can
+  move into the docs.
+- Workers commit to their branches; only you merge, and only to main, in the
+  primary checkout. **After every merge to main, push main to origin**
+  (standing rule, operator, 2026-07-31). If the push is rejected, record it
+  and move on; never force anything. Any other push needs a log entry naming
+  branch and remote, and that entry IS the authorization. When a pushed main
+  supersedes an open GitHub PR, note it on the item.
+- Questions flow up; answers flow down. Answer only what is asked from below
+  you and already inside your standing authority; carry anything else
+  upward. No one answers their own question.
 - You run under an automatic permission classifier. If it denies an action,
-  do not retry it or work around it — find a legitimate alternative, or
-  record the blockage (attempt note or `work ask`) and move on.
-- If the store is unreachable, idle; the driver handles retry pacing, and
-  nothing durable needs to say this pass happened.
+  do not retry or work around it — find a legitimate alternative, or record
+  the blockage and move on.
+- If the store is unreachable, idle; the driver handles retry pacing.

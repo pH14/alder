@@ -483,7 +483,7 @@ A second `work start` is rejected while an active attempt exists.
 
 ```text
 $ alder attempt edit hm-9a1-attempt-1 \
-    --handle tmux:alder-work-hm-9a1
+    --handle alder-ext-work-hm-9a1
 ```
 
 `--handle` attaches one external handle to the attempt. A handle is a
@@ -707,7 +707,7 @@ key, ordered by that key. It does not run scripts or inspect SQLite.
 ```text
 $ alder observations
 github  owner/repo#171  ci  passing
-tmux    hm-9a1-attempt-1  liveness  present
+runner  hm-9a1-attempt-1  liveness  present
 ```
 
 ### `alder observation report <observer> <subject> <field> <level>`
@@ -758,7 +758,7 @@ name and nothing runs under it), or `unknown` (not a name the probe
 recognizes; Alder writes nothing).
 
 ```json
-{"observer":"tmux", "probe":"scripts/observe-tmux.sh \"$1\""}
+{"observer":"runner", "probe":"scripts/observe-runner.sh \"$1\""}
 ```
 
 The handle stays fully opaque to Alder: it is passed verbatim and matched
@@ -869,7 +869,7 @@ hm-9a1-attempt-1
 
 # The runner launches the worker, then:
 $ alder attempt edit hm-9a1-attempt-1 \
-    --handle tmux:alder-work-hm-9a1
+    --handle alder-ext-work-hm-9a1
 ```
 
 Later:

@@ -65,7 +65,7 @@ to poll are properties of the box, not durable project facts.
 
 ```json
 {
-  "command": "alder-pass",
+  "command": "scripts/ensure-executor",
   "pollSeconds": 60,
   "hintPollSeconds": 1,
   "debounceSeconds": 20,
@@ -74,6 +74,20 @@ to poll are properties of the box, not durable project facts.
   "notify": "terminal-notifier -title alder -message",
   "alder": "alder"
 }
+```
+
+That `command` is this repository's standard wiring: `scripts/ensure-executor`
+keeps one resident executor session alive through `alder-ext-runner`, rotates
+it on age or on a durable rotation request, runs the observation sweep
+(`alder refresh`) at the top of every wake, and delivers the trigger names to
+the session. The 600-second `commandTimeoutSeconds` bounds one wake
+comfortably: the command starts or messages a session and exits without
+waiting on the executor's work. For the sweep to see runner-launched
+executions, the project's observer manifest (`.alder/config.json`) carries
+the execution probe:
+
+```json
+{"observer": "runner", "probe": "scripts/observe-runner.sh \"$1\""}
 ```
 
 | Field | Default | Meaning |

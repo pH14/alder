@@ -234,10 +234,10 @@ gets recorded.
 Two conventions in that process are worth naming here because they show up
 in the log rather than in the repository. A worker records an up-tier
 consult as `consulted` metadata on its own attempt, and a dispatch records
-the rung it launched at as `tier`, `engine` and `effort` metadata. Between
-them, an item resent up the ladder carries the whole climb. All are ordinary
-open-ended metadata: Alder stores and displays them and reads nothing into
-them.
+the rung it launched at as the attempt's `tier` (`alder work start --tier`);
+the model and effort behind a rung live in the runner's machine-local table,
+not in the log. Between them, an item resent up the ladder carries the whole
+climb. Alder stores and displays these names and reads nothing into them.
 
 ## Driver configuration
 
@@ -245,7 +245,7 @@ them.
 
 ```json
 {
-  "command": "alder-pass",
+  "command": "scripts/ensure-executor",
   "pollSeconds": 60,
   "debounceSeconds": 20,
   "maxIntervalSeconds": 1800,

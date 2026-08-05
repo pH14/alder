@@ -624,7 +624,7 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         env, fs,
         os::unix::fs::PermissionsExt,
-        path::{Path, PathBuf},
+        path::Path,
         process::Command,
     };
 
@@ -1336,34 +1336,37 @@ mod tests {
         );
     }
 
-    /// The shipped tmux observer is the probe: asked about one handle at a
-    /// time, it answers `present` or `absent` for `tmux:*` names it owns and
-    /// `unknown` for anything else — and when tmux itself is gone, a `tmux:*`
-    /// name is `absent`, because no session can be running under it.
+    /// The shipped runner observer is the probe: asked about one handle at a
+    /// time, it maps the runner's own status words — `running` is `present`,
+    /// `done` and `dead` are `absent` (a finished execution is no longer a
+    /// live one; the result lives on the branch) — and answers `unknown` for
+    /// any name that is not the runner's, including the retired `tmux:*`
+    /// grammar. A recognized name it cannot ask about fails loudly instead
+    /// of guessing.
     #[test]
-    fn the_tmux_observer_script_answers_one_probe_word_per_handle() {
+    fn the_runner_observer_script_answers_one_probe_word_per_handle() {
         let temporary = TempDir::new().unwrap();
-        let bin = temporary.path().join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        let stub = bin.join("tmux");
+        let stub = temporary.path().join("alder-ext-runner");
         fs::write(
             &stub,
-            "#!/bin/sh\ncase \"$1 $2 $3\" in\n  'has-session -t =alder-work-one') exit 0 ;;\nesac\nexit 1\n",
+            "#!/bin/sh\ncase \"$2\" in\n\
+             alder-ext-running) echo running; echo 'tier terra' ;;\n\
+             alder-ext-done) echo done ;;\n\
+             alder-ext-dead) echo dead ;;\n\
+             *) echo 'no such handle' >&2; exit 1 ;;\n\
+             esac\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&stub).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&stub, permissions).unwrap();
 
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/observe-tmux.sh");
-        let mut path_entries = vec![bin];
-        path_entries.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
-        let stubbed_path = env::join_paths(path_entries).unwrap();
-        let probe = |path: &std::ffi::OsStr, handle: &str| {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/observe-runner.sh");
+        let probe = |runner: &Path, handle: &str| {
             let output = Command::new("bash")
                 .arg(&script)
                 .arg(handle)
-                .env("PATH", path)
+                .env("ALDER_EXT_RUNNER_BIN", runner)
                 .output()
                 .unwrap();
             assert!(
@@ -1373,16 +1376,25 @@ mod tests {
             );
             validate_probe_output(&output.stdout).unwrap()
         };
-        assert_eq!(probe(&stubbed_path, "tmux:alder-work-one"), "present");
-        assert_eq!(probe(&stubbed_path, "tmux:alder-work-two"), "absent");
-        assert_eq!(probe(&stubbed_path, "codex:019f-rollout"), "unknown");
+        assert_eq!(probe(&stub, "alder-ext-running"), "present");
+        assert_eq!(probe(&stub, "alder-ext-done"), "absent");
+        assert_eq!(probe(&stub, "alder-ext-dead"), "absent");
+        assert_eq!(probe(&stub, "tmux:alder-work-one"), "unknown");
+        assert_eq!(probe(&stub, "codex:019f-rollout"), "unknown");
 
-        // No tmux at all: a tmux: handle is absent, a foreign one unknown.
-        let empty = temporary.path().join("empty");
-        fs::create_dir_all(&empty).unwrap();
-        let bare_path =
-            env::join_paths([empty, PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
-        assert_eq!(probe(&bare_path, "tmux:alder-work-one"), "absent");
-        assert_eq!(probe(&bare_path, "codex:019f-rollout"), "unknown");
+        // A recognized name with no runner to ask fails the probe loudly; a
+        // foreign name still answers `unknown` without needing one.
+        let missing = temporary.path().join("no-such-runner");
+        let raw = |runner: &Path, handle: &str| {
+            Command::new("bash")
+                .arg(&script)
+                .arg(handle)
+                .env("ALDER_EXT_RUNNER_BIN", runner)
+                .output()
+                .unwrap()
+        };
+        assert!(!raw(&missing, "alder-ext-running").status.success());
+        assert!(!raw(&stub, "alder-ext-vanished").status.success());
+        assert_eq!(probe(&missing, "codex:019f-rollout"), "unknown");
     }
 }

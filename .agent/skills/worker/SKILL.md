@@ -6,17 +6,18 @@ description: Implement exactly one Alder work item and record honest attempt evi
 # One worker, one item
 
 You are a worker on the alder project. You have exactly one work item, and
-the goal you were launched on states it: the spec, the acceptance checks, and
-the gates. That is the whole assignment. *How* you reach it is yours to
-decide. This worktree — a branch named `work/<your-item>` — is your world.
-The executor (a separate session) dispatched you, will review your branch, and
-will merge it.
+the launch text you were started with states it: your work ID, your attempt
+ID, the spec, the acceptance checks, and the gates. That is the whole
+assignment. *How* you reach it is yours to decide. This worktree — a branch
+named `work/<your-item>` — is your world. The executor (a separate session)
+dispatched you, will review your branch, and will merge it.
 
-Use `.alder/bin/alder` for every alder command. The log, not the launch
-goal, is the authority; re-read it whenever the two disagree or the item has
-been amended under you:
+Build the alder CLI once (`cargo build`), then use `./target/debug/alder`
+for every alder command; your worktree already carries `.alder/config.json`,
+seeded at dispatch. The log, not the launch text, is the authority; re-read
+it whenever the two disagree or the item has been amended under you:
 
-    .alder/bin/alder show <your-work-id>
+    ./target/debug/alder show <your-work-id>
 
 If your item carries a check with a manual at `.agent/skills/<key>/SKILL.md`,
 read it before satisfying that check.
@@ -26,7 +27,7 @@ read it before satisfying that check.
 1. Implement your one item, here, on your branch. Commit locally with clear
    messages as you go.
 2. Record progress honestly on YOUR attempt:
-   - milestones: `.alder/bin/alder attempt edit <your-attempt> --note "..."`
+   - milestones: `./target/debug/alder attempt edit <your-attempt> --note "..."`
    - satisfied checks: `... attempt edit <your-attempt> --satisfied <check>
      --evidence "<what proves it>"` — every check except the ones your goal
      hands to the executor.
@@ -53,7 +54,7 @@ less of your problem than you do, and the round trip costs a whole pass.
    transcript talking. Hand it the problem and the constraints, not your
    conclusions.
 2. **Then up-tier, at most twice per attempt.** There are two ladders, and
-   your attempt's `tier` metadata says which rung you are on:
+   your attempt's `tier` says which rung you are on:
 
    | ladder | rungs, low to high |
    | ------ | ------------------ |
@@ -73,7 +74,7 @@ less of your problem than you do, and the round trip costs a whole pass.
    question that would unblock you — never "help me with X". Record each one
    on your attempt so the ladder is visible in the log:
 
-       .alder/bin/alder attempt edit <your-attempt> --meta consulted=<engine>
+       ./target/debug/alder attempt edit <your-attempt> --meta consulted=<engine>
 
    A second consult appends rather than overwrites:
    `--meta consulted=<first>,<second>`.
@@ -94,21 +95,19 @@ that binds something outside your own task:
 Frame every ask as options plus a recommendation. You stood on the ground; a
 ruling should be cheap to make and cheap to defend:
 
-    .alder/bin/alder work ask <your-work-id> "<the tension>. Options:
+    ./target/debug/alder work ask <your-work-id> "<the tension>. Options:
     (a) <one>; (b) <the other>. Recommendation: (a) — <why>."
 
 That single command blocks your item and wakes the executor — the append IS
 the escalation; there is nothing else to do. Then park: leave an attempt note
 saying where you stopped, and stop. Never stall silently.
 
-The answer comes back into this session. If you are an interactive session,
-it is typed at your prompt. If you ran as one shot (`codex exec`), your turn
-ends and the executor resumes this same session with the ruling — so end the
-turn cleanly, with the note written and nothing half-applied on disk, rather
-than idling to wait for it. Spawn starts an independent watcher before Codex
-that records `codex-session` on the attempt, so this does not rely on you
-reaching the ask. If a reconcile finding says the stamp is missing, repair it
-with the UUID it names; never ask the executor to fall back to `--last`.
+The answer comes back into this session, delivered through the runner that
+launched you. If you are an interactive session, it appears at your prompt.
+If you ran as one shot (`codex exec`), your turn ends and the executor
+resumes this same session with the ruling — the runner recorded your session
+for exactly that — so end the turn cleanly, with the note written and
+nothing half-applied on disk, rather than idling to wait for it.
 
 ## Hard rules
 

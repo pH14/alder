@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# What one alderd wake runs: `driver.json`'s `command`.
+#
+# Policy (operator-ratified): a resident executor with semi-frequent
+# rotation. The current executor's handle lives in `.alder/executor-handle`
+# (machine-local, like every other `.alder/` file); each wake:
+#
+#   1. runs `alder refresh` — the observation sweep belongs to this command
+#      now, so status reflects live executions before anything reads it;
+#   2. ensures one executor session exists and delivers the wake to it:
+#        no handle, or its status is dead    -> start a fresh executor;
+#        alive but older than the rotation
+#        age, or a durable rotation request
+#        is outstanding                      -> kill it, start fresh;
+#        otherwise                           -> send one line naming the
+#                                               triggers ($ALDERD_TRIGGERS).
+#
+# A `done` executor (engine exited, holding shell remains) gets the send
+# first: for a one-shot engine that IS the resume path. If the send refuses
+# — an exited interactive engine, a torn pane — the session is rotated.
+#
+# Branch discipline (documented decision): the executor sits in a runner-cut
+# worktree beside the primary checkout on the branch named by
+# $ALDER_EXECUTOR_BRANCH (default `executor`). That branch carries no
+# commits of its own — it is a seat, not a line of work — and each fresh
+# executor's first instruction is `git merge --ff-only main`, which
+# fast-forwards the seat to current main. Merges to main cannot happen in
+# that worktree (main stays checked out in the primary checkout, and git
+# allows a branch in only one worktree), so the executor performs them in
+# the primary checkout with `git -C <primary-root>`, and pushes main from
+# there; PASS.md states the same rule from the executor's side.
+#
+# Tunables, all environment: ALDER_EXECUTOR_TIER (default `fable`),
+# ALDER_EXECUTOR_BRANCH (default `executor`),
+# ALDER_EXECUTOR_ROTATION_SECONDS (default 21600 — six hours).
+set -euo pipefail
+
+script_dir=$(cd "$(dirname "$0")" && pwd -P)
+root=$(dirname "$(git -C "$script_dir" rev-parse --path-format=absolute --git-common-dir)")
+cd "$root"
+
+resolve_bin() {
+  name=$1
+  override=$2
+  if [ -n "$override" ]; then
+    printf '%s\n' "$override"
+    return 0
+  fi
+  for candidate in "$root/target/release/$name" "$root/target/debug/$name"; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
+    return 0
+  fi
+  echo "ensure-executor: $name not found; build it or set ${3}" >&2
+  return 1
+}
+alder=$(resolve_bin alder "${ALDER_BIN:-}" ALDER_BIN)
+runner=$(resolve_bin alder-ext-runner "${ALDER_EXT_RUNNER_BIN:-}" ALDER_EXT_RUNNER_BIN)
+
+tier=${ALDER_EXECUTOR_TIER:-fable}
+branch=${ALDER_EXECUTOR_BRANCH:-executor}
+rotation=${ALDER_EXECUTOR_ROTATION_SECONDS:-21600}
+triggers=${ALDERD_TRIGGERS:-none}
+notes=$root/.alder/executor-handle
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/alder-ensure-executor.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+
+# 1. The observation sweep, before anything reads status. A failing sweep
+# fails the wake — alderd retries next poll — because acting on a stale
+# picture is worse than acting late.
+"$alder" refresh
+
+# The durable rotation request, honored by the note-comparison rule LOOP.md
+# states: a request sequence later than the noted one is outstanding, and
+# rotating (which notes it) consumes it.
+rotate_seq=$("$alder" status --json |
+  sed -n 's/.*"rotate_requested_seq":\([0-9][0-9]*\).*/\1/p')
+rotate_seq=${rotate_seq:-0}
+
+handle=""
+started=0
+noted_rotate=0
+if [ -f "$notes" ]; then
+  {
+    read -r handle || true
+    read -r started || true
+    read -r noted_rotate || true
+  } <"$notes"
+fi
+# Corrupt notes read as ancient, which rotates — the safe direction.
+case $started in '' | *[!0-9]*) started=0 ;; esac
+case $noted_rotate in '' | *[!0-9]*) noted_rotate=0 ;; esac
+
+note() { # note <handle> — the file a later wake decides from
+  printf '%s\n%s\n%s\n' "$1" "$(date +%s)" "$rotate_seq" >"$notes"
+}
+
+seed_worktree() { # seed_worktree <handle> — copy the log manifest in
+  worktree=$("$runner" status "$1" | sed -n 's/.*worktree //p' | head -n 1)
+  if [ -z "$worktree" ] || [ ! -d "$worktree" ]; then
+    echo "ensure-executor: cannot learn the worktree for $1" >&2
+    exit 1
+  fi
+  mkdir -p "$worktree/.alder"
+  cp "$root/.alder/config.json" "$worktree/.alder/config.json"
+}
+
+deliver() { # deliver <handle> — one line naming the triggers
+  printf '%s\n' \
+    "Read the current Alder state and act on it. Your brief is PASS.md. Triggers this wake: $triggers." \
+    >"$scratch/wake"
+  "$runner" send "$1" --file "$scratch/wake"
+}
+
+start_fresh() {
+  cat >"$scratch/prompt" <<EOF
+You are the alder executor. First fast-forward this worktree to current
+main: git merge --ff-only main (your seat branch $branch carries no commits
+of its own). Then build the CLI (cargo build) and read PASS.md at the
+worktree root — it is your entire brief. Read the current Alder state and
+act on it. Triggers this wake: $triggers.
+EOF
+  if handle=$("$runner" start --repo "$root" --branch "$branch" --tier "$tier" \
+    --prompt-file "$scratch/prompt" 2>"$scratch/start-err"); then
+    cat "$scratch/start-err" >&2 || true
+    seed_worktree "$handle"
+    note "$handle"
+    echo "ensure-executor: started $handle"
+    return 0
+  fi
+  # A live session these notes had no record of: adopt it and deliver the
+  # wake to it instead. Its age is unknown, so the note starts it now —
+  # rotation arrives at most one rotation age late, which is harmless.
+  # The backticks are literal text in the runner's refusal, not expansions.
+  # shellcheck disable=SC2016
+  handle=$(sed -n 's/.*handle `\([^`]*\)` is already running.*/\1/p' "$scratch/start-err")
+  if [ -z "$handle" ]; then
+    cat "$scratch/start-err" >&2
+    exit 1
+  fi
+  echo "ensure-executor: adopting live executor $handle"
+  seed_worktree "$handle"
+  note "$handle"
+  deliver "$handle"
+}
+
+action=start
+if [ -n "$handle" ]; then
+  word=$("$runner" status "$handle" | head -n 1)
+  age=$(($(date +%s) - started))
+  case $word in
+  running | done)
+    if [ "$rotate_seq" -gt "$noted_rotate" ]; then
+      echo "ensure-executor: rotation requested (seq $rotate_seq); rotating $handle"
+      action=rotate
+    elif [ "$age" -ge "$rotation" ]; then
+      echo "ensure-executor: $handle is ${age}s old (limit ${rotation}s); rotating"
+      action=rotate
+    else
+      action=send
+    fi
+    ;;
+  *)
+    action=start
+    ;;
+  esac
+fi
+
+if [ "$action" = send ]; then
+  if deliver "$handle"; then
+    echo "ensure-executor: delivered wake to $handle"
+    exit 0
+  fi
+  echo "ensure-executor: send to $handle refused; rotating" >&2
+  action=rotate
+fi
+
+if [ "$action" = rotate ]; then
+  "$runner" kill "$handle"
+fi
+
+start_fresh

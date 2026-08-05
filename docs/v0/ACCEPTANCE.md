@@ -61,10 +61,10 @@ At the schema level no Alder mechanism requires a mark inside the worker, so
 the log cannot attribute the execution: reconciliation reports the attempt as
 `unspawned` while its work is live. The runner — which named the execution —
 either binds the handle it created with `attempt edit` or replaces the
-execution; the unattributed leftover is the runner's residue to sweep.
-(Transitionally, the in-tree alderd runner still stamps `ALDER_ATTEMPT` into
-its own sessions to adopt across this crash window; that private convention
-leaves with the runner extraction and is no part of the criterion.)
+execution; the unattributed leftover is the runner's residue to sweep. (The
+extracted runner, `alder-ext-runner`, adopts across this crash window through
+its own deterministic handles and session stamps; that private convention is
+no part of the criterion.)
 
 ### A5. Unknown append outcome
 

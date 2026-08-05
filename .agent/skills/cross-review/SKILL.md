@@ -54,9 +54,10 @@ not merge.
 The reviewer is the rung across from the author's or higher — never the
 author's own vendor or session, and never a subagent of the executor (it
 inherits unlogged session effort). The author is every vendor with an attempt
-on the branch; check the `engine` metadata of every attempt, not just the
-newest. Attempt IDs take the form `al-<id>-attempt-N`, so inspect each attempt
-by that ID with `alder show <attempt-id>`.
+on the branch; check the `tier` of every attempt, not just the newest — the
+rungs `luna`, `terra`, `sol` are codex and `sonnet`, `opus`, `fable` are
+claude. Attempt IDs take the form `al-<id>-attempt-N`, so inspect each
+attempt by that ID with `alder show <attempt-id>`.
 
 | authored at | reviewed by |
 | --- | --- |
@@ -83,7 +84,7 @@ Claude-authored branch — Codex review:
 ```sh
 codex review --base main --title "Cross-review work/<id>" \
   -c model=gpt-5.6-sol -c model_reasoning_effort=xhigh \
-  -c approval_policy=never -c sandbox_mode=workspace-write
+  -c approval_policy=never -c sandbox_mode=workspace-write < /dev/null
 ```
 
 `codex review` scope flags and a prompt do not compose (measured): `--base
@@ -91,21 +92,26 @@ main` plus a positional prompt errors, and a bare prompt lets the model pick
 its own scope and miss commits. A scoped review carries no custom
 instructions; `AGENTS.md` and the diff are the entire lens. `--title` is
 display text, not a prompt channel. There is no `-m`; pin the model with
-`-c model=`.
+`-c model=`. **Close stdin** (`< /dev/null`): a backgrounded `codex
+review`/`codex exec` with an open stdin wedges waiting on it.
 
-Codex-authored branch — fresh Claude review in a tmux session (operator
-ruling 2026-07-31: never `claude -p`; the tmux method is the standard
-transport, same as workers):
+Codex-authored branch — fresh Claude review through the runner (operator
+ruling 2026-07-31: never `claude -p`; the interactive session is the
+standard transport, same as workers). Start it on the branch itself — the
+runner adopts the branch's existing worktree, and a review runs only after
+the worker's status reads `done` or `dead`, so the start replaces the exited
+pane:
 
 ```sh
-tmux new-session -d -s review-<id> -c <branch-worktree> \
-  claude --model claude-fable-5 --effort xhigh --permission-mode auto
-.alder/relay review-<id> "$scratch/review-prompt-<id>.txt"
+alder-ext-runner start --repo <primary-root> --branch work/<id> \
+  --tier fable --prompt-file "$scratch/review-prompt-<id>.txt"
 ```
 
-Collect the verdict from the session's pane/transcript, record it, then kill
-the session. Freshness still matters: a new session every review, never the
-executor's own or a subagent (both carry unlogged context or effort).
+Collect the verdict from the session's transcript, record it, then
+`alder-ext-runner kill <handle>`. A round-2 message to the same reviewer
+session rides `alder-ext-runner send <handle> --file <file>`. Freshness
+still matters: a fresh session every review, never the executor's own or a
+subagent (both carry unlogged context or effort).
 
 The prompt file (in `$scratch`, outside the worktree) holds the brief:
 
@@ -121,8 +127,8 @@ match the waiter (or the ChatGPT app's own long-lived process). A wedge looks
 like a slow review by clock alone: if output has not grown for ~25 minutes and
 CPU has gained only seconds, kill it, record the abandonment, end the pass.
 That silence-plus-low-CPU heuristic is for streaming Codex reviews. For a
-tmux-hosted Claude review, pane and session-transcript growth is the useful
-signal instead.
+runner-hosted Claude review, session-transcript growth is the useful signal
+instead.
 In a review sandbox, a `host_tmux` test failure is environmental, not a
 finding.
 
@@ -154,8 +160,9 @@ remains a named quoting surface: write any nonliteral value to a local file and
 pass it as `"$(cat "$file")"`. Inside double quotes that becomes one argv
 value; its contents are not parsed again as shell syntax.
 
-**Feedback:** if the author session is alive, relay the findings. If it is
-gone, spawn a fresh worker whose brief names the exact source attempt ID and
+**Feedback:** if the author session is alive, deliver the findings file with
+`alder-ext-runner send <handle> --file <file>`. If it is
+gone, dispatch a fresh worker whose brief names the exact source attempt ID and
 says to run `alder show <attempt-id>` before writing code. Never copy findings
 into specs, notes, goals, or metadata — the check evidence is the single copy.
 Pick the fix tier by the size of the findings, not the original item.

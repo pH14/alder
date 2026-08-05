@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Dispatch one ready Alder work item to a worker execution.
+#
+#   dispatch <work-id> [tier]
+#
+# The default tier is $ALDER_DISPATCH_TIER, or `terra`.
+#
+# Records first, launches second, binds last — the order the docs ratify: an
+# attempt is recorded before its worker is launched (docs/v0/README.md), so
+# every crash window leaves durable state that names its own repair:
+#
+#   crash after `work start`      reconcile reports `unspawned`; a re-run of
+#                                 this script adopts the recorded attempt;
+#   crash after the runner start  a re-run converges: the runner refuses the
+#                                 live handle and this script adopts it;
+#   crash after the bind          a re-run is a no-op that reports the
+#                                 existing binding.
+set -euo pipefail
+
+usage() {
+  echo "usage: dispatch <work-id> [tier]" >&2
+  exit 2
+}
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+work=$1
+tier=${2:-${ALDER_DISPATCH_TIER:-terra}}
+branch="work/$work"
+
+# The primary checkout. This script may run from a copy inside a linked
+# worktree (the executor's seat), so the root is resolved through git's
+# common directory, never assumed to be this script's parent. Worker
+# worktrees are cut beside the primary checkout, and its `.alder/` holds the
+# log configuration a worker's worktree needs a copy of.
+script_dir=$(cd "$(dirname "$0")" && pwd -P)
+root=$(dirname "$(git -C "$script_dir" rev-parse --path-format=absolute --git-common-dir)")
+cd "$root"
+
+# Binary resolution: an explicit override, this checkout's builds, then PATH.
+resolve_bin() {
+  name=$1
+  override=$2
+  if [ -n "$override" ]; then
+    printf '%s\n' "$override"
+    return 0
+  fi
+  for candidate in "$root/target/release/$name" "$root/target/debug/$name"; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
+    return 0
+  fi
+  echo "dispatch: $name not found; build it or set ${3}" >&2
+  return 1
+}
+alder=$(resolve_bin alder "${ALDER_BIN:-}" ALDER_BIN)
+runner=$(resolve_bin alder-ext-runner "${ALDER_EXT_RUNNER_BIN:-}" ALDER_EXT_RUNNER_BIN)
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/alder-dispatch.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+
+# 1. Record. The attempt exists durably before anything runs.
+if attempt=$("$alder" work start "$work" --tier "$tier" 2>"$scratch/start-err"); then
+  echo "dispatch: recorded $attempt"
+else
+  # A crashed or repeated dispatch already recorded the attempt; adopt the
+  # newest one. If none exists the item is genuinely not ready, and alder's
+  # own refusal is the error.
+  newest=$("$alder" show "$work" --json |
+    grep -oE "${work}-attempt-[0-9]+" |
+    awk -F'-attempt-' '{print $2}' | sort -n | tail -n 1 || true)
+  if [ -z "$newest" ]; then
+    cat "$scratch/start-err" >&2
+    exit 1
+  fi
+  attempt="${work}-attempt-${newest}"
+  echo "dispatch: adopting recorded $attempt"
+fi
+
+# 2. Compose the brief: the worker preamble, then the item as recorded. The
+# `alder show` output is included verbatim — title, spec, checks, history —
+# so nothing is lost to parsing; the log stays the authority.
+prompt="$scratch/prompt"
+{
+  cat <<EOF
+You are a worker on the alder project. This directory is your worktree, on
+branch $branch; it is your whole world. Read .agent/skills/worker/SKILL.md
+now and follow it for the rest of this session.
+
+Your work item: $work
+Your attempt:   $attempt
+
+Build the alder CLI once (cargo build), then use ./target/debug/alder for
+every alder command; your worktree already carries .alder/config.json. The
+log is the authority over this launch text — re-read your item if the two
+disagree.
+
+The item as recorded at dispatch (alder show $work):
+
+EOF
+  "$alder" show "$work"
+} >"$prompt"
+
+# 3. Launch — or adopt the execution a crashed dispatch already started. The
+# runner's handle is deterministic per branch and a live engine is refused,
+# so the refusal names exactly the execution this item already has.
+if handle=$("$runner" start --repo "$root" --branch "$branch" --tier "$tier" \
+  --prompt-file "$prompt" 2>"$scratch/runner-err"); then
+  cat "$scratch/runner-err" >&2 || true
+  echo "dispatch: started $handle"
+else
+  # The backticks are literal text in the runner's refusal, not expansions.
+  # shellcheck disable=SC2016
+  handle=$(sed -n 's/.*handle `\([^`]*\)` is already running.*/\1/p' "$scratch/runner-err")
+  if [ -z "$handle" ]; then
+    cat "$scratch/runner-err" >&2
+    exit 1
+  fi
+  echo "dispatch: adopting live execution $handle"
+fi
+
+# 4. Seed the worker's log configuration. The runner writes nothing into a
+# worktree, and `.alder/` is gitignored, so a fresh worktree cannot reach the
+# log until the manifest is copied in. The worktree location comes from the
+# runner's own status detail rather than an assumed layout.
+worktree=$("$runner" status "$handle" | sed -n 's/.*worktree //p' | head -n 1)
+if [ -z "$worktree" ] || [ ! -d "$worktree" ]; then
+  echo "dispatch: cannot learn the worktree for $handle from its status detail" >&2
+  exit 1
+fi
+mkdir -p "$worktree/.alder"
+cp "$root/.alder/config.json" "$worktree/.alder/config.json"
+
+# 5. Bind. A bound attempt means dispatch finished: the worktree is
+# provisioned and the execution is the attempt's to observe. Binding is
+# one-way in alder, so a re-run verifies rather than re-binds.
+bound=$("$alder" show "$attempt" --json |
+  grep -o '"handle":"[^"]*"' | head -n 1 | sed 's/^"handle":"//;s/"$//' || true)
+if [ -z "$bound" ]; then
+  "$alder" attempt edit "$attempt" --handle "$handle"
+  echo "dispatch: bound $attempt to $handle"
+elif [ "$bound" = "$handle" ]; then
+  echo "dispatch: $attempt is already bound to $handle"
+else
+  echo "dispatch: $attempt is bound to $bound, not $handle; refusing" >&2
+  exit 1
+fi

@@ -383,10 +383,9 @@ it is executed —
 the same item could be run by an agent in tmux, an agent in a web sandbox,
 or a deterministic script — so no engine name, session kind, or execution
 vocabulary appears in the work schema, and no Alder mechanism depends on a
-mark planted in the execution environment. (Transitionally, the in-tree
-alderd runner still stamps `ALDER_ATTEMPT` into the sessions it creates as
-its own crash-adoption bookkeeping; that is the runner's private convention,
-due to leave with the runner extraction, not part of this model.)
+mark planted in the execution environment. (The extracted runner,
+`alder-ext-runner`, stamps only its own names into the sessions it creates —
+its private crash-adoption bookkeeping, no part of this model.)
 
 V0 stores at most one primary handle on an attempt. Metadata is open-ended
 JSON. Alder stores and displays it but does not use its keys for readiness,
