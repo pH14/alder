@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# Dispatch one ready Alder work item to a worker execution.
+#
+#   dispatch <work-id> [tier]
+#
+# The default tier is $ALDER_DISPATCH_TIER, or `terra`.
+#
+# Records first, launches second, binds last — the order the docs ratify: an
+# attempt is recorded before its worker is launched (docs/v0/README.md), so
+# every crash window leaves durable state that names its own repair:
+#
+#   crash after `work start`      reconcile reports `unspawned`; a re-run of
+#                                 this script adopts the recorded attempt;
+#   crash after the runner start  a re-run converges: the runner refuses the
+#                                 live handle with exit 3 and prints it, and
+#                                 this script adopts it;
+#   crash after the bind          a re-run is a no-op that reports the
+#                                 existing binding.
+#
+# Adoption is coded, never grepped from prose: alder errors carry a machine
+# `code` and context (`active_attempt` names the active attempt ID), and the
+# runner's refusals carry exit codes with a machine-readable stdout line
+# (exit 3 prints `handle <h>`). Any refusal this script does not have a
+# converging answer for aborts loudly and launches nothing.
+set -euo pipefail
+
+usage() {
+  echo "usage: dispatch <work-id> [tier]" >&2
+  exit 2
+}
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+work=$1
+tier=${2:-${ALDER_DISPATCH_TIER:-terra}}
+branch="work/$work"
+
+# The primary checkout. This script may run from a copy inside a linked
+# worktree (the executor's seat), so the root is resolved through git's
+# common directory, never assumed to be this script's parent. Worker
+# worktrees are cut beside the primary checkout, and its `.alder/` holds the
+# log configuration the runner seeds into each worker's worktree at start.
+script_dir=$(cd "$(dirname "$0")" && pwd -P)
+root=$(dirname "$(git -C "$script_dir" rev-parse --path-format=absolute --git-common-dir)")
+cd "$root"
+
+# Binary resolution: an explicit override, this checkout's builds, then PATH.
+resolve_bin() {
+  name=$1
+  override=$2
+  if [ -n "$override" ]; then
+    printf '%s\n' "$override"
+    return 0
+  fi
+  for candidate in "$root/target/release/$name" "$root/target/debug/$name"; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
+    return 0
+  fi
+  echo "dispatch: $name not found; build it or set ${3}" >&2
+  return 1
+}
+alder=$(resolve_bin alder "${ALDER_BIN:-}" ALDER_BIN)
+runner=$(resolve_bin alder-ext-runner "${ALDER_EXT_RUNNER_BIN:-}" ALDER_EXT_RUNNER_BIN)
+command -v python3 >/dev/null 2>&1 ||
+  { echo "dispatch: python3 is required to parse alder's JSON" >&2; exit 1; }
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/alder-dispatch.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+
+# One field out of a JSON document, by dotted path. Empty output for an
+# explicit null; a nonzero exit for a missing key or an unparsable file.
+json_field() { # json_field <file> <dotted.path>
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+with open(sys.argv[1]) as handle:
+    node = json.load(handle)
+for part in sys.argv[2].split("."):
+    if not isinstance(node, dict) or part not in node:
+        sys.exit(1)
+    node = node[part]
+print("" if node is None else node)
+PY
+}
+
+# The runner's handle is deterministic per branch: lowercase alphanumerics
+# survive, everything else becomes `-`, prefixed `alder-ext-`. Computing it
+# here lets adoption verify a recorded attempt against the execution this
+# branch would have, before anything is launched.
+slug=$(printf '%s' "$branch" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g')
+expected_handle="alder-ext-$slug"
+
+# 1. Record. The attempt exists durably before anything runs. A refusal is
+# adopted only on the one code that names an adoptable attempt; every other
+# code aborts loudly, because launching a worker against a refusal whose
+# meaning this script does not know is how fictions start.
+if "$alder" work start "$work" --tier "$tier" --json \
+  >"$scratch/start.json" 2>"$scratch/start-err"; then
+  attempt=$(json_field "$scratch/start.json" attempt_id) || {
+    echo "dispatch: alder work start succeeded but printed no attempt_id" >&2
+    cat "$scratch/start.json" >&2
+    exit 1
+  }
+  echo "dispatch: recorded $attempt"
+else
+  # With --json, alder prints its coded error envelope on stdout.
+  code=$(json_field "$scratch/start.json" code 2>/dev/null || true)
+  case $code in
+  active_attempt)
+    attempt=$(json_field "$scratch/start.json" context.active_attempt_id 2>/dev/null || true)
+    if [ -z "$attempt" ]; then
+      echo "dispatch: the active_attempt refusal names no active_attempt_id" >&2
+      cat "$scratch/start.json" >&2
+      exit 1
+    fi
+    "$alder" show "$attempt" --json >"$scratch/attempt.json"
+    state=$(json_field "$scratch/attempt.json" current.state)
+    bound=$(json_field "$scratch/attempt.json" current.handle 2>/dev/null || true)
+    case $state in
+    starting | active) ;;
+    *)
+      echo "dispatch: recorded attempt $attempt is $state, not active; refusing to adopt" >&2
+      exit 1
+      ;;
+    esac
+    if [ -n "$bound" ] && [ "$bound" != "$expected_handle" ]; then
+      echo "dispatch: $attempt is bound to $bound, not this branch's $expected_handle; refusing" >&2
+      exit 1
+    fi
+    echo "dispatch: adopting recorded $attempt"
+    ;;
+  *)
+    echo "dispatch: alder refused work start (code ${code:-unreadable}); launching nothing" >&2
+    cat "$scratch/start.json" >&2 2>/dev/null || true
+    cat "$scratch/start-err" >&2 2>/dev/null || true
+    exit 1
+    ;;
+  esac
+fi
+
+# 2. Compose the brief: the worker preamble, then the item as recorded. The
+# `alder show` output is included verbatim — title, spec, checks, history —
+# so nothing is lost to parsing; the log stays the authority.
+prompt="$scratch/prompt"
+{
+  printf '%s\n' \
+    "You are a worker on the alder project. This directory is your worktree, on" \
+    "branch $branch; it is your whole world. Read .agent/skills/worker/SKILL.md" \
+    "now and follow it for the rest of this session." \
+    "" \
+    "Your work item: $work" \
+    "Your attempt:   $attempt" \
+    "" \
+    "Build the alder CLI once (cargo build), then use ./target/debug/alder for" \
+    "every alder command; your worktree already carries .alder/config.json. The" \
+    "log is the authority over this launch text — re-read your item if the two" \
+    "disagree." \
+    "" \
+    "The item as recorded at dispatch (alder show $work):" \
+    ""
+  "$alder" show "$work"
+} >"$prompt"
+
+# 3. Launch — or adopt the execution a crashed dispatch already started. The
+# runner seeds the worker's log configuration into the worktree before the
+# engine starts (--seed), and its exit codes are the contract: 0 started
+# (stdout: handle, then `tier <served>`), 3 already running (stdout:
+# `handle <h>` — adopt it), 4 another dispatch holds the lock (abort; rerun
+# later), 5 an unproven session (abort; a human decides).
+set +e
+"$runner" start --repo "$root" --branch "$branch" --tier "$tier" \
+  --prompt-file "$prompt" \
+  --seed "$root/.alder/config.json:.alder/config.json" \
+  >"$scratch/runner-out" 2>"$scratch/runner-err"
+runner_status=$?
+set -e
+cat "$scratch/runner-err" >&2 || true
+served=""
+case $runner_status in
+0)
+  handle=$(sed -n 1p "$scratch/runner-out")
+  served=$(sed -n '2s/^tier //p' "$scratch/runner-out")
+  if [ -z "$handle" ]; then
+    echo "dispatch: the runner started but printed no handle" >&2
+    exit 1
+  fi
+  echo "dispatch: started $handle (tier ${served:-$tier})"
+  ;;
+3)
+  handle=$(sed -n '1s/^handle //p' "$scratch/runner-out")
+  if [ -z "$handle" ]; then
+    echo "dispatch: the runner refused with exit 3 but printed no handle line" >&2
+    exit 1
+  fi
+  # The served tier is stamped on the live session; read it back so the
+  # bind can record the truth even on the adopt path.
+  served=$("$runner" status "$handle" | sed -n '2s/^tier \([^,]*\).*/\1/p') || served=""
+  echo "dispatch: adopting live execution $handle"
+  ;;
+4)
+  echo "dispatch: another operation holds the start lock for $branch (a racing dispatch); rerun later" >&2
+  exit 1
+  ;;
+5)
+  echo "dispatch: the runner refuses to start on $branch (exit 5); resolve the session by hand" >&2
+  exit 1
+  ;;
+*)
+  echo "dispatch: the runner failed (exit $runner_status)" >&2
+  exit 1
+  ;;
+esac
+
+# 4. Bind. A bound attempt means dispatch finished: the execution is the
+# attempt's to observe. Binding is one-way in alder, so a re-run verifies
+# rather than re-binds. When rate-limit substitution served a different rung
+# than requested, the bind records the served tier too, so cross-review
+# vendor selection reads what actually ran.
+"$alder" show "$attempt" --json >"$scratch/bound.json"
+bound=$(json_field "$scratch/bound.json" current.handle 2>/dev/null || true)
+if [ -z "$bound" ]; then
+  bind_args=(attempt edit "$attempt" --handle "$handle")
+  if [ -n "$served" ] && [ "$served" != "$tier" ]; then
+    echo "dispatch: rate-limit substitution served tier $served (requested $tier)"
+    bind_args+=(--tier "$served")
+  fi
+  "$alder" "${bind_args[@]}"
+  echo "dispatch: bound $attempt to $handle"
+elif [ "$bound" = "$handle" ]; then
+  echo "dispatch: $attempt is already bound to $handle"
+else
+  echo "dispatch: $attempt is bound to $bound, not $handle; refusing" >&2
+  exit 1
+fi

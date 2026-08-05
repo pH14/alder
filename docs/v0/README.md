@@ -129,9 +129,9 @@ planning language.
 An attempt is recorded before its worker is launched, then the worker's
 opaque handle is attached to the attempt with `alder attempt edit`. The
 schema-level rule is one-directional: the log stores the runner's names, and
-nothing of Alder's requires a mark planted in the worker. (Transitionally,
-the in-tree alderd runner still stamps `ALDER_ATTEMPT` into its own sessions
-as private crash-adoption bookkeeping until the runner extraction.)
+nothing of Alder's requires a mark planted in the worker. (The extracted
+runner, `alder-ext-runner`, stamps only its own names into its sessions as
+private crash-adoption bookkeeping.)
 
 This makes the crash window repairable: a recorded attempt with no bound
 handle is `unspawned` — launch a worker for it, or end the attempt as
@@ -212,7 +212,7 @@ tier name — and returns its ID. The runner then launches the work and
 attaches an opaque handle to the attempt with `alder attempt edit`.
 
 A handle is a non-empty opaque string the runner chose, such as
-`tmux:alder-work-hm-9a1` or `codex:019f...`. Alder stores it verbatim and
+`alder-ext-work-hm-9a1` or `codex:019f...`. Alder stores it verbatim and
 never parses it; no part of it selects anything inside Alder. Removing an
 observation command never invalidates a stored handle or prevents replay.
 

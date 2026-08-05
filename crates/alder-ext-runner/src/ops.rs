@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::{
-    error::{Result, RunnerError},
+    error::{EXIT_UNRECEIVABLE, Result, RunnerError},
     host::{EngineMarker, Host},
     start::{ENGINE_ENV, ENGINE_RUNNING, TORN_ENV},
     tier::Provider,
@@ -125,6 +125,13 @@ pub fn kill(host: &Host, handle: &str) -> Result<Killed> {
 /// and stamped into the session; `send` reads it back and never consults the
 /// current tier table, so reclassifying a tier in the config cannot change a
 /// live session's delivery protocol.
+///
+/// **Exit codes are the contract.** 0 is one accepted delivery. 4 means
+/// another operation holds the handle's lock — the caller should treat the
+/// message as already served by the lock winner, never kill the session over
+/// it. 5 means the execution cannot receive this delivery — nothing answers
+/// to the handle, the engine exited, the pane is torn, or the codex session
+/// cannot be resumed — and the caller may rotate. Everything else is 1.
 pub fn send(host: &Host, handle: &str, file: &Path, force: bool) -> Result<()> {
     use crate::host::RunnerHost;
     if !file.is_file() {
@@ -150,9 +157,12 @@ pub fn send(host: &Host, handle: &str, file: &Path, force: bool) -> Result<()> {
     // refuses, for symmetry with `start`, rather than queueing a message the
     // caller believes was delivered promptly.
     let _lock = host.lock_handle(handle)?;
-    let observed = host
-        .tmux_session(handle)?
-        .ok_or_else(|| RunnerError::new(format!("no execution answers to `{handle}`")))?;
+    let observed = host.tmux_session(handle)?.ok_or_else(|| {
+        RunnerError::refusal(
+            EXIT_UNRECEIVABLE,
+            format!("no execution answers to `{handle}`"),
+        )
+    })?;
     let provider = observed.provider.as_deref().ok_or_else(|| {
         RunnerError::new(format!(
             "session `{handle}` carries no provider stamp; it is not this runner's"
@@ -168,28 +178,37 @@ pub fn send(host: &Host, handle: &str, file: &Path, force: bool) -> Result<()> {
     // unsubmitted text, and pasting more at it would mix two messages.
     let torn = host.tmux_environment(handle, TORN_ENV)?.is_some();
     if torn && !force {
-        return Err(RunnerError::new(format!(
-            "the pane for `{handle}` holds unsubmitted text from a torn send; \
+        return Err(RunnerError::refusal(
+            EXIT_UNRECEIVABLE,
+            format!(
+                "the pane for `{handle}` holds unsubmitted text from a torn send; \
              kill or submit it first, or pass --force to deliver anyway"
-        )));
+            ),
+        ));
     }
 
     let buffer = format!("alder-ext-send-{}", std::process::id());
     let delivered = match provider {
         Provider::Claude => {
             if observed.engine == EngineMarker::Exited {
-                return Err(RunnerError::new(format!(
-                    "cannot deliver to the exited interactive engine for `{handle}`; \
+                return Err(RunnerError::refusal(
+                    EXIT_UNRECEIVABLE,
+                    format!(
+                        "cannot deliver to the exited interactive engine for `{handle}`; \
                      start a fresh execution"
-                )));
+                    ),
+                ));
             }
             if observed.engine != EngineMarker::Running {
                 // Fail-safe: never paste at a pane that cannot prove an
                 // engine is running to receive it.
-                return Err(RunnerError::new(format!(
-                    "session `{handle}` cannot prove an engine is running (no engine \
+                return Err(RunnerError::refusal(
+                    EXIT_UNRECEIVABLE,
+                    format!(
+                        "session `{handle}` cannot prove an engine is running (no engine \
                      marker); refusing to paste at it"
-                )));
+                    ),
+                ));
             }
             // tmux reads the local file itself into a server buffer; no
             // command substitution can trim a newline or make its contents
@@ -209,10 +228,13 @@ pub fn send(host: &Host, handle: &str, file: &Path, force: bool) -> Result<()> {
             let marker = state.join("codex-session");
             let codex_session = std::fs::read_to_string(&marker)
                 .map_err(|error| {
-                    RunnerError::new(format!(
-                        "cannot resume `{handle}`: no codex session recorded at `{}`: {error}",
-                        marker.display()
-                    ))
+                    RunnerError::refusal(
+                        EXIT_UNRECEIVABLE,
+                        format!(
+                            "cannot resume `{handle}`: no codex session recorded at `{}`: {error}",
+                            marker.display()
+                        ),
+                    )
                 })?
                 .trim()
                 .to_owned();
@@ -220,10 +242,13 @@ pub fn send(host: &Host, handle: &str, file: &Path, force: bool) -> Result<()> {
             // lowercase UUID; anything else — including an option-like string
             // — is not a session ID and must never reach a command line.
             if !is_codex_session_id(&codex_session) {
-                return Err(RunnerError::new(format!(
-                    "the recorded codex session for `{handle}` is not a session ID \
+                return Err(RunnerError::refusal(
+                    EXIT_UNRECEIVABLE,
+                    format!(
+                        "the recorded codex session for `{handle}` is not a session ID \
                      (expected a lowercase UUID)"
-                )));
+                    ),
+                ));
             }
             let bytes = std::fs::read(file).map_err(|error| {
                 RunnerError::new(format!("cannot read `{}`: {error}", file.display()))
@@ -257,17 +282,23 @@ pub fn send(host: &Host, handle: &str, file: &Path, force: bool) -> Result<()> {
         && host.tmux_environment(handle, ENGINE_ENV)?.as_deref() != Some(ENGINE_RUNNING)
     {
         if let Err(clear) = host.tmux_discard_input(handle) {
-            return Err(RunnerError::new(format!(
-                "the engine for `{handle}` exited between paste and submit, and \
+            return Err(RunnerError::refusal(
+                EXIT_UNRECEIVABLE,
+                format!(
+                    "the engine for `{handle}` exited between paste and submit, and \
                  the pasted text could NOT be cleared ({clear}); do not press \
                  Enter in that pane — clear its input line by hand"
-            )));
+                ),
+            ));
         }
-        return Err(RunnerError::new(format!(
-            "the engine for `{handle}` exited between paste and submit; the \
+        return Err(RunnerError::refusal(
+            EXIT_UNRECEIVABLE,
+            format!(
+                "the engine for `{handle}` exited between paste and submit; the \
              pasted text was cleared (C-u) and nothing was submitted. Start a \
              fresh execution instead"
-        )));
+            ),
+        ));
     }
     // The paste landed; from here the only honest outcomes are "submitted"
     // or "torn, and the session says so". One immediate retry covers a
@@ -282,11 +313,14 @@ pub fn send(host: &Host, handle: &str, file: &Path, force: bool) -> Result<()> {
                  `{handle}`: {mark}"
             );
         }
-        return Err(RunnerError::new(format!(
-            "DELIVERY TORN for `{handle}`: the text was pasted but Enter failed \
+        return Err(RunnerError::refusal(
+            EXIT_UNRECEIVABLE,
+            format!(
+                "DELIVERY TORN for `{handle}`: the text was pasted but Enter failed \
              twice ({first}; retry: {second}). Unsubmitted text sits in the pane; \
              kill or submit it by hand, or resend with --force"
-        )));
+            ),
+        ));
     }
     if torn {
         // `--force` delivered over a torn pane and its Enter landed, which

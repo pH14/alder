@@ -483,7 +483,7 @@ A second `work start` is rejected while an active attempt exists.
 
 ```text
 $ alder attempt edit hm-9a1-attempt-1 \
-    --handle tmux:alder-work-hm-9a1
+    --handle alder-ext-work-hm-9a1
 ```
 
 `--handle` attaches one external handle to the attempt. A handle is a
@@ -707,7 +707,7 @@ key, ordered by that key. It does not run scripts or inspect SQLite.
 ```text
 $ alder observations
 github  owner/repo#171  ci  passing
-tmux    hm-9a1-attempt-1  liveness  present
+runner  hm-9a1-attempt-1  liveness  present
 ```
 
 ### `alder observation report <observer> <subject> <field> <level>`
@@ -753,12 +753,13 @@ appends nothing.
 
 A `probe` command is invoked once per relevant handle, with the handle as its
 single argument (`$1`), and prints exactly one word: `present` (the
-execution this handle names is running), `absent` (the probe recognizes the
-name and nothing runs under it), or `unknown` (not a name the probe
-recognizes; Alder writes nothing).
+execution this handle names is running), `done` (the execution finished; the
+result is on the branch and wants inspecting), `absent` (the probe
+recognizes the name and nothing runs under it), or `unknown` (not a name the
+probe recognizes; Alder writes nothing).
 
 ```json
-{"observer":"tmux", "probe":"scripts/observe-tmux.sh \"$1\""}
+{"observer":"runner", "probe":"scripts/observe-runner.sh \"$1\""}
 ```
 
 The handle stays fully opaque to Alder: it is passed verbatim and matched
@@ -768,14 +769,17 @@ handle, plus every handle bound to an ended attempt whose liveness key is
 still current, and records each answer under the attempt's own ID — the
 durable key is `(observer, attempt-id, liveness)`:
 
-- active + `present` or `absent`: that level is reported — `absent`
-  establishes the key even on the first sweep, so a worker that died before
-  it was ever observed still becomes a durable statement;
+- active + `present`, `done`, or `absent`: that level is reported — `done`
+  makes `reconcile` say `finished` (inspect the branch before ending the
+  attempt), and `absent` establishes the key even on the first sweep, so a
+  worker that died before it was ever observed still becomes a durable
+  statement;
 - active + `unknown`: nothing is written, and reconcile keeps saying
   `observation_unknown`, which is honest;
 - ended + `present`: the level stays, so `reconcile` names the `orphan`;
-- ended + `absent` or `unknown`: the key retires — an ended attempt is not
-  watched forever once its execution is gone or unrecognizable.
+- ended + `done`, `absent`, or `unknown`: the key retires — an ended attempt
+  is not watched forever once its execution is finished, gone, or
+  unrecognizable.
 
 When an ended and a live attempt hold the same handle string (respawns reuse
 session names), the live attempt owns the probe answer and the ended
@@ -869,7 +873,7 @@ hm-9a1-attempt-1
 
 # The runner launches the worker, then:
 $ alder attempt edit hm-9a1-attempt-1 \
-    --handle tmux:alder-work-hm-9a1
+    --handle alder-ext-work-hm-9a1
 ```
 
 Later:

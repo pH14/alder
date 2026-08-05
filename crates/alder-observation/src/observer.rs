@@ -67,17 +67,20 @@ pub fn validate_output(bytes: &[u8]) -> Result<Vec<NormalizedObject>> {
     Ok(objects)
 }
 
-/// A probe answers with exactly one word — `present`, `absent`, or
+/// A probe answers with exactly one word — `present`, `done`, `absent`, or
 /// `unknown` — surrounded by nothing but whitespace. Anything else is an
-/// invalid execution and retries like malformed `list` output.
+/// invalid execution and retries like malformed `list` output. `done` is the
+/// probe's way of saying "the execution finished and its result is safe":
+/// distinct from `absent`, which means nothing runs under the handle at all
+/// and there may be nothing to inspect.
 pub fn validate_probe_output(bytes: &[u8]) -> Result<String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| AlderError::new("invalid_observation", "a probe answer must be UTF-8 text"))?;
     match text.trim() {
-        answer @ ("present" | "absent" | "unknown") => Ok(answer.to_owned()),
+        answer @ ("present" | "done" | "absent" | "unknown") => Ok(answer.to_owned()),
         other => Err(AlderError::with_context(
             "invalid_observation",
-            "a probe must answer exactly one of `present`, `absent`, or `unknown`",
+            "a probe must answer exactly one of `present`, `done`, `absent`, or `unknown`",
             json!({"answer": bounded(other.as_bytes(), 80)}),
         )),
     }

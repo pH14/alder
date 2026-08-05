@@ -54,9 +54,10 @@ not merge.
 The reviewer is the rung across from the author's or higher — never the
 author's own vendor or session, and never a subagent of the executor (it
 inherits unlogged session effort). The author is every vendor with an attempt
-on the branch; check the `engine` metadata of every attempt, not just the
-newest. Attempt IDs take the form `al-<id>-attempt-N`, so inspect each attempt
-by that ID with `alder show <attempt-id>`.
+on the branch; check the `tier` of every attempt, not just the newest — the
+rungs `luna`, `terra`, `sol` are codex and `sonnet`, `opus`, `fable` are
+claude. Attempt IDs take the form `al-<id>-attempt-N`, so inspect each
+attempt by that ID with `alder show <attempt-id>`.
 
 | authored at | reviewed by |
 | --- | --- |
@@ -83,7 +84,7 @@ Claude-authored branch — Codex review:
 ```sh
 codex review --base main --title "Cross-review work/<id>" \
   -c model=gpt-5.6-sol -c model_reasoning_effort=xhigh \
-  -c approval_policy=never -c sandbox_mode=workspace-write
+  -c approval_policy=never -c sandbox_mode=workspace-write < /dev/null
 ```
 
 `codex review` scope flags and a prompt do not compose (measured): `--base
@@ -91,29 +92,54 @@ main` plus a positional prompt errors, and a bare prompt lets the model pick
 its own scope and miss commits. A scoped review carries no custom
 instructions; `AGENTS.md` and the diff are the entire lens. `--title` is
 display text, not a prompt channel. There is no `-m`; pin the model with
-`-c model=`.
+`-c model=`. **Close stdin** (`< /dev/null`): a backgrounded `codex
+review`/`codex exec` with an open stdin wedges waiting on it.
 
-Codex-authored branch — fresh Claude review in a tmux session (operator
-ruling 2026-07-31: never `claude -p`; the tmux method is the standard
-transport, same as workers):
+Codex-authored branch — fresh Claude review through the runner (operator
+ruling 2026-07-31: never `claude -p`; the interactive session is the
+standard transport, same as workers). The review runs on its OWN branch,
+`review/<id>`, cut from the branch under review — never on `work/<id>`
+itself. The runner's handle is deterministic per branch, so the reviewer
+gets `alder-ext-review-<id>`, distinct from the worker's handle: the
+worker's session, its per-handle state, and its codex resume recording are
+never replaced by a review, and a ruling can still resume the worker after
+any number of review rounds:
 
 ```sh
-tmux new-session -d -s review-<id> -c <branch-worktree> \
-  claude --model claude-fable-5 --effort xhigh --permission-mode auto
-.alder/relay review-<id> "$scratch/review-prompt-<id>.txt"
+alder-ext-runner start --repo <primary-root> --branch review/<id> \
+  --from work/<id> --tier fable \
+  --prompt-file "$scratch/review-prompt-<id>.txt"
 ```
 
-Collect the verdict from the session's pane/transcript, record it, then kill
-the session. Freshness still matters: a new session every review, never the
-executor's own or a subagent (both carry unlogged context or effort).
+(`--from` cuts the new `review/<id>` branch at `work/<id>`'s tip instead of
+the repo HEAD, so the reviewer's worktree holds exactly the code under
+review.)
+
+Collect the verdict from the session's transcript, record it (below), then
+clean up: `alder-ext-runner kill <handle>`, remove the review worktree
+(`git worktree remove ../alder-ext-review-<id>`, beside the primary
+checkout), and delete the review branch (`git branch -D review/<id>`). The
+review branch carries no result — the verdict lives in the log — so
+deleting it loses nothing. A round-2 message to the same reviewer session
+rides `alder-ext-runner send <handle> --file <file>` while it is alive.
+Freshness still matters: a fresh session every review, never the executor's
+own or a subagent (both carry unlogged context or effort).
+
+A crashed pass leaves a live `review/<id>` execution behind. The next pass
+checks `alder-ext-runner status alder-ext-review-<id>`: anything but `dead`
+means a stale review — kill the handle, delete the leftover `review/<id>`
+branch and worktree, and rerun the review whole. At-least-once, on purpose:
+a half-collected verdict is not a verdict, and rerunning costs one review.
 
 The prompt file (in `$scratch`, outside the worktree) holds the brief:
 
 ```text
+You are a reviewer on branch review/<id>, a throwaway copy of work/<id>.
 Review work/<id> against main: git diff main...work/<id>.
 The item is <work-id> — <the item's title>.
 Its spec: <spec, or 'none recorded'>. Its checks: <checks>.
 AGENTS.md is the review lens. Report findings, or say the branch is clean.
+Commit nothing.
 ```
 
 **Watching a run:** wait on the review's PID, not a `pgrep` pattern that can
@@ -121,8 +147,8 @@ match the waiter (or the ChatGPT app's own long-lived process). A wedge looks
 like a slow review by clock alone: if output has not grown for ~25 minutes and
 CPU has gained only seconds, kill it, record the abandonment, end the pass.
 That silence-plus-low-CPU heuristic is for streaming Codex reviews. For a
-tmux-hosted Claude review, pane and session-transcript growth is the useful
-signal instead.
+runner-hosted Claude review, session-transcript growth is the useful signal
+instead.
 In a review sandbox, a `host_tmux` test failure is environmental, not a
 finding.
 
@@ -154,8 +180,9 @@ remains a named quoting surface: write any nonliteral value to a local file and
 pass it as `"$(cat "$file")"`. Inside double quotes that becomes one argv
 value; its contents are not parsed again as shell syntax.
 
-**Feedback:** if the author session is alive, relay the findings. If it is
-gone, spawn a fresh worker whose brief names the exact source attempt ID and
+**Feedback:** if the author session is alive, deliver the findings file with
+`alder-ext-runner send <handle> --file <file>`. If it is
+gone, dispatch a fresh worker whose brief names the exact source attempt ID and
 says to run `alder show <attempt-id>` before writing code. Never copy findings
 into specs, notes, goals, or metadata — the check evidence is the single copy.
 Pick the fix tier by the size of the findings, not the original item.

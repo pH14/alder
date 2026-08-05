@@ -98,9 +98,10 @@ pub(crate) fn acquire_start_lock(path: &Path, handle: &str) -> Result<StartLock>
         })?;
     match file.try_lock() {
         Ok(()) => Ok(StartLock { _file: Some(file) }),
-        Err(std::fs::TryLockError::WouldBlock) => Err(RunnerError::new(format!(
-            "another operation on `{handle}` holds its lock; refusing to race it"
-        ))),
+        Err(std::fs::TryLockError::WouldBlock) => Err(RunnerError::refusal(
+            crate::error::EXIT_LOCK_HELD,
+            format!("another operation on `{handle}` holds its lock; refusing to race it"),
+        )),
         Err(std::fs::TryLockError::Error(error)) => Err(RunnerError::new(format!(
             "cannot lock `{}` for `{handle}`: {error}",
             path.display()
@@ -141,6 +142,12 @@ pub trait RunnerHost {
     fn remove_path(&self, path: &Path) -> Result<()>;
     fn create_dir_all(&self, path: &Path) -> Result<()>;
     fn write_executable(&self, path: &Path, body: &str) -> Result<()>;
+    /// Whether `path` is itself a symlink (never following it). Absent paths
+    /// answer `false`.
+    fn is_symlink(&self, path: &Path) -> bool;
+    /// Copy one local file, used by `--seed` to provision a worktree before
+    /// its engine starts.
+    fn copy_file(&self, source: &Path, destination: &Path) -> Result<()>;
     fn log(&self, message: &str);
 }
 
@@ -406,6 +413,24 @@ impl RunnerHost for Host {
             })
     }
 
+    fn is_symlink(&self, path: &Path) -> bool {
+        path.symlink_metadata()
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+    }
+
+    fn copy_file(&self, source: &Path, destination: &Path) -> Result<()> {
+        std::fs::copy(source, destination)
+            .map(|_| ())
+            .map_err(|error| {
+                RunnerError::new(format!(
+                    "cannot seed `{}` from `{}`: {error}",
+                    destination.display(),
+                    source.display()
+                ))
+            })
+    }
+
     fn log(&self, message: &str) {
         self.say(message);
     }
@@ -461,6 +486,11 @@ mod tests {
         let refused = acquire_start_lock(&path, "alder-ext-work-x")
             .expect_err("a concurrent start is refused, not queued");
         assert!(refused.message.contains("holds its lock"), "{refused}");
+        assert_eq!(
+            refused.exit,
+            crate::error::EXIT_LOCK_HELD,
+            "scripts branch on exit 4 for lock contention"
+        );
 
         drop(held);
         acquire_start_lock(&path, "alder-ext-work-x")

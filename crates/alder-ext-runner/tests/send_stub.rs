@@ -9,7 +9,11 @@
 //! refused rather than typed at. Delivery routes by the provider `start`
 //! stamped into the session — never by the current tier table. The tmux on
 //! PATH is a stub that records its argv, so what the runner does to a
-//! terminal is an assertion here, not a claim.
+//! terminal is an assertion here, not a claim. The refusal exit codes are
+//! pinned here too, because scripts branch on them: 4 means another
+//! operation holds the handle lock (treat the message as already served),
+//! 5 means the execution cannot receive the delivery (the caller may
+//! rotate); anything else mechanical is 1.
 
 use std::{
     env, fs,
@@ -283,6 +287,11 @@ fn an_engine_that_exits_between_paste_and_recheck_is_backed_out_not_submitted() 
         "a send into a dying pane was reported delivered: {}",
         String::from_utf8_lossy(&output.stdout)
     );
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "a dead engine is exit 5: the caller may rotate"
+    );
     let complaint = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         complaint.contains(HANDLE) && complaint.contains("exited between paste and submit"),
@@ -428,6 +437,11 @@ fn a_torn_enter_marks_the_pane_and_later_sends_refuse_until_force_resolves_it() 
         "a torn Enter was reported as delivered: {}",
         String::from_utf8_lossy(&torn.stdout)
     );
+    assert_eq!(
+        torn.status.code(),
+        Some(5),
+        "a torn delivery is exit 5: the caller may rotate"
+    );
     let complaint = String::from_utf8_lossy(&torn.stderr).into_owned();
     assert!(complaint.contains("DELIVERY TORN"), "{complaint}");
     assert!(
@@ -456,6 +470,11 @@ fn a_torn_enter_marks_the_pane_and_later_sends_refuse_until_force_resolves_it() 
     fs::remove_file(&stub.enter_fails).unwrap();
     let refused = send(&stub, "running", "claude");
     assert!(!refused.status.success());
+    assert_eq!(
+        refused.status.code(),
+        Some(5),
+        "a torn pane refusal is exit 5: the caller may rotate"
+    );
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains("holds unsubmitted text"),
         "{}",
@@ -504,6 +523,11 @@ fn a_pane_that_cannot_prove_a_running_engine_is_refused_not_pasted_at() {
     // to never paste at a pane that cannot prove an engine is listening.
     let output = send(&stub, "", "claude");
     assert!(!output.status.success());
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "an unprovable engine is exit 5: the caller may rotate"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("cannot prove an engine is running"),
         "{}",
@@ -544,6 +568,11 @@ fn an_exited_interactive_engine_is_refused_rather_than_typed_at() {
     let stub = stub();
     let output = send(&stub, "exited", "claude");
     assert!(!output.status.success());
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "an exited interactive engine is exit 5: the caller may rotate"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("exited interactive engine"),
         "{}",
@@ -566,6 +595,11 @@ fn a_codex_send_without_a_recorded_lowercase_uuid_is_refused() {
     // from `--last`, which the runner refuses to do.
     let output = send(&stub, "exited", "codex");
     assert!(!output.status.success());
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "an unresumable codex execution is exit 5: the caller may rotate"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("no codex session recorded"),
         "{}",
@@ -608,6 +642,11 @@ fn a_file_past_the_send_ceiling_is_refused_by_name() {
         &["send", HANDLE, "--file", big.to_str().unwrap()],
     );
     assert!(!output.status.success());
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an oversized file is a caller mistake, not a rotatable engine state"
+    );
     let complaint = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(complaint.contains("64 KiB"), "{complaint}");
     assert!(
@@ -645,6 +684,11 @@ fn a_send_refuses_while_another_operation_holds_the_handle_lock() {
 
     let output = send(&stub, "running", "claude");
     assert!(!output.status.success());
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "lock contention is exit 4: the caller treats the wake as already served"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("holds its lock"),
         "{}",
@@ -661,6 +705,35 @@ fn a_send_refuses_while_another_operation_holds_the_handle_lock() {
     assert!(
         output.status.success(),
         "a released lock still refuses: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_send_to_a_handle_nothing_answers_to_is_exit_5() {
+    let stub = stub();
+    let output = Command::new(env!("CARGO_BIN_EXE_alder-ext-runner"))
+        .args(["send", HANDLE, "--file", stub.finding.to_str().unwrap()])
+        .env("PATH", &stub.path)
+        .env("STUB_HANDLE", HANDLE)
+        .env("STUB_ENGINE", "running")
+        .env("STUB_PROVIDER", "claude")
+        .env("STUB_WORKTREE", &stub.worktree)
+        .env("STUB_ABSENT", "1")
+        .env("STUB_KILL_FAILS", "")
+        .env("ALDER_EXT_RUNNER_STATE_DIR", &stub.state)
+        .env_remove("ALDER_EXT_RUNNER_CONFIG")
+        .output()
+        .expect("the runner runs");
+    assert!(!output.status.success());
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "a dead handle is exit 5: the caller may rotate"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no execution answers"),
+        "{}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

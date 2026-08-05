@@ -203,10 +203,13 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
     let luna = lookup(&TIERS, "luna").expect("luna is a rung");
     let started = start::start(
         &host,
-        BRANCH,
         luna,
-        prompt,
-        Some(&stub.display().to_string()),
+        &start::Request {
+            branch: BRANCH,
+            prompt,
+            override_command: Some(&stub.display().to_string()),
+            ..start::Request::default()
+        },
     )
     .expect("the start succeeds");
 
@@ -304,13 +307,23 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
     // A second start while the engine is live is genuinely refused.
     let refused = start::start(
         &host,
-        BRANCH,
         luna,
-        prompt,
-        Some(&stub.display().to_string()),
+        &start::Request {
+            branch: BRANCH,
+            prompt,
+            override_command: Some(&stub.display().to_string()),
+            ..start::Request::default()
+        },
     )
     .expect_err("a second live execution is refused");
     assert!(refused.message.contains("already running"), "{refused}");
+    // The refusal is the machine contract scripts adopt from: exit 3, and
+    // the adoptable handle on stdout.
+    assert_eq!(refused.exit, alder_ext_runner::error::EXIT_ALREADY_RUNNING);
+    assert_eq!(
+        refused.stdout.as_deref(),
+        Some(format!("handle {session}").as_str())
+    );
 
     // The resume machinery lives in the runner-owned state directory — the
     // worktree, which the execution itself writes, carries none of it — and
@@ -475,10 +488,13 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
     let opus = lookup(&TIERS, "opus").expect("opus is a rung");
     let restarted = start::start(
         &host,
-        BRANCH,
         opus,
-        "a second prompt for the same branch",
-        Some(&interactive_stub.display().to_string()),
+        &start::Request {
+            branch: BRANCH,
+            prompt: "a second prompt for the same branch",
+            override_command: Some(&interactive_stub.display().to_string()),
+            ..start::Request::default()
+        },
     )
     .expect("an exited pane is replaced");
     assert!(restarted.adopted_worktree);

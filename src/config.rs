@@ -382,16 +382,16 @@ mod tests {
     fn an_observer_has_exactly_one_command_form() {
         let mut config = valid_config();
         config.observers[0].list = None;
-        config.observers[0].probe = Some("scripts/observe-tmux.sh \"$1\"".to_owned());
+        config.observers[0].probe = Some("scripts/observe-runner.sh \"$1\"".to_owned());
         assert!(validate_config(&config).is_ok());
         assert_eq!(config.observers[0].mode(), "probe");
         assert_eq!(
             config.observers[0].command(),
-            "scripts/observe-tmux.sh \"$1\""
+            "scripts/observe-runner.sh \"$1\""
         );
 
         let mut config = valid_config();
-        config.observers[0].probe = Some("scripts/observe-tmux.sh \"$1\"".to_owned());
+        config.observers[0].probe = Some("scripts/observe-runner.sh \"$1\"".to_owned());
         assert!(validate_config(&config).is_err());
 
         let mut config = valid_config();

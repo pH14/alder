@@ -6,7 +6,7 @@ use alder_ext_runner::{
     host::Host,
     limits::Limits,
     ops,
-    start::{self, RUNNER_CMD_ENV},
+    start::{self, RUNNER_CMD_ENV, Seed},
     tier::{Provider, Tier},
 };
 use chrono::Utc;
@@ -15,8 +15,13 @@ fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
         Err(error) => {
+            // A refusal's machine-readable line rides stdout; the prose is
+            // stderr. The exit code is part of the contract (see --help).
+            if let Some(line) = &error.stdout {
+                println!("{line}");
+            }
             eprintln!("alder-ext-runner: {error}");
-            ExitCode::from(1)
+            ExitCode::from(error.exit)
         }
     }
 }
@@ -46,12 +51,15 @@ fn usage(complaint: &str) -> RunnerError {
     RunnerError::new(format!("{complaint}\n\n{USAGE}"))
 }
 
-/// `start --repo <path> --branch <name> --tier <name> --prompt-file <path>`.
+/// `start --repo <path> --branch <name> --tier <name> --prompt-file <path>
+/// [--from <ref>] [--seed <src>:<relpath>]...`.
 fn start_execution(arguments: &[String]) -> Result<ExitCode, RunnerError> {
     let mut repo: Option<PathBuf> = None;
     let mut branch: Option<String> = None;
     let mut tier_name: Option<String> = None;
     let mut prompt_file: Option<PathBuf> = None;
+    let mut from: Option<String> = None;
+    let mut seeds: Vec<Seed> = Vec::new();
     let mut iterator = arguments.iter();
     while let Some(argument) = iterator.next() {
         let mut value = |flag: &str| {
@@ -65,6 +73,8 @@ fn start_execution(arguments: &[String]) -> Result<ExitCode, RunnerError> {
             "--branch" => branch = Some(value("--branch")?),
             "--tier" => tier_name = Some(value("--tier")?),
             "--prompt-file" => prompt_file = Some(PathBuf::from(value("--prompt-file")?)),
+            "--from" => from = Some(value("--from")?),
+            "--seed" => seeds.push(Seed::parse(&value("--seed")?)?),
             other => return Err(usage(&format!("unknown argument `{other}`"))),
         }
     }
@@ -96,10 +106,23 @@ fn start_execution(arguments: &[String]) -> Result<ExitCode, RunnerError> {
 
     let host = Host::new(repo);
     let override_command = env::var(RUNNER_CMD_ENV).ok();
-    let started = start::start(&host, &branch, tier, &prompt, override_command.as_deref())?;
+    let started = start::start(
+        &host,
+        tier,
+        &start::Request {
+            branch: &branch,
+            prompt: &prompt,
+            override_command: override_command.as_deref(),
+            from: from.as_deref(),
+            seeds: &seeds,
+        },
+    )?;
     eprintln!("alder-ext-runner: {}", started.summary());
-    // The handle is the whole stdout, so a caller can capture it verbatim.
+    // Stdout is the machine-readable contract: the handle on the first line,
+    // and the served tier on the second — rate-limit substitution can serve a
+    // different rung than requested, and the caller records the truth.
     println!("{}", started.handle);
+    println!("tier {}", started.tier);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -268,6 +291,7 @@ const USAGE: &str = "\
 alder-ext-runner — give a prompt to a model at some effort; get a handle
 
 usage: alder-ext-runner start --repo <path> --branch <name> --tier <name> --prompt-file <path>
+                              [--from <ref>] [--seed <src>:<relpath>]...
        alder-ext-runner status <handle>
        alder-ext-runner send <handle> --file <path> [--force]
        alder-ext-runner kill <handle>
@@ -276,11 +300,17 @@ usage: alder-ext-runner start --repo <path> --branch <name> --tier <name> --prom
 
 start   Launch one execution: a worktree beside the repo on the given branch,
         and a session running the tier's engine with the prompt file's
-        contents as its final argument. Prints the handle and exits; the
-        result's location is the branch. An unknown tier is an error, never a
-        CLI default.
+        contents as its final argument. Prints the handle on stdout's first
+        line and `tier <served>` on the second (rate-limit substitution can
+        serve a different rung than requested) and exits; the result's
+        location is the branch. An unknown tier is an error, never a CLI
+        default. --from cuts a NEW branch from the named ref instead of the
+        repo's HEAD; an existing branch is reused unchanged. Each --seed
+        copies a local file to <relpath> inside the worktree before the
+        engine starts; a symlinked destination or parent is refused.
 status  One word about a handle: running, done (the engine exited; the branch
-        holds whatever it left), or dead (nothing answers to the handle).
+        holds whatever it left), or dead (nothing answers to the handle). An
+        optional second line carries detail (the served tier, the worktree).
 send    Deliver a local file's contents as input to the running execution.
         Delivery is at-least-once. A send that tears between paste and Enter
         leaves the pane refusing further sends until a human resolves it or
@@ -289,4 +319,16 @@ kill    End the execution. The worktree and branch remain.
 limit   Record that a provider is rate-limited, so start serves its rungs
         from the other ladder until then.
 budget  Trailing-window token spend per provider, read from local
-        transcripts, plus rate-limit state.";
+        transcripts, plus rate-limit state.
+
+exit codes (the machine contract scripts branch on):
+    0   done — for start, stdout is `<handle>` then `tier <served>`
+    1   failure with no better classification
+    3   start: the handle is already running a live engine; stdout carries
+        exactly `handle <h>` so the caller can adopt the execution
+    4   another operation on this handle holds its lock; a send caller
+        should treat the message as already served, never kill over it
+    5   start: a session exists but cannot prove its engine exited.
+        send: the execution cannot receive the delivery (engine exited,
+        nothing answers, torn pane, unresumable codex session) — the
+        caller may rotate";

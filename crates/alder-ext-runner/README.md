@@ -12,21 +12,28 @@ branch you gave at start; the runner never reads or interprets it.
 
 ```text
 alder-ext-runner start --repo <path> --branch <name> --tier <name> --prompt-file <path>
+                       [--from <ref>] [--seed <src>:<relpath>]...
 alder-ext-runner status <handle>
 alder-ext-runner send <handle> --file <path> [--force]
 alder-ext-runner kill <handle>
 ```
 
 **`start`** cuts (or adopts) a worktree beside the repository on the given
-branch — a new branch is cut from the repository's current `HEAD` — writes
-the runner's own resume machinery into its per-handle state directory
+branch — a new branch is cut from the repository's current `HEAD`, or from
+the ref `--from` names; an existing branch is reused unchanged either way —
+writes the runner's own resume machinery into its per-handle state directory
 (`<state dir>/<handle>/`, never into the worktree; see the trust model
-below), stamps the session with the resolved provider, and starts a detached
-tmux session running the tier's engine with the prompt file's contents
-(verbatim) as the engine's final argument. It prints the
-handle on stdout — nothing else — and exits. It does not wait for the engine
-to boot; there is no sleep anywhere on the path, and the tests read the
-source for one.
+below), copies each `--seed <src>:<relpath>` file to `<relpath>` inside the
+worktree **before** the engine starts (refusing if the destination or any
+parent inside the worktree is a symlink — a worktree is execution-writable
+across restarts, and a planted link could aim the copy outside it), stamps
+the session with the resolved provider, and starts a detached tmux session
+running the tier's engine with the prompt file's contents (verbatim) as the
+engine's final argument. Stdout is the machine contract: the handle on the
+first line and `tier <served>` on the second — rate-limit substitution (see
+`limit` below) can serve a different rung than requested, and the caller
+records the truth. It does not wait for the engine to boot; there is no
+sleep anywhere on the path, and the tests read the source for one.
 
 The handle is deterministic per branch (it is derived from the branch name),
 so a crashed or repeated `start` on the same branch converges on the same
@@ -51,9 +58,26 @@ using.
   judging that is the caller's business;
 - `dead` — nothing answers to the handle.
 
-An optional second line carries detail (tier, worktree). A session that
-exists but carries no runner marker reads `running`, because a session of
-unknown provenance must never be presumed finished.
+An optional second line carries detail (the served tier, the worktree). A
+session that exists but carries no runner marker reads `running`, because a
+session of unknown provenance must never be presumed finished.
+
+### Exit codes
+
+Refusals are machine-readable, because callers converge on them — adopting a
+live execution, treating a lock loss as already-served, rotating a dead
+engine — and prose parsed by `sed` is not a contract:
+
+| code | meaning |
+| --- | --- |
+| 0 | done. For `start`, stdout is `<handle>` then `tier <served>`. |
+| 1 | failure with no better classification. |
+| 3 | `start`: the handle is already running a live engine. Stdout carries exactly `handle <h>`, so the caller can adopt the execution without parsing prose. |
+| 4 | another operation on this handle holds its lock. A `send` caller should treat the message as already served by the lock winner — never kill the session over it. |
+| 5 | `start`: a session exists but cannot prove its engine exited. `send`: the execution cannot receive the delivery (the engine exited, nothing answers to the handle, the pane holds a torn send, or the codex session cannot be resumed) — the caller may rotate. |
+
+These codes and both stdout shapes are pinned in `tests/contract.rs` and
+`tests/send_stub.rs`.
 
 **`send`** delivers a local file's contents as input to the execution. The
 route is decided by the provider **stamped into the session at start**,
