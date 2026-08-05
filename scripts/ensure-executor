@@ -10,14 +10,25 @@
 #   2. ensures one executor session exists and delivers the wake to it:
 #        no handle, or its status is dead    -> start a fresh executor;
 #        alive but older than the rotation
-#        age, or a durable rotation request
-#        is outstanding                      -> kill it, start fresh;
+#        age, a negative age (the clock
+#        rolled back under the note), or a
+#        durable rotation request is
+#        outstanding                         -> kill it, start fresh;
 #        otherwise                           -> send one line naming the
 #                                               triggers ($ALDERD_TRIGGERS).
 #
-# A `done` executor (engine exited, holding shell remains) gets the send
-# first: for a one-shot engine that IS the resume path. If the send refuses
-# — an exited interactive engine, a torn pane — the session is rotated.
+# The runner's exit codes are the contract this script branches on, never its
+# prose. For `send`: 0 delivered; 4 means another operation holds the handle
+# lock — another wake is delivering, so this one stands down without killing
+# anything; 5 means the executor cannot receive the wake (a `done`
+# interactive engine, a torn pane) and the session is rotated. For `start`:
+# 0 started (stdout: the handle, then `tier <served>`); 3 means a live
+# executor already runs — adopt the handle from the `handle <h>` stdout line;
+# 4 means another wake is starting one — stand down.
+#
+# The notes file is written atomically (tmp+mv), and the honored-rotate-seq
+# it carries is advanced ONLY on a kill+start: an adopted executor never
+# consumes a rotation request, because nothing rotated.
 #
 # Branch discipline (documented decision): the executor sits in a runner-cut
 # worktree beside the primary checkout on the branch named by
@@ -97,18 +108,13 @@ fi
 case $started in '' | *[!0-9]*) started=0 ;; esac
 case $noted_rotate in '' | *[!0-9]*) noted_rotate=0 ;; esac
 
-note() { # note <handle> — the file a later wake decides from
-  printf '%s\n%s\n%s\n' "$1" "$(date +%s)" "$rotate_seq" >"$notes"
-}
-
-seed_worktree() { # seed_worktree <handle> — copy the log manifest in
-  worktree=$("$runner" status "$1" | sed -n 's/.*worktree //p' | head -n 1)
-  if [ -z "$worktree" ] || [ ! -d "$worktree" ]; then
-    echo "ensure-executor: cannot learn the worktree for $1" >&2
-    exit 1
-  fi
-  mkdir -p "$worktree/.alder"
-  cp "$root/.alder/config.json" "$worktree/.alder/config.json"
+# The file a later wake decides from, written whole or not at all: a wake
+# killed mid-write must never leave a torn note that misidentifies the
+# executor. The honored rotate seq is the caller's to choose — only a
+# kill+start passes the current request seq; adoption passes the old one.
+note() { # note <handle> <honored-rotate-seq>
+  printf '%s\n%s\n%s\n' "$1" "$(date +%s)" "$2" >"$notes.tmp.$$"
+  mv -f "$notes.tmp.$$" "$notes"
 }
 
 deliver() { # deliver <handle> — one line naming the triggers
@@ -118,46 +124,116 @@ deliver() { # deliver <handle> — one line naming the triggers
   "$runner" send "$1" --file "$scratch/wake"
 }
 
-start_fresh() {
-  cat >"$scratch/prompt" <<EOF
-You are the alder executor. First fast-forward this worktree to current
-main: git merge --ff-only main (your seat branch $branch carries no commits
-of its own). Then build the CLI (cargo build) and read PASS.md at the
-worktree root — it is your entire brief. Read the current Alder state and
-act on it. Triggers this wake: $triggers.
-EOF
-  if handle=$("$runner" start --repo "$root" --branch "$branch" --tier "$tier" \
-    --prompt-file "$scratch/prompt" 2>"$scratch/start-err"); then
-    cat "$scratch/start-err" >&2 || true
-    seed_worktree "$handle"
-    note "$handle"
-    echo "ensure-executor: started $handle"
-    return 0
-  fi
-  # A live session these notes had no record of: adopt it and deliver the
-  # wake to it instead. Its age is unknown, so the note starts it now —
-  # rotation arrives at most one rotation age late, which is harmless.
-  # The backticks are literal text in the runner's refusal, not expansions.
-  # shellcheck disable=SC2016
-  handle=$(sed -n 's/.*handle `\([^`]*\)` is already running.*/\1/p' "$scratch/start-err")
-  if [ -z "$handle" ]; then
-    cat "$scratch/start-err" >&2
+# Deliver the wake and act on the send contract: 0 delivered, 4 another wake
+# delivered (stand down, never kill), 5 the executor cannot receive (rotate
+# when allowed — killing an executor over a transient failure is not this
+# script's call for any other code).
+deliver_or_rotate() { # deliver_or_rotate <handle> <rotate|no-rotate>
+  local handle=$1 may_rotate=$2 sent=0
+  deliver "$handle" || sent=$?
+  case $sent in
+  0)
+    echo "ensure-executor: delivered wake to $handle"
+    exit 0
+    ;;
+  4)
+    echo "ensure-executor: another wake delivered to $handle; standing down"
+    exit 0
+    ;;
+  5)
+    if [ "$may_rotate" = rotate ]; then
+      echo "ensure-executor: $handle cannot receive the wake; rotating" >&2
+      "$runner" kill "$handle"
+      start_fresh "$rotate_seq" no-adopt
+    else
+      echo "ensure-executor: the adopted executor $handle cannot receive the wake; leaving it to the next wake" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "ensure-executor: send to $handle failed (exit $sent); failing this wake" >&2
     exit 1
-  fi
-  echo "ensure-executor: adopting live executor $handle"
-  seed_worktree "$handle"
-  note "$handle"
-  deliver "$handle"
+    ;;
+  esac
+}
+
+# Start a fresh executor. The runner seeds the worktree's log configuration
+# before the engine starts (--seed), so a fast engine can never read an
+# unseeded worktree. `note_seq` is the honored-rotate-seq the fresh note
+# records: the current request seq on a kill+start, the previous one
+# everywhere else.
+start_fresh() { # start_fresh <note-seq> <adopt|no-adopt>
+  local note_seq=$1 may_adopt=$2 status=0
+  printf '%s\n' \
+    "You are the alder executor. First fast-forward this worktree to current" \
+    "main: git merge --ff-only main (your seat branch $branch carries no commits" \
+    "of its own). Then build the CLI (cargo build) and read PASS.md at the" \
+    "worktree root — it is your entire brief. Read the current Alder state and" \
+    "act on it. Triggers this wake: $triggers." \
+    >"$scratch/prompt"
+  set +e
+  "$runner" start --repo "$root" --branch "$branch" --tier "$tier" \
+    --prompt-file "$scratch/prompt" \
+    --seed "$root/.alder/config.json:.alder/config.json" \
+    >"$scratch/start-out" 2>"$scratch/start-err"
+  status=$?
+  set -e
+  cat "$scratch/start-err" >&2 || true
+  case $status in
+  0)
+    handle=$(sed -n 1p "$scratch/start-out")
+    note "$handle" "$note_seq"
+    echo "ensure-executor: started $handle"
+    exit 0
+    ;;
+  3)
+    # A live session these notes had no record of: adopt it and deliver the
+    # wake to it instead. Its age is unknown, so the note starts it now —
+    # rotation arrives at most one rotation age late, which is harmless —
+    # and the honored seq stays put: an adopt never consumes a rotation
+    # request, because nothing rotated.
+    handle=$(sed -n '1s/^handle //p' "$scratch/start-out")
+    if [ -z "$handle" ]; then
+      echo "ensure-executor: the runner refused with exit 3 but printed no handle line" >&2
+      exit 1
+    fi
+    if [ "$may_adopt" != adopt ]; then
+      echo "ensure-executor: a live executor reappeared mid-rotation; leaving it to the next wake" >&2
+      exit 1
+    fi
+    echo "ensure-executor: adopting live executor $handle"
+    note "$handle" "$noted_rotate"
+    deliver_or_rotate "$handle" no-rotate
+    ;;
+  4)
+    echo "ensure-executor: another wake is starting the executor; standing down"
+    exit 0
+    ;;
+  *)
+    cat "$scratch/start-out" >&2 || true
+    echo "ensure-executor: the runner could not start an executor (exit $status)" >&2
+    exit 1
+    ;;
+  esac
 }
 
 action=start
 if [ -n "$handle" ]; then
-  word=$("$runner" status "$handle" | head -n 1)
+  # Captured to a file, not piped through `head`: a reader that quits after
+  # the first line SIGPIPEs the runner's second, and pipefail would then
+  # fail the wake on a perfectly good status.
+  "$runner" status "$handle" >"$scratch/status"
+  word=$(sed -n 1p "$scratch/status")
   age=$(($(date +%s) - started))
   case $word in
   running | done)
     if [ "$rotate_seq" -gt "$noted_rotate" ]; then
       echo "ensure-executor: rotation requested (seq $rotate_seq); rotating $handle"
+      action=rotate
+    elif [ "$age" -lt 0 ]; then
+      # The note claims a start in the future: the clock rolled back under
+      # it. An unknowable age is treated as ancient — the safe direction.
+      echo "ensure-executor: $handle claims a future start (clock rollback); rotating"
       action=rotate
     elif [ "$age" -ge "$rotation" ]; then
       echo "ensure-executor: $handle is ${age}s old (limit ${rotation}s); rotating"
@@ -173,16 +249,17 @@ if [ -n "$handle" ]; then
 fi
 
 if [ "$action" = send ]; then
-  if deliver "$handle"; then
-    echo "ensure-executor: delivered wake to $handle"
-    exit 0
-  fi
-  echo "ensure-executor: send to $handle refused; rotating" >&2
-  action=rotate
+  # A `done` executor (engine exited, holding shell remains) gets the send
+  # first: for a one-shot engine that IS the resume path. An exit-5 refusal
+  # — an exited interactive engine, a torn pane — rotates instead.
+  deliver_or_rotate "$handle" rotate
 fi
 
 if [ "$action" = rotate ]; then
   "$runner" kill "$handle"
+  # The kill+start path is the one place the honored seq advances: this is
+  # what consumes an outstanding rotation request.
+  start_fresh "$rotate_seq" adopt
 fi
 
-start_fresh
+start_fresh "$noted_rotate" adopt

@@ -106,7 +106,9 @@ The answer comes back into this session, delivered through the runner that
 launched you. If you are an interactive session, it appears at your prompt.
 If you ran as one shot (`codex exec`), your turn ends and the executor
 resumes this same session with the ruling — the runner recorded your session
-for exactly that — so end the turn cleanly, with the note written and
+for exactly that, and cross-reviews run in a separate session on their own
+`review/<your-item>` branch, so your session and its recording survive any
+number of review rounds — so end the turn cleanly, with the note written and
 nothing half-applied on disk, rather than idling to wait for it.
 
 ## Hard rules

@@ -29,12 +29,12 @@
 //! exited pane is replaced, because `start` means "run this prompt" and an
 //! exited pane already ran its own.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
 use crate::{
-    error::{Result, RunnerError},
+    error::{EXIT_ALREADY_RUNNING, EXIT_UNRECEIVABLE, Result, RunnerError},
     host::{EngineMarker, RunnerHost},
     limits::Limits,
     tier::Tier,
@@ -61,6 +61,47 @@ pub(crate) const WORKTREE_ENV: &str = "ALDER_EXT_RUNNER_WORKTREE";
 pub(crate) const TORN_ENV: &str = "ALDER_EXT_RUNNER_TORN";
 pub(crate) const ENGINE_RUNNING: &str = "running";
 pub(crate) const ENGINE_EXITED: &str = "exited";
+
+/// One file to copy into the worktree before the engine starts:
+/// `--seed <source>:<relative destination>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seed {
+    pub source: PathBuf,
+    /// Where the copy lands, relative to the worktree root.
+    pub destination: PathBuf,
+}
+
+impl Seed {
+    /// Parse one `--seed` value. The separator is the last `:` so an absolute
+    /// source path containing colons still splits where the caller meant.
+    pub fn parse(value: &str) -> Result<Self> {
+        let (source, destination) = value.rsplit_once(':').ok_or_else(|| {
+            RunnerError::new(format!(
+                "--seed takes `<source>:<relative destination>`, got `{value}`"
+            ))
+        })?;
+        if source.trim().is_empty() || destination.trim().is_empty() {
+            return Err(RunnerError::new(format!(
+                "--seed takes `<source>:<relative destination>`, got `{value}`"
+            )));
+        }
+        let destination = PathBuf::from(destination);
+        let plain = destination
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+        if !plain {
+            return Err(RunnerError::new(format!(
+                "a --seed destination must be a plain relative path inside \
+                 the worktree, got `{}`",
+                destination.display()
+            )));
+        }
+        Ok(Self {
+            source: PathBuf::from(source),
+            destination,
+        })
+    }
+}
 
 /// One started execution.
 #[derive(Debug, Clone)]
@@ -235,23 +276,44 @@ fn git_common_dir(host: &impl RunnerHost) -> String {
     }
 }
 
+/// Everything one start is asked for.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Request<'a> {
+    pub branch: &'a str,
+    pub prompt: &'a str,
+    pub override_command: Option<&'a str>,
+    /// Cut a NEW branch from this ref instead of the repository's current
+    /// `HEAD`. An existing branch is reused unchanged, exactly as without it.
+    pub from: Option<&'a str>,
+    /// Files to copy into the worktree before the engine starts.
+    pub seeds: &'a [Seed],
+}
+
 /// One start, whole.
 pub fn start(
     host: &impl RunnerHost,
-    branch: &str,
     tier: &'static Tier,
-    prompt: &str,
-    override_command: Option<&str>,
+    request: &Request<'_>,
 ) -> Result<Started> {
+    let branch = request.branch;
     if branch.trim().is_empty() {
         return Err(RunnerError::new("the branch cannot be empty"));
     }
-    if prompt.trim().is_empty() {
+    if request.prompt.trim().is_empty() {
         return Err(RunnerError::new("the prompt file is empty; nothing to run"));
+    }
+    if request
+        .from
+        .is_some_and(|reference| reference.trim().is_empty())
+    {
+        return Err(RunnerError::new("--from needs a non-empty ref"));
     }
     // A set-but-empty override yields an empty engine argv, which would run
     // the prompt itself as the command. That is never what anyone meant.
-    if override_command.is_some_and(|command| command.trim().is_empty()) {
+    if request
+        .override_command
+        .is_some_and(|command| command.trim().is_empty())
+    {
         return Err(RunnerError::new(format!(
             "{RUNNER_CMD_ENV} is set but empty; unset it or name a command \
              (the value is split on whitespace)"
@@ -281,15 +343,28 @@ pub fn start(
         if observed.engine != EngineMarker::Exited {
             // A proven-running engine is refused; so is a session that
             // carries no marker at all, which proves nothing and therefore
-            // must be neither killed nor typed over.
-            let why = match observed.engine {
-                EngineMarker::Running => "is already running",
-                _ => "exists but cannot prove its engine exited",
+            // must be neither killed nor typed over. Both refusals are
+            // machine-readable: already-running exits 3 and prints exactly
+            // `handle <h>` on stdout so a caller can adopt the execution;
+            // unproven exits 5.
+            let (exit, why) = match observed.engine {
+                EngineMarker::Running => (EXIT_ALREADY_RUNNING, "is already running"),
+                _ => (
+                    EXIT_UNRECEIVABLE,
+                    "exists but cannot prove its engine exited",
+                ),
             };
-            return Err(RunnerError::new(format!(
-                "handle `{session}` {why}; kill it before starting another \
-                 execution on `{branch}`"
-            )));
+            let mut refusal = RunnerError::refusal(
+                exit,
+                format!(
+                    "handle `{session}` {why}; kill it before starting another \
+                     execution on `{branch}`"
+                ),
+            );
+            if exit == EXIT_ALREADY_RUNNING {
+                refusal = refusal.with_stdout(format!("handle {session}"));
+            }
+            return Err(refusal);
         }
         // `start` means "run this prompt", and an exited pane already ran its
         // own. Its result is safe — it lives on the branch — so the pane is
@@ -305,8 +380,10 @@ pub fn start(
         host,
         &Launch {
             tier,
-            prompt,
-            override_command,
+            prompt: request.prompt,
+            override_command: request.override_command,
+            from: request.from,
+            seeds: request.seeds,
             session: &session,
             branch,
             worktree: &worktree,
@@ -409,6 +486,8 @@ struct Launch<'a> {
     tier: &'static Tier,
     prompt: &'a str,
     override_command: Option<&'a str>,
+    from: Option<&'a str>,
+    seeds: &'a [Seed],
     session: &'a str,
     branch: &'a str,
     worktree: &'a Path,
@@ -437,7 +516,9 @@ fn launch(
             ])?
             .ok;
         // A restart keeps the branch it already has; a first launch cuts one
-        // from the repository's current HEAD.
+        // from the repository's current HEAD, or from `--from` when the
+        // caller named a ref. `--from` never moves an existing branch: a
+        // branch that exists is reused unchanged, exactly as without it.
         let add: Vec<String> = if branch_exists {
             host.log(&format!("reusing the existing branch {}", launch.branch));
             vec![
@@ -447,13 +528,21 @@ fn launch(
                 launch.branch.to_owned(),
             ]
         } else {
-            vec![
+            let mut add = vec![
                 "worktree".to_owned(),
                 "add".to_owned(),
                 worktree.display().to_string(),
                 "-b".to_owned(),
                 launch.branch.to_owned(),
-            ]
+            ];
+            if let Some(reference) = launch.from {
+                host.log(&format!(
+                    "cutting {} from {reference} rather than HEAD",
+                    launch.branch
+                ));
+                add.push(reference.to_owned());
+            }
+            add
         };
         let add: Vec<&str> = add.iter().map(String::as_str).collect();
         let added = host.git(&add)?;
@@ -465,6 +554,10 @@ fn launch(
         }
         made.worktree = true;
     }
+
+    // Seeds land before the engine can start: a worker that boots faster than
+    // a post-launch copy would read a worktree missing its own configuration.
+    seed_worktree(host, worktree, launch.seeds)?;
 
     let git_common_dir = git_common_dir(host);
     let engine = engine_command(launch.tier, Some(&git_common_dir), launch.override_command);
@@ -508,6 +601,40 @@ fn launch(
         ],
     )?;
     made.session = true;
+    Ok(())
+}
+
+/// Copy each `--seed` file into the worktree, refusing symlinked ground.
+///
+/// The destination and every parent of it inside the worktree must be a real
+/// directory or absent: a symlink anywhere on the path would let a crafted
+/// worktree (worktrees are execution-writable across restarts) aim the copy
+/// outside itself, so the walk refuses rather than follows.
+fn seed_worktree(host: &impl RunnerHost, worktree: &Path, seeds: &[Seed]) -> Result<()> {
+    for seed in seeds {
+        let mut prefix = worktree.to_path_buf();
+        for component in seed.destination.components() {
+            prefix.push(component);
+            if host.is_symlink(&prefix) {
+                return Err(RunnerError::new(format!(
+                    "refusing to seed through the symlink `{}`; a seed \
+                     destination and its parents must be real paths inside \
+                     the worktree",
+                    prefix.display()
+                )));
+            }
+        }
+        let destination = worktree.join(&seed.destination);
+        if let Some(parent) = destination.parent() {
+            host.create_dir_all(parent)?;
+        }
+        host.copy_file(&seed.source, &destination)?;
+        host.log(&format!(
+            "seeded {} from {}",
+            destination.display(),
+            seed.source.display()
+        ));
+    }
     Ok(())
 }
 
@@ -609,6 +736,8 @@ mod tests {
         common_dir: RefCell<Option<Run>>,
         canonical_paths: RefCell<BTreeMap<PathBuf, PathBuf>>,
         sessions: RefCell<BTreeMap<String, crate::host::ObservedSession>>,
+        symlinks: RefCell<BTreeSet<PathBuf>>,
+        seeded: RefCell<BTreeMap<PathBuf, PathBuf>>,
         crash_after: RefCell<Option<&'static str>>,
         fail_tmux: bool,
         lock_contended: bool,
@@ -648,9 +777,10 @@ mod tests {
         fn lock_handle(&self, handle: &str) -> Result<StartLock> {
             self.calls.borrow_mut().push(format!("lock {handle}"));
             if self.lock_contended {
-                return Err(RunnerError::new(format!(
-                    "another operation on `{handle}` holds its lock; refusing to race it"
-                )));
+                return Err(RunnerError::refusal(
+                    crate::error::EXIT_LOCK_HELD,
+                    format!("another operation on `{handle}` holds its lock; refusing to race it"),
+                ));
             }
             Ok(StartLock::unlocked_for_tests())
         }
@@ -837,6 +967,25 @@ mod tests {
             Ok(())
         }
 
+        fn is_symlink(&self, path: &Path) -> bool {
+            self.calls
+                .borrow_mut()
+                .push(format!("islink {}", path.display()));
+            self.symlinks.borrow().contains(path)
+        }
+
+        fn copy_file(&self, source: &Path, destination: &Path) -> Result<()> {
+            self.calls.borrow_mut().push(format!(
+                "copy {} -> {}",
+                source.display(),
+                destination.display()
+            ));
+            self.seeded
+                .borrow_mut()
+                .insert(destination.to_path_buf(), source.to_path_buf());
+            Ok(())
+        }
+
         fn log(&self, message: &str) {
             self.calls.borrow_mut().push(format!("log {message}"));
         }
@@ -847,7 +996,15 @@ mod tests {
     const WORKTREE: &str = "/projects/alder-ext-work-al-1";
 
     fn run_start(host: &Fake, tier_name: &str) -> Result<Started> {
-        start(host, BRANCH, tier(tier_name), "do the thing", None)
+        start(
+            host,
+            tier(tier_name),
+            &Request {
+                branch: BRANCH,
+                prompt: "do the thing",
+                ..Request::default()
+            },
+        )
     }
 
     #[test]
@@ -1020,10 +1177,12 @@ mod tests {
         let host = Fake::new();
         start(
             &host,
-            BRANCH,
             tier("luna"),
-            "Fix the thing.\nSecond line with 'quotes' and; semicolons.",
-            None,
+            &Request {
+                branch: BRANCH,
+                prompt: "Fix the thing.\nSecond line with 'quotes' and; semicolons.",
+                ..Request::default()
+            },
         )
         .unwrap();
         let pane = host
@@ -1226,10 +1385,11 @@ mod tests {
 
     /// The host effects a start only reads the world with. A wait has to
     /// repeat one of these; the ones that change the world it has no use for.
-    const OBSERVING_EFFECTS: [&str; 5] = [
+    const OBSERVING_EFFECTS: [&str; 6] = [
         "tmux observe",
         "exists ",
         "resolve ",
+        "islink ",
         "git rev-parse",
         "git worktree list",
     ];
@@ -1328,8 +1488,17 @@ mod tests {
     fn an_empty_engine_override_is_a_hard_error_before_anything_exists() {
         for value in ["", "   ", "\n\t"] {
             let host = Fake::new();
-            let error = start(&host, BRANCH, tier("terra"), "prompt", Some(value))
-                .expect_err("an empty override must not launch the prompt as a command");
+            let error = start(
+                &host,
+                tier("terra"),
+                &Request {
+                    branch: BRANCH,
+                    prompt: "prompt",
+                    override_command: Some(value),
+                    ..Request::default()
+                },
+            )
+            .expect_err("an empty override must not launch the prompt as a command");
             assert!(error.message.contains(RUNNER_CMD_ENV), "{error}");
             assert!(error.message.contains("split on whitespace"), "{error}");
             assert!(host.calls().is_empty(), "{:#?}", host.calls());
@@ -1351,6 +1520,10 @@ mod tests {
         );
         let error = run_start(&host, "terra").unwrap_err();
         assert!(error.message.contains("already running"), "{error}");
+        // The refusal is machine-readable: exit 3, and stdout carries exactly
+        // `handle <h>` so a caller can adopt the live execution unparsed.
+        assert_eq!(error.exit, crate::error::EXIT_ALREADY_RUNNING);
+        assert_eq!(error.stdout.as_deref(), Some("handle alder-ext-work-al-1"));
         assert!(!host.called("git worktree add"));
         assert!(!host.called("tmux new-session"));
         assert!(!host.called("tmux kill-session"));
@@ -1374,6 +1547,11 @@ mod tests {
             error.message.contains("cannot prove its engine exited"),
             "{error}"
         );
+        assert_eq!(error.exit, crate::error::EXIT_UNRECEIVABLE);
+        assert!(
+            error.stdout.is_none(),
+            "an unproven session must not be adopted"
+        );
         assert!(!host.called("tmux kill-session"));
         assert!(!host.called("tmux new-session"));
         assert!(!host.called("git worktree add"));
@@ -1391,6 +1569,7 @@ mod tests {
         };
         let error = run_start(&host, "terra").unwrap_err();
         assert!(error.message.contains("holds its lock"), "{error}");
+        assert_eq!(error.exit, crate::error::EXIT_LOCK_HELD);
 
         let calls = host.calls();
         assert_eq!(
@@ -1684,10 +1863,13 @@ mod tests {
         let host = Fake::new();
         start(
             &host,
-            BRANCH,
             tier("sol"),
-            "do the thing",
-            Some("/tmp/stub.sh --once"),
+            &Request {
+                branch: BRANCH,
+                prompt: "do the thing",
+                override_command: Some("/tmp/stub.sh --once"),
+                ..Request::default()
+            },
         )
         .unwrap();
         let pane = host
@@ -1709,18 +1891,179 @@ mod tests {
     fn an_empty_branch_or_prompt_starts_nothing() {
         let host = Fake::new();
         assert!(
-            start(&host, " ", tier("terra"), "prompt", None)
-                .unwrap_err()
-                .message
-                .contains("branch")
+            start(
+                &host,
+                tier("terra"),
+                &Request {
+                    branch: " ",
+                    prompt: "prompt",
+                    ..Request::default()
+                }
+            )
+            .unwrap_err()
+            .message
+            .contains("branch")
         );
         assert!(
-            start(&host, BRANCH, tier("terra"), " \n", None)
-                .unwrap_err()
-                .message
-                .contains("prompt file is empty")
+            start(
+                &host,
+                tier("terra"),
+                &Request {
+                    branch: BRANCH,
+                    prompt: " \n",
+                    ..Request::default()
+                }
+            )
+            .unwrap_err()
+            .message
+            .contains("prompt file is empty")
         );
         assert!(host.calls().is_empty(), "{:#?}", host.calls());
+    }
+
+    #[test]
+    fn a_seed_parses_only_a_source_and_a_plain_relative_destination() {
+        let seed = Seed::parse("/roots/.alder/config.json:.alder/config.json").unwrap();
+        assert_eq!(seed.source, Path::new("/roots/.alder/config.json"));
+        assert_eq!(seed.destination, Path::new(".alder/config.json"));
+
+        for wrong in [
+            "no-colon",
+            ":dest",
+            "src:",
+            "src:/etc/passwd",
+            "src:../outside",
+            "src:a/../b",
+        ] {
+            assert!(Seed::parse(wrong).is_err(), "`{wrong}` was accepted");
+        }
+    }
+
+    #[test]
+    fn seeds_are_copied_into_the_worktree_before_the_session_exists() {
+        let host = Fake::new();
+        let seeds = [Seed::parse("/primary/.alder/config.json:.alder/config.json").unwrap()];
+        start(
+            &host,
+            tier("terra"),
+            &Request {
+                branch: BRANCH,
+                prompt: "do the thing",
+                seeds: &seeds,
+                ..Request::default()
+            },
+        )
+        .unwrap();
+
+        let calls = host.calls();
+        let ordinal = |needle: &str| {
+            calls
+                .iter()
+                .position(|call| call.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} never happened in {calls:#?}"))
+        };
+        let copied = ordinal(&format!(
+            "copy /primary/.alder/config.json -> {WORKTREE}/.alder/config.json"
+        ));
+        // The seed lands after the worktree exists and before the engine can
+        // possibly start: a fast worker must never read an unseeded worktree.
+        assert!(ordinal("git worktree add") < copied, "{calls:#?}");
+        assert!(copied < ordinal("tmux new-session"), "{calls:#?}");
+        // Every path component was proven not to be a symlink first.
+        assert!(ordinal(&format!("islink {WORKTREE}/.alder")) < copied);
+        assert!(ordinal(&format!("islink {WORKTREE}/.alder/config.json")) < copied);
+    }
+
+    #[test]
+    fn a_seed_refuses_a_symlinked_destination_or_parent_and_copies_nothing() {
+        for symlinked in [".alder", ".alder/config.json"] {
+            let host = Fake::new();
+            host.symlinks
+                .borrow_mut()
+                .insert(PathBuf::from(WORKTREE).join(symlinked));
+            let seeds = [Seed::parse("/primary/config.json:.alder/config.json").unwrap()];
+            let error = start(
+                &host,
+                tier("terra"),
+                &Request {
+                    branch: BRANCH,
+                    prompt: "do the thing",
+                    seeds: &seeds,
+                    ..Request::default()
+                },
+            )
+            .expect_err("a symlink on the seed path must refuse the start");
+            assert!(error.message.contains("symlink"), "{error}");
+            assert!(!host.called("copy "), "{:#?}", host.calls());
+            assert!(
+                !host.called("tmux new-session"),
+                "a refused seed still launched: {:#?}",
+                host.calls()
+            );
+        }
+    }
+
+    #[test]
+    fn from_cuts_a_new_branch_at_the_named_ref_and_leaves_an_existing_one_alone() {
+        // A fresh branch is cut from the ref, not from HEAD.
+        let host = Fake::new();
+        start(
+            &host,
+            tier("terra"),
+            &Request {
+                branch: BRANCH,
+                prompt: "do the thing",
+                from: Some("work/al-parent"),
+                ..Request::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            host.called(&format!(
+                "git worktree add {WORKTREE} -b {BRANCH} work/al-parent"
+            )),
+            "{:#?}",
+            host.calls()
+        );
+
+        // An existing branch keeps its own history: --from changes nothing.
+        let host = Fake::new();
+        host.existing_branches
+            .borrow_mut()
+            .insert(BRANCH.to_owned());
+        start(
+            &host,
+            tier("terra"),
+            &Request {
+                branch: BRANCH,
+                prompt: "do the thing",
+                from: Some("work/al-parent"),
+                ..Request::default()
+            },
+        )
+        .unwrap();
+        assert!(host.called(&format!("git worktree add {WORKTREE} {BRANCH}")));
+        assert!(
+            !host.called("-b work/al-parent") && !host.called(&format!("{BRANCH} work/al-parent")),
+            "{:#?}",
+            host.calls()
+        );
+
+        // An empty ref is a usage error before anything happens.
+        let host = Fake::new();
+        let error = start(
+            &host,
+            tier("terra"),
+            &Request {
+                branch: BRANCH,
+                prompt: "do the thing",
+                from: Some("  "),
+                ..Request::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains("--from"), "{error}");
+        assert!(host.calls().is_empty());
     }
 
     #[test]

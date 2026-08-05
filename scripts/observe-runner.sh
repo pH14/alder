@@ -5,16 +5,17 @@
 # as `$1` and reads back exactly one word:
 #
 #   present  the execution this handle names is running
+#   done     the execution finished; the result is on the branch and wants
+#            inspecting before the attempt ends
 #   absent   the handle is one of this runner's names and nothing runs under it
 #   unknown  not a name this probe recognizes; alder writes nothing
 #
-# The runner's own status words map so:
+# The runner's own status words map one to one:
 #
 #   running -> present
-#   done    -> absent    a finished execution is no longer a live execution;
-#                        the result lives on the branch, and an attempt still
-#                        claiming the handle is reconcile's to judge, not a
-#                        live reading
+#   done    -> done      a finished execution is a statement of its own —
+#                        reconcile reports `finished` (inspect the branch),
+#                        never the `missing` funeral a plain absence earns
 #   dead    -> absent
 #
 # The handle stays opaque to alder — it is matched by equality and never
@@ -58,7 +59,10 @@ case "$(printf '%s\n' "$status" | head -n 1)" in
 running)
   echo present
   ;;
-done | dead)
+done)
+  echo "done"
+  ;;
+dead)
   echo absent
   ;;
 *)

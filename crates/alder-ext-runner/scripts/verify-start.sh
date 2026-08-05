@@ -164,11 +164,17 @@ done
 # From here on there is a session teardown may kill — and only this one.
 SESSION_NAME=alder-ext-work-wv-1
 
-HANDLE=$(ALDER_EXT_RUNNER_CMD="$SB/stub.sh" \
+ALDER_EXT_RUNNER_CMD="$SB/stub.sh" \
   "$RUNNER" start --repo "$SB/repo" --branch "$BRANCH" --tier luna \
-  --prompt-file "$SB/prompt.txt")
+  --prompt-file "$SB/prompt.txt" >"$SB/start.out"
+# Stdout is the machine contract: the handle, then the served tier.
+HANDLE=$(sed -n 1p "$SB/start.out")
 [ "$HANDLE" = "$SESSION_NAME" ] ||
   fail "the printed handle is '$HANDLE', expected $SESSION_NAME"
+[ "$(sed -n 2p "$SB/start.out")" = "tier luna" ] ||
+  fail "the second stdout line is not the served tier: $(cat "$SB/start.out")"
+[ "$(wc -l <"$SB/start.out" | tr -d ' ')" = "2" ] ||
+  fail "start printed more than the handle and the served tier: $(cat "$SB/start.out")"
 
 # The stub exits immediately, so its argv file appears at once. Waiting for
 # it is not a sleep in the start path; it is this script waiting for a

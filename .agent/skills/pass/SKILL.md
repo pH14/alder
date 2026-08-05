@@ -86,11 +86,15 @@ flag or transport without an operator ruling.
    The wake command already ran `alder refresh`, so observations are fresh;
    re-run it yourself only after your own actions change what is live.
 2. **Reconcile.** `alder reconcile`, then repair by finding kind:
-   - *missing* (recorded active, observed absent): the probe reports a
-     finished execution absent too, so check before ending anything — a
-     `done` status plus a "ready for review" note is a finished worker
-     (step 5), not a loss; a genuinely dead engine mid-work gets the
-     suggested `attempt end`.
+   - *finished* (recorded active, observed done): the execution finished
+     and the branch holds its result — inspect it. A "ready for review"
+     note means the review-and-merge path (step 5); anything else, judge
+     what the branch holds before finishing or ending the attempt. Never
+     the lost funeral.
+   - *missing* (recorded active, observed absent): nothing answers to the
+     handle at all — a genuinely dead or vanished engine mid-work; the
+     suggested `attempt end` applies. Finished workers report *finished*,
+     not *missing*.
    - *unspawned* (an attempt no worker was launched for):
      `scripts/dispatch <id>` adopts the recorded attempt.
    - *orphan* (an execution outliving its ended attempt):

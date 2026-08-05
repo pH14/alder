@@ -2013,6 +2013,54 @@ fn a_never_observed_dead_worker_is_missing_through_default_reconcile() {
     assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
 }
 
+/// A1: a probe answering `done` for an active attempt's handle must surface
+/// as the `finished` finding through the DEFAULT refresh-first `alder
+/// reconcile` — the execution finished and the branch wants inspecting —
+/// never as the `missing` funeral, and with a non-destructive suggestion.
+#[test]
+fn a_finished_execution_is_reported_finished_through_default_reconcile() {
+    let project = TestProject::new();
+    let work = string(
+        &project.success(&["work", "add", "--title", "Finished work"]),
+        "work_id",
+    );
+    let attempt = string(&project.success(&["work", "start", &work]), "attempt_id");
+    project.success(&["attempt", "edit", &attempt, "--handle", "tmux:worker"]);
+
+    // The engine exited; the runner's probe maps its `done` word through.
+    project.config(json!([{"observer": "tmux", "probe": "echo done"}]));
+    let reconciled = project.success(&["reconcile"]);
+    assert_eq!(reconciled["refreshed"], true);
+    let findings = reconciled["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{reconciled}");
+    assert_eq!(findings[0]["kind"], "finished");
+    assert_eq!(findings[0]["attempt_id"], attempt);
+    assert_eq!(findings[0]["handle"], "tmux:worker");
+    assert_eq!(findings[0]["status"], "done");
+    let suggestion = findings[0]["suggested_command"].as_str().unwrap();
+    assert!(suggestion.contains("inspect the branch"), "{suggestion}");
+    assert!(
+        suggestion.contains(&format!("work finish {work}")),
+        "{suggestion}"
+    );
+    assert!(
+        !suggestion.contains("--outcome lost"),
+        "a finished execution suggested the lost funeral: {suggestion}"
+    );
+
+    // The fold alone carries it: status attention shows the finished worker.
+    let status = project.success(&["status", "--full"]);
+    assert_eq!(status["counts"]["attention"], 1);
+    assert_eq!(status["attention"][0]["kind"], "finished");
+
+    // Finishing the work through the attempt settles the picture: the key
+    // retires on the next default reconcile and nothing demands attention.
+    project.success(&["work", "finish", &work, "--attempt", &attempt]);
+    let settled = project.success(&["reconcile"]);
+    assert!(settled["findings"].as_array().unwrap().is_empty());
+    assert_eq!(project.success(&["status"])["counts"]["attention"], 0);
+}
+
 /// The live incident of al-pass-64, reproduced over the mutation that
 /// remains: an executor-side write lost the compare-and-append to a worker
 /// appending its own milestones.

@@ -97,29 +97,49 @@ review`/`codex exec` with an open stdin wedges waiting on it.
 
 Codex-authored branch — fresh Claude review through the runner (operator
 ruling 2026-07-31: never `claude -p`; the interactive session is the
-standard transport, same as workers). Start it on the branch itself — the
-runner adopts the branch's existing worktree, and a review runs only after
-the worker's status reads `done` or `dead`, so the start replaces the exited
-pane:
+standard transport, same as workers). The review runs on its OWN branch,
+`review/<id>`, cut from the branch under review — never on `work/<id>`
+itself. The runner's handle is deterministic per branch, so the reviewer
+gets `alder-ext-review-<id>`, distinct from the worker's handle: the
+worker's session, its per-handle state, and its codex resume recording are
+never replaced by a review, and a ruling can still resume the worker after
+any number of review rounds:
 
 ```sh
-alder-ext-runner start --repo <primary-root> --branch work/<id> \
-  --tier fable --prompt-file "$scratch/review-prompt-<id>.txt"
+alder-ext-runner start --repo <primary-root> --branch review/<id> \
+  --from work/<id> --tier fable \
+  --prompt-file "$scratch/review-prompt-<id>.txt"
 ```
 
-Collect the verdict from the session's transcript, record it, then
-`alder-ext-runner kill <handle>`. A round-2 message to the same reviewer
-session rides `alder-ext-runner send <handle> --file <file>`. Freshness
-still matters: a fresh session every review, never the executor's own or a
-subagent (both carry unlogged context or effort).
+(`--from` cuts the new `review/<id>` branch at `work/<id>`'s tip instead of
+the repo HEAD, so the reviewer's worktree holds exactly the code under
+review.)
+
+Collect the verdict from the session's transcript, record it (below), then
+clean up: `alder-ext-runner kill <handle>`, remove the review worktree
+(`git worktree remove ../alder-ext-review-<id>`, beside the primary
+checkout), and delete the review branch (`git branch -D review/<id>`). The
+review branch carries no result — the verdict lives in the log — so
+deleting it loses nothing. A round-2 message to the same reviewer session
+rides `alder-ext-runner send <handle> --file <file>` while it is alive.
+Freshness still matters: a fresh session every review, never the executor's
+own or a subagent (both carry unlogged context or effort).
+
+A crashed pass leaves a live `review/<id>` execution behind. The next pass
+checks `alder-ext-runner status alder-ext-review-<id>`: anything but `dead`
+means a stale review — kill the handle, delete the leftover `review/<id>`
+branch and worktree, and rerun the review whole. At-least-once, on purpose:
+a half-collected verdict is not a verdict, and rerunning costs one review.
 
 The prompt file (in `$scratch`, outside the worktree) holds the brief:
 
 ```text
+You are a reviewer on branch review/<id>, a throwaway copy of work/<id>.
 Review work/<id> against main: git diff main...work/<id>.
 The item is <work-id> — <the item's title>.
 Its spec: <spec, or 'none recorded'>. Its checks: <checks>.
 AGENTS.md is the review lens. Report findings, or say the branch is clean.
+Commit nothing.
 ```
 
 **Watching a run:** wait on the review's PID, not a `pgrep` pattern that can

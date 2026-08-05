@@ -125,21 +125,24 @@ pub fn probe_targets(state: &ProjectState, kind: &str) -> Vec<String> {
 /// [`plan_observer_run`].
 ///
 /// Each normalized row is one probe answer: the subject is the opaque handle
-/// exactly as the runner bound it, the level one of `present`, `absent`, or
-/// `unknown`. The plan matches handles against attempts by equality — never
-/// by parsing — and writes levels keyed `(observer, attempt-id, liveness)`:
+/// exactly as the runner bound it, the level one of `present`, `done`,
+/// `absent`, or `unknown`. The plan matches handles against attempts by
+/// equality — never by parsing — and writes levels keyed
+/// `(observer, attempt-id, liveness)`:
 ///
-/// - active attempt, `present` or `absent`: report that level — `absent`
-///   establishes the key even when none existed, because a dead worker is a
-///   statement the fold must carry;
+/// - active attempt, `present`, `done`, or `absent`: report that level —
+///   `done` is a statement of its own (the execution finished; the branch
+///   holds the result and wants inspecting), and `absent` establishes the
+///   key even when none existed, because a dead worker is a statement the
+///   fold must carry;
 /// - active attempt, `unknown`: write nothing — the fold keeps saying
 ///   `observation_unknown`, which is the honest verdict;
 /// - ended attempt with a current key, `present`: the level stays, so
 ///   `reconcile` can name the `orphan`;
-/// - ended attempt with a current key, `absent`: retire the key;
-/// - ended attempt with a current key, `unknown`: retire the key — the probe
-///   no longer recognizes the name, and an ended attempt cannot be watched
-///   forever, so the key would otherwise be unfalsifiable.
+/// - ended attempt with a current key, `done`, `absent`, or `unknown`:
+///   retire the key — a finished or vanished execution under an ended
+///   attempt asks nothing further of anyone, and an ended attempt cannot be
+///   watched forever, so the key would otherwise be unfalsifiable.
 ///
 /// When an ended and an active attempt hold the same handle string (legal
 /// sequentially — respawns reuse session names), the active attempt owns the
@@ -179,7 +182,7 @@ pub fn plan_probe_run(
             // Anything else — `unknown`, or a handle this sweep did not
             // cover because the attempt appeared after targets were read —
             // writes nothing.
-            if let Some(level @ ("present" | "absent")) = answers.get(handle).copied() {
+            if let Some(level @ ("present" | "done" | "absent")) = answers.get(handle).copied() {
                 changes.push(ObservationChange {
                     key,
                     level: Some(level.to_owned()),
@@ -501,6 +504,22 @@ pub fn reconcile(
                 for observation in &liveness {
                     match observation.level.as_str() {
                         "present" => {}
+                        // A finished execution is not a lost one: the branch
+                        // holds whatever the run left, so the repair is to
+                        // inspect it — never the `missing` funeral.
+                        "done" => findings.push(ReconcileFinding {
+                            kind: "finished".to_owned(),
+                            attempt_id: Some(attempt.id.clone()),
+                            handle: Some(handle.to_owned()),
+                            status: "done".to_owned(),
+                            detail: "the execution finished; inspect the branch before ending the attempt"
+                                .to_owned(),
+                            suggested_command: Some(format!(
+                                "inspect the branch, then `alder work finish {} --attempt {}` or end the attempt with what you found",
+                                attempt.work_id, attempt.id
+                            )),
+                            metadata: json!({"observer": observation.key.observer}),
+                        }),
                         "absent" => findings.push(ReconcileFinding {
                             kind: "missing".to_owned(),
                             attempt_id: Some(attempt.id.clone()),
@@ -867,6 +886,7 @@ mod tests {
 
         for (answer, expected) in [
             ("present", Some("present")),
+            ("done", Some("done")),
             ("  absent\n", Some("absent")),
             ("unknown", Some("unknown")),
             ("gone", None),
@@ -1028,6 +1048,16 @@ mod tests {
                 level: Some("absent".to_owned()),
             }]
         );
+        // active + done → done: a finished execution is a statement of its
+        // own (the `finished` finding's ground truth), never folded into
+        // absence.
+        assert_eq!(
+            plan_probe_run(&state, "tmux", &[level("tmux:worker", "liveness", "done")]),
+            vec![ObservationChange {
+                key: liveness_key("tmux", "active"),
+                level: Some("done".to_owned()),
+            }]
+        );
         // active + unknown → write nothing; reconcile keeps saying
         // observation_unknown, which is honest.
         assert!(
@@ -1061,10 +1091,11 @@ mod tests {
                 level: Some("present".to_owned()),
             }]
         );
-        // ended + absent → retire; ended + unknown → retire too, because an
-        // ended attempt cannot be watched forever once the probe no longer
-        // recognizes the name.
-        for answer in ["absent", "unknown"] {
+        // ended + done/absent → retire; ended + unknown → retire too, because
+        // an ended attempt cannot be watched forever once the probe no longer
+        // recognizes the name, and a finished execution under an ended
+        // attempt asks nothing further of anyone.
+        for answer in ["done", "absent", "unknown"] {
             assert_eq!(
                 plan_probe_run(&ended, "tmux", &[level("tmux:orphan", "liveness", answer)]),
                 vec![ObservationChange {
@@ -1202,6 +1233,35 @@ mod tests {
         assert_eq!(missing[0].handle.as_deref(), Some("tmux:active"));
         assert!(missing[0].suggested_command.is_some());
 
+        // A finished execution is a distinct statement: never the `missing`
+        // funeral, and the suggested repair is non-destructive — inspect the
+        // branch, then finish or end the attempt with what was found.
+        let mut done = state.clone();
+        with_observations(
+            &mut done,
+            &[observation("tmux", "active", "liveness", "done")],
+        );
+        let finished = reconcile(&done, &configured, &known);
+        assert_eq!(finding_kinds(&finished), vec!["finished"]);
+        assert_eq!(finished[0].attempt_id.as_deref(), Some("active"));
+        assert_eq!(finished[0].handle.as_deref(), Some("tmux:active"));
+        assert_eq!(finished[0].status, "done");
+        assert!(
+            finished[0].detail.contains("inspect the branch"),
+            "{}",
+            finished[0].detail
+        );
+        let suggestion = finished[0].suggested_command.as_deref().unwrap();
+        assert!(suggestion.contains("inspect the branch"), "{suggestion}");
+        assert!(
+            suggestion.contains("work finish active-work"),
+            "{suggestion}"
+        );
+        assert!(
+            !suggestion.contains("--outcome lost"),
+            "a finished execution suggested the lost funeral: {suggestion}"
+        );
+
         let mut odd = state.clone();
         with_observations(
             &mut odd,
@@ -1337,12 +1397,11 @@ mod tests {
     }
 
     /// The shipped runner observer is the probe: asked about one handle at a
-    /// time, it maps the runner's own status words — `running` is `present`,
-    /// `done` and `dead` are `absent` (a finished execution is no longer a
-    /// live one; the result lives on the branch) — and answers `unknown` for
-    /// any name that is not the runner's, including the retired `tmux:*`
-    /// grammar. A recognized name it cannot ask about fails loudly instead
-    /// of guessing.
+    /// time, it maps the runner's own status words one to one — `running` is
+    /// `present`, `done` is `done` (the execution finished; the branch wants
+    /// inspecting), `dead` is `absent` — and answers `unknown` for any name
+    /// that is not the runner's, including the retired `tmux:*` grammar. A
+    /// recognized name it cannot ask about fails loudly instead of guessing.
     #[test]
     fn the_runner_observer_script_answers_one_probe_word_per_handle() {
         let temporary = TempDir::new().unwrap();
@@ -1377,7 +1436,7 @@ mod tests {
             validate_probe_output(&output.stdout).unwrap()
         };
         assert_eq!(probe(&stub, "alder-ext-running"), "present");
-        assert_eq!(probe(&stub, "alder-ext-done"), "absent");
+        assert_eq!(probe(&stub, "alder-ext-done"), "done");
         assert_eq!(probe(&stub, "alder-ext-dead"), "absent");
         assert_eq!(probe(&stub, "tmux:alder-work-one"), "unknown");
         assert_eq!(probe(&stub, "codex:019f-rollout"), "unknown");

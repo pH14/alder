@@ -677,7 +677,7 @@ fn status(
     let mut findings: Vec<observer::ReconcileFinding> =
         observer::reconcile(&state, &BTreeSet::new(), &BTreeSet::new())
             .into_iter()
-            .filter(|finding| matches!(finding.kind.as_str(), "missing" | "orphan"))
+            .filter(|finding| matches!(finding.kind.as_str(), "missing" | "orphan" | "finished"))
             .collect();
     // A deferral whose deadline has passed demands review. Nothing unblocks by
     // itself — the fold is a pure function of the log and cannot read a clock —
