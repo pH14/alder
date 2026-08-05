@@ -14,7 +14,9 @@ use std::{
 
 use crate::{
     error::{Result, RunnerError},
-    start::{ENGINE_ENV, ENGINE_EXITED, ENGINE_RUNNING, HANDLE_ENV, TIER_ENV, WORKTREE_ENV},
+    start::{
+        ENGINE_ENV, ENGINE_EXITED, ENGINE_RUNNING, HANDLE_ENV, PROVIDER_ENV, TIER_ENV, WORKTREE_ENV,
+    },
 };
 
 /// What the engine marker on a session proves. A missing or unrecognized
@@ -41,6 +43,10 @@ pub enum EngineMarker {
 pub struct ObservedSession {
     pub handle: Option<String>,
     pub tier: Option<String>,
+    /// The provider `start` resolved and stamped. `send` routes delivery by
+    /// this stamp alone, so reclassifying a tier in the config after a start
+    /// can never change a live session's protocol.
+    pub provider: Option<String>,
     pub worktree: Option<PathBuf>,
     pub engine: EngineMarker,
 }
@@ -53,9 +59,9 @@ pub struct Run {
     pub stderr: String,
 }
 
-/// An exclusive per-handle start lock, released when dropped. Holding it is
-/// what lets two concurrent starts of one branch serialize instead of racing
-/// each other's worktree and session effects.
+/// An exclusive per-handle lock, released when dropped. `start`, `send`, and
+/// `kill` all take it, so two concurrent operations on one handle serialize
+/// instead of racing each other's worktree, session, and pane-input effects.
 #[derive(Debug)]
 pub struct StartLock {
     _file: Option<std::fs::File>,
@@ -71,9 +77,11 @@ impl StartLock {
 
 /// Take an exclusive advisory lock on `path`, refusing immediately if another
 /// process (or another handle to the same file) already holds it. Refusing is
-/// the point: the loser of a double start must not stand in line behind the
-/// winner and then re-run the same prompt — it reports the contention and the
-/// caller retries once the winner's session is observable.
+/// the point, for every verb: the loser of a double start must not stand in
+/// line behind the winner and then re-run the same prompt, and the loser of a
+/// double send must not queue behind the winner and interleave a second
+/// paste/Enter into the same pane — it reports the contention and the caller
+/// retries once the winner is done.
 pub(crate) fn acquire_start_lock(path: &Path, handle: &str) -> Result<StartLock> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
@@ -91,7 +99,7 @@ pub(crate) fn acquire_start_lock(path: &Path, handle: &str) -> Result<StartLock>
     match file.try_lock() {
         Ok(()) => Ok(StartLock { _file: Some(file) }),
         Err(std::fs::TryLockError::WouldBlock) => Err(RunnerError::new(format!(
-            "another start of `{handle}` holds its lock; refusing to race it"
+            "another operation on `{handle}` holds its lock; refusing to race it"
         ))),
         Err(std::fs::TryLockError::Error(error)) => Err(RunnerError::new(format!(
             "cannot lock `{}` for `{handle}`: {error}",
@@ -104,9 +112,14 @@ pub(crate) fn acquire_start_lock(path: &Path, handle: &str) -> Result<StartLock>
 pub trait RunnerHost {
     /// The repository executions are launched from.
     fn repo(&self) -> &Path;
-    /// Take the exclusive start lock for one handle, held (by the caller
-    /// keeping the returned guard alive) across the whole start sequence.
-    fn lock_start(&self, handle: &str) -> Result<StartLock>;
+    /// Take the exclusive per-handle lock, held (by the caller keeping the
+    /// returned guard alive) across a whole `start`, `send`, or `kill`.
+    fn lock_handle(&self, handle: &str) -> Result<StartLock>;
+    /// The runner-owned machine-local directory for one handle's state. Never
+    /// inside the worktree: the worktree is worker-writable, and nothing the
+    /// runner later trusts or executes may live where the worker can rewrite
+    /// it.
+    fn handle_state_dir(&self, handle: &str) -> PathBuf;
     /// Run `git <args>` in the repository. An error means git could not be
     /// run at all; a git command that ran and failed comes back as `Run`.
     fn git(&self, args: &[&str]) -> Result<Run>;
@@ -202,6 +215,13 @@ impl Host {
         self.tmux_ok(&["send-keys", "-t", &pane, "Enter"])
     }
 
+    /// Clear the pane's pending input line (C-u), used when a send must back
+    /// out text it already pasted rather than let anything submit it.
+    pub fn tmux_discard_input(&self, session: &str) -> Result<()> {
+        let pane = format!("={session}:");
+        self.tmux_ok(&["send-keys", "-t", &pane, "C-u"])
+    }
+
     pub fn tmux_delete_buffer(&self, buffer: &str) {
         let _ = self.run("tmux", &["delete-buffer", "-b", buffer]);
     }
@@ -251,9 +271,13 @@ impl RunnerHost for Host {
         &self.repo
     }
 
-    fn lock_start(&self, handle: &str) -> Result<StartLock> {
+    fn lock_handle(&self, handle: &str) -> Result<StartLock> {
         let path = crate::config::state_dir().join(format!("start-{handle}.lock"));
         acquire_start_lock(&path, handle)
+    }
+
+    fn handle_state_dir(&self, handle: &str) -> PathBuf {
+        crate::config::handle_state_dir(handle)
     }
 
     fn git(&self, args: &[&str]) -> Result<Run> {
@@ -273,6 +297,7 @@ impl RunnerHost for Host {
         Ok(Some(ObservedSession {
             handle: environment(HANDLE_ENV)?,
             tier: environment(TIER_ENV)?,
+            provider: environment(PROVIDER_ENV)?,
             worktree: environment(WORKTREE_ENV)?.map(PathBuf::from),
             // Only an explicit marker proves anything. A missing marker is
             // fail-safe in both directions: never pasted at (nothing proves
@@ -320,8 +345,18 @@ impl RunnerHost for Host {
     }
 
     fn tmux_kill_session(&self, session: &str) -> Result<()> {
-        self.run("tmux", &["kill-session", "-t", &format!("={session}")])?;
-        Ok(())
+        // The exit status is checked rather than swallowed: a kill that tmux
+        // refused must not be reported as an ended execution. The caller in
+        // `ops::kill` additionally verifies the session is really gone.
+        let output = self.run("tmux", &["kill-session", "-t", &format!("={session}")])?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(RunnerError::new(format!(
+                "tmux kill-session failed for `{session}`: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
     }
 
     fn path_exists(&self, path: &Path) -> bool {

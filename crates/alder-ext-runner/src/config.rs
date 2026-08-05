@@ -59,6 +59,16 @@ pub fn limits_path() -> PathBuf {
     state_dir().join("rate-limits.json")
 }
 
+/// The runner-owned directory for one handle's machine-local state: the codex
+/// resume script, the codex-session marker, and the session watcher's log.
+///
+/// This lives under the state directory, never inside the worktree, because
+/// the worktree is written by the execution itself: anything the runner later
+/// trusts or executes must not sit where the worker can rewrite it.
+pub fn handle_state_dir(handle: &str) -> PathBuf {
+    state_dir().join(handle)
+}
+
 fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)

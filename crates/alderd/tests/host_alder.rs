@@ -141,6 +141,54 @@ fn a_failing_wake_command_reports_its_exit_status() {
 }
 
 #[test]
+fn a_hung_wake_command_is_killed_at_the_configured_timeout() {
+    let root = TempDir::new().expect("a project root");
+    let survivor = root.path().join("survived");
+    let host = Host::new(
+        root.path().to_path_buf(),
+        &serde_json::from_value(json!({
+            "command": "true",
+            "alder": "alder",
+            "commandTimeoutSeconds": 1,
+        }))
+        .expect("the generated config is valid"),
+    );
+
+    let started = Instant::now();
+    let error = host
+        .run_command(
+            &format!("sleep 30 && touch '{}'", survivor.display()),
+            "due",
+        )
+        .expect_err("a hung command must become a failed wake, not a wedge");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the daemon waited out the hang instead of killing it"
+    );
+    assert!(error.message.contains("commandTimeoutSeconds"), "{error}");
+    assert!(
+        error.message.contains("not noted"),
+        "the error must say the wake will be retried: {error}"
+    );
+    assert!(
+        !survivor.exists(),
+        "the killed command still ran to its end"
+    );
+}
+
+#[test]
+fn a_chatty_alder_cannot_deadlock_the_bounded_wait() {
+    // The bounded wait polls the child's exit while reader threads drain its
+    // pipes. A status document far larger than any pipe buffer proves the
+    // drain is real: without it the child would block on a full pipe, never
+    // exit, and be killed at the timeout instead of answering.
+    let big = "a".repeat(512 * 1024);
+    let (_root, host) = project(&format!("printf '{{\"work_id\": \"%s\"}}\\n' '{big}'"), 0);
+    let document = host.alder(&["status"]).expect("the large document reads");
+    assert_eq!(document["work_id"].as_str().map(str::len), Some(big.len()));
+}
+
+#[test]
 fn output_that_is_not_exactly_one_json_document_is_an_error() {
     for body in [
         "printf 'not json\\n'",

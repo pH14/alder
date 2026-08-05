@@ -26,10 +26,14 @@ use crate::error::{DriverError, Result};
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct LoopState {
     /// The current log head. Compared with the last head the driver acted on,
-    /// this is the whole wake rule.
+    /// this is the whole wake rule. Not read from the loop section (the head
+    /// sits at the document's top level); [`LoopState::from_status`] requires
+    /// it explicitly.
     #[serde(default)]
     pub head: u64,
-    #[serde(default)]
+    /// Required, never defaulted: a loop section that does not say whether
+    /// the loop is paused is a malformed document, and reading it as
+    /// "unpaused" would let a truncated status run the command over a pause.
     pub paused: bool,
     /// The sequence of the latest nudge request, if any was ever made.
     #[serde(default)]
@@ -41,19 +45,35 @@ pub struct LoopState {
     pub review_deadlines: Vec<DateTime<Utc>>,
 }
 
+/// The code every malformed-status error carries. The driver counts these
+/// toward its outage notice: a store that answers with a document the wake
+/// rule cannot be decided from is as unavailable as one that does not answer.
+pub const MALFORMED_STATUS: &str = "malformed_status";
+
 impl LoopState {
     /// Extract the loop section and the head, ignoring everything else
     /// `status` reports.
+    ///
+    /// Fail closed on partial documents: the head and the loop section's
+    /// `paused` are required explicitly. A document missing either is an
+    /// error — never a default — because "unpaused at head 0" read off a
+    /// truncated status is indistinguishable from a real decision input.
     pub fn from_status(status: &Value) -> Result<Self> {
-        let section = status
-            .get("loop")
-            .ok_or_else(|| DriverError::new("`alder status --json` has no loop section"))?;
-        let mut state: Self = serde_json::from_value(section.clone())
-            .map_err(|error| DriverError::new(format!("unreadable loop section: {error}")))?;
-        state.head = status
-            .get("head")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| DriverError::new("`alder status --json` has no head"))?;
+        let section = status.get("loop").ok_or_else(|| {
+            DriverError::coded(
+                MALFORMED_STATUS,
+                "`alder status --json` has no loop section",
+            )
+        })?;
+        let mut state: Self = serde_json::from_value(section.clone()).map_err(|error| {
+            DriverError::coded(
+                MALFORMED_STATUS,
+                format!("unreadable loop section: {error}"),
+            )
+        })?;
+        state.head = status.get("head").and_then(Value::as_u64).ok_or_else(|| {
+            DriverError::coded(MALFORMED_STATUS, "`alder status --json` has no head")
+        })?;
         Ok(state)
     }
 }
@@ -107,5 +127,27 @@ mod tests {
         assert!(LoopState::from_status(&json!({"loop": 7})).is_err());
         // A status document with no head cannot answer the wake rule.
         assert!(LoopState::from_status(&json!({"loop": {"paused": false}})).is_err());
+    }
+
+    #[test]
+    fn a_loop_section_without_paused_is_malformed_never_default_unpaused() {
+        // The exact partial document from the review: a loop section with no
+        // `paused`. Reading it as unpaused would run the command over a real
+        // pause the truncation ate.
+        let error = LoopState::from_status(&json!({"head": 42, "loop": {}}))
+            .expect_err("a paused-less loop section must not decide anything");
+        assert!(error.is(MALFORMED_STATUS), "{error}");
+
+        // Every malformed shape carries the code, so the driver counts it
+        // toward the outage notice rather than logging it invisibly forever.
+        for document in [
+            json!({"head": 1}),
+            json!({"loop": 7}),
+            json!({"loop": {"paused": false}}),
+            json!({"head": "not a number", "loop": {"paused": false}}),
+        ] {
+            let error = LoopState::from_status(&document).expect_err("malformed");
+            assert!(error.is(MALFORMED_STATUS), "{document}: {error}");
+        }
     }
 }

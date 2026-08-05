@@ -151,6 +151,9 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
     };
     let socket = env::var(SOCKET_ENV).expect("the harness names the sandbox socket");
     let work = PathBuf::from(env::var(WORK_ENV).expect("the harness names its work directory"));
+    let state = PathBuf::from(
+        env::var("ALDER_EXT_RUNNER_STATE_DIR").expect("the harness pins the state directory"),
+    );
 
     // Prove the sandbox before creating anything.
     assert!(
@@ -178,25 +181,19 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "-qm", "sandbox"]);
 
-    // The engine stub records the argv it was handed, then reads one
-    // multi-line delivery in raw mode. This makes the real tmux bytes — not a
-    // mocked tmux call — the delivery contract. It stays live until the test
-    // releases it, which keeps the running/exited distinction observable too.
+    // The first engine stub (the codex-tier launch) records the argv it was
+    // handed and stays live until the test releases it, which keeps the
+    // running/exited distinction observable. It deliberately reads nothing:
+    // a codex-route delivery queues in the pane until the holding shell.
     let argv = work.join("engine-argv");
     let argc = work.join("engine-argc");
-    let send_ready = work.join("engine-ready-for-send");
-    let send_received = work.join("engine-send-bytes");
     let message = "ruling line one\nruling line two";
-    let send_byte_count = message.len() + 1; // tmux sends one final Enter.
     let stub = write_executable(
         &work.join("engine.sh"),
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$#\" >'{argc}'\nprintf '%s\\n' \"$@\" >'{argv}.part' && mv '{argv}.part' '{argv}'\nstty -icanon -echo min 1 time 0\n: >'{ready}'\ndd bs=1 count={count} of='{received}.part' 2>/dev/null && mv '{received}.part' '{received}'\nstty sane\nwhile [ ! -f '{release}' ]; do sleep 0.05; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$#\" >'{argc}'\nprintf '%s\\n' \"$@\" >'{argv}.part' && mv '{argv}.part' '{argv}'\nwhile [ ! -f '{release}' ]; do sleep 0.05; done\n",
             argc = argc.display(),
             argv = argv.display(),
-            ready = send_ready.display(),
-            count = send_byte_count,
-            received = send_received.display(),
             release = work.join("release-engine").display(),
         ),
     );
@@ -231,7 +228,8 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
     let new_session = format!(
         "new-session -d -s {session} -c {worktree} \
          -e ALDER_EXT_RUNNER_HANDLE={session} -e ALDER_EXT_RUNNER_ENGINE=running \
-         -e ALDER_EXT_RUNNER_TIER=luna -e ALDER_EXT_RUNNER_WORKTREE={worktree} ",
+         -e ALDER_EXT_RUNNER_TIER=luna -e ALDER_EXT_RUNNER_PROVIDER=codex \
+         -e ALDER_EXT_RUNNER_WORKTREE={worktree} ",
         worktree = work.join(&session).display()
     );
     assert_eq!(
@@ -250,10 +248,12 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
     });
     assert!(
         pane_command.starts_with(&format!(
-            ".alder-ext-runner/stamp-codex-session; '{}' '",
+            "'{}'; '{}' '",
+            state.join(&session).join("stamp-codex-session").display(),
             stub.display()
         )),
-        "something precedes the engine in the pane command: {start_ran}"
+        "the pane no longer starts the state-directory watcher then the \
+         engine: {start_ran}"
     );
     assert!(
         pane_command.ends_with(&format!(
@@ -272,9 +272,9 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
     );
     assert_eq!(received, format!("{prompt}\n"));
 
-    // Identity and live state are present on the session from the
-    // new-session effect itself, under the runner's own names and nobody
-    // else's.
+    // Identity, live state, and the resolved provider are present on the
+    // session from the new-session effect itself, under the runner's own
+    // names and nobody else's.
     assert_eq!(
         session_environment(&session, "ALDER_EXT_RUNNER_HANDLE").as_deref(),
         Some(session.as_str())
@@ -286,6 +286,11 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
     assert_eq!(
         session_environment(&session, "ALDER_EXT_RUNNER_TIER").as_deref(),
         Some("luna")
+    );
+    assert_eq!(
+        session_environment(&session, "ALDER_EXT_RUNNER_PROVIDER").as_deref(),
+        Some("codex"),
+        "the resolved provider is stamped at start; send routes by it alone"
     );
     assert!(
         session_environment(&session, "ALDER_ATTEMPT").is_none(),
@@ -307,97 +312,86 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
     .expect_err("a second live execution is refused");
     assert!(refused.message.contains("already running"), "{refused}");
 
-    // Run `send` against this test's live pane. The stub reads the terminal
-    // in raw mode, so this catches both a bad pane target and tmux's default
-    // LF-to-CR conversion without trusting a tmux mock. The interactive
-    // route is selected from the session's own tier marker; the runner reads
-    // it before delivery only and does not sample the pane after it sends.
+    // The resume machinery lives in the runner-owned state directory — the
+    // worktree, which the execution itself writes, carries none of it — and
+    // repeats the launch pinning whole.
+    let resume = state.join(&session).join("resume");
+    assert!(
+        resume.is_file(),
+        "a codex execution has nothing to resume it"
+    );
+    assert!(
+        resume
+            .metadata()
+            .expect("the resume script is statable")
+            .permissions()
+            .mode()
+            & 0o111
+            != 0,
+        "the resume script is not executable"
+    );
+    let script = fs::read_to_string(&resume).expect("the resume script is readable");
+    for part in [
+        "codex exec resume",
+        "-m",
+        "gpt-5.6-luna",
+        "model_reasoning_effort=high",
+        "sandbox_workspace_write.network_access=true",
+        "writable_roots",
+    ] {
+        assert!(
+            script.contains(part),
+            "the resume script omits {part}: {script}"
+        );
+    }
+    let checked = Command::new("sh")
+        .args(["-n"])
+        .arg(&resume)
+        .status()
+        .expect("sh runs");
+    assert!(checked.success(), "the resume script is not valid sh");
+    assert!(
+        !started.worktree.join(".alder-ext-runner").exists(),
+        "the runner wrote its machinery into the worker-writable worktree"
+    );
+
+    // A send takes the encoded-resume route because the session is stamped
+    // codex — even under a config that has since reclassified the tier as
+    // interactive, and even while the one-shot process is still running and
+    // cannot read its terminal. Once that process ends, the holding shell
+    // receives only the generated command, never the raw message.
     let tmux_before_send = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
     assert!(
         !tmux_before_send.contains("send-keys"),
         "start typed into the pane: {tmux_before_send}"
     );
-    await_true(
-        || send_ready.is_file(),
-        "the engine is reading its pane for a delivery",
-    );
     let message_file = work.join("review-finding.txt");
     fs::write(&message_file, message).expect("the local send input is written");
-    // The built-in table calls luna a codex rung, but this pane runs an
-    // interactive stub; a config table that names the same rung interactive
-    // is exactly what the config file is for.
-    let config = work.join("runner-config.json");
-    fs::write(
-        &config,
-        r#"{"tiers": {
-            "luna": {"provider": "claude", "model": "stub", "effort": "high", "counterpart": "luna-codex"},
-            "luna-codex": {"provider": "codex", "model": "stub", "effort": "high", "counterpart": "luna"}
-        }}"#,
-    )
-    .expect("the config is written");
-    let delivered = Command::new(env!("CARGO_BIN_EXE_alder-ext-runner"))
-        .args(["send", &session, "--file", message_file.to_str().unwrap()])
-        .env("ALDER_EXT_RUNNER_CONFIG", &config)
-        .output()
-        .expect("send runs");
-    assert!(
-        delivered.status.success(),
-        "send failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&delivered.stdout),
-        String::from_utf8_lossy(&delivered.stderr)
-    );
-    await_true(
-        || send_received.is_file(),
-        "the live pane receives the sent bytes",
-    );
-    assert_eq!(
-        fs::read(&send_received).expect("the received message is readable"),
-        format!("{message}\n").as_bytes(),
-        "send must preserve embedded LF and add exactly one submitting Enter"
-    );
-    let send_tmux_calls = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
-    assert!(
-        tmux_entries(&send_tmux_calls).iter().any(|call| call
-            .starts_with("paste-buffer -d -r -b alder-ext-send-")
-            && call.ends_with(&format!("-t ={session}:"))),
-        "send did not paste raw bytes into the session pane: {send_tmux_calls}"
-    );
-    assert!(
-        tmux_entries(&send_tmux_calls)
-            .iter()
-            .any(|call| *call == format!("send-keys -t ={session}: Enter")),
-        "send did not submit once to the session pane: {send_tmux_calls}"
-    );
-
-    // A codex-tier send takes the encoded-resume route even while the
-    // one-shot process is still running and cannot read its terminal. Once
-    // that process ends, the holding shell receives only the generated
-    // command, never the raw message.
     let resumed_message = work.join("resumed-message");
     write_executable(
-        &started.worktree.join(".alder-ext-runner/resume"),
+        &resume,
         &format!(
             "#!/bin/sh\nprintf '%s' \"$2\" >'{}'\nexec tmux wait-for send-resume-hold\n",
             resumed_message.display()
         ),
     );
     fs::write(
-        started.worktree.join(".alder-ext-runner/codex-session"),
+        state.join(&session).join("codex-session"),
         "019fb2ef-d507-7201-bc36-79d6d5b82336\n",
     )
     .expect("the codex session marker is written");
-    let codex_config = work.join("runner-config-codex.json");
+    let drifted_config = work.join("runner-config-drifted.json");
     fs::write(
-        &codex_config,
+        &drifted_config,
         r#"{"tiers": {
-            "luna": {"provider": "codex", "model": "stub", "effort": "high", "counterpart": "luna-claude"},
-            "luna-claude": {"provider": "claude", "model": "stub", "effort": "high", "counterpart": "luna"}
+            "luna": {"provider": "claude", "model": "stub", "effort": "high", "counterpart": "luna-codex"},
+            "luna-codex": {"provider": "codex", "model": "stub", "effort": "high", "counterpart": "luna"}
         }}"#,
     )
-    .expect("the codex config is written");
+    .expect("the drifted config is written");
     let running_codex = Command::new(env!("CARGO_BIN_EXE_alder-ext-runner"))
         .args(["send", &session, "--file", message_file.to_str().unwrap()])
-        .env("ALDER_EXT_RUNNER_CONFIG", &codex_config)
+        .env("ALDER_EXT_RUNNER_CONFIG", &drifted_config)
         .output()
         .expect("the running-codex send runs");
     assert!(
@@ -415,7 +409,15 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
         tmux_entries(&running_codex_calls)
             .iter()
             .any(|call| call.starts_with("set-buffer -b alder-ext-send-")),
-        "the codex route did not receive an encoded resume command: {running_codex_calls}"
+        "the codex route did not receive an encoded resume command — config \
+         drift changed a live session's protocol: {running_codex_calls}"
+    );
+    assert!(
+        !tmux_entries(&running_codex_calls)
+            .iter()
+            .any(|call| call.starts_with("load-buffer")),
+        "the drifted config rerouted a codex-stamped session onto the \
+         interactive paste: {running_codex_calls}"
     );
     assert!(
         !running_codex_calls.contains(message),
@@ -452,13 +454,31 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
     );
 
     // `start` means "run this prompt": the exited pane is replaced, its
-    // worktree adopted, and no second worktree is cut.
+    // worktree adopted, and no second worktree is cut. Restarting at a
+    // claude rung re-stamps the session, so the interactive route is
+    // exercised next against real pane bytes. The second stub reads one
+    // multi-line delivery in raw mode, which catches both a bad pane target
+    // and tmux's default LF-to-CR conversion without trusting a tmux mock.
+    let send_ready = work.join("engine-ready-for-send");
+    let send_received = work.join("engine-send-bytes");
+    let send_byte_count = message.len() + 1; // tmux sends one final Enter.
+    let interactive_stub = write_executable(
+        &work.join("engine-interactive.sh"),
+        &format!(
+            "#!/bin/sh\nstty -icanon -echo min 1 time 0\n: >'{ready}'\ndd bs=1 count={count} of='{received}.part' 2>/dev/null && mv '{received}.part' '{received}'\nstty sane\nwhile [ ! -f '{release}' ]; do sleep 0.05; done\n",
+            ready = send_ready.display(),
+            count = send_byte_count,
+            received = send_received.display(),
+            release = work.join("release-interactive-engine").display(),
+        ),
+    );
+    let opus = lookup(&TIERS, "opus").expect("opus is a rung");
     let restarted = start::start(
         &host,
         BRANCH,
-        luna,
+        opus,
         "a second prompt for the same branch",
-        Some(&stub.display().to_string()),
+        Some(&interactive_stub.display().to_string()),
     )
     .expect("an exited pane is replaced");
     assert!(restarted.adopted_worktree);
@@ -478,9 +498,54 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
             .any(|call| call.starts_with("kill-session")),
         "the exited pane was not replaced: {calls}"
     );
+    assert_eq!(
+        session_environment(&session, "ALDER_EXT_RUNNER_PROVIDER").as_deref(),
+        Some("claude"),
+        "the replacement start re-stamps the session with its own provider"
+    );
 
-    // The worktree is real, on its own branch, and carries only the runner's
-    // own machinery — nothing of any caller's.
+    // The interactive route needs no config at all: the stamp is the route.
+    await_true(
+        || send_ready.is_file(),
+        "the engine is reading its pane for a delivery",
+    );
+    let delivered = Command::new(env!("CARGO_BIN_EXE_alder-ext-runner"))
+        .args(["send", &session, "--file", message_file.to_str().unwrap()])
+        .env_remove("ALDER_EXT_RUNNER_CONFIG")
+        .output()
+        .expect("send runs");
+    assert!(
+        delivered.status.success(),
+        "send failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&delivered.stdout),
+        String::from_utf8_lossy(&delivered.stderr)
+    );
+    await_true(
+        || send_received.is_file(),
+        "the live pane receives the sent bytes",
+    );
+    assert_eq!(
+        fs::read(&send_received).expect("the received message is readable"),
+        format!("{message}\n").as_bytes(),
+        "send must preserve embedded LF and add exactly one submitting Enter"
+    );
+    let send_tmux_calls = fs::read_to_string(work.join("tmux-calls.log")).unwrap_or_default();
+    assert!(
+        tmux_entries(&send_tmux_calls).iter().any(|call| call
+            .starts_with("paste-buffer -d -r -b alder-ext-send-")
+            && call.ends_with(&format!("-t ={session}:"))),
+        "send did not paste raw bytes into the session pane: {send_tmux_calls}"
+    );
+    assert!(
+        tmux_entries(&send_tmux_calls)
+            .iter()
+            .any(|call| *call == format!("send-keys -t ={session}: Enter")),
+        "send did not submit once to the session pane: {send_tmux_calls}"
+    );
+
+    // The worktree is real, on its own branch, and carries nothing of the
+    // runner's or any caller's: the runner's machinery lives in its own
+    // state directory, never where the execution writes.
     let worktree = &started.worktree;
     assert!(
         worktree.join("README.md").is_file(),
@@ -490,46 +555,16 @@ fn sandboxed_start_cuts_a_worktree_and_leaves_a_live_pane() {
         !worktree.join(".alder").exists(),
         "the runner wrote somebody else's directory into the worktree"
     );
-    let resume = worktree.join(".alder-ext-runner/resume");
     assert!(
-        resume.is_file(),
-        "a codex execution has nothing to resume it"
+        !worktree.join(".alder-ext-runner").exists(),
+        "the runner still writes machinery into the worker-writable worktree"
     );
-    assert!(
-        resume
-            .metadata()
-            .expect("the resume script is statable")
-            .permissions()
-            .mode()
-            & 0o111
-            != 0,
-        "the resume script is not executable"
-    );
-    let script = fs::read_to_string(&resume).expect("the resume script is readable");
-    for part in [
-        "codex exec resume",
-        "-m",
-        "gpt-5.6-luna",
-        "model_reasoning_effort=high",
-        "sandbox_workspace_write.network_access=true",
-        "writable_roots",
-    ] {
-        assert!(
-            script.contains(part),
-            "the resume script omits {part}: {script}"
-        );
-    }
-    let checked = Command::new("sh")
-        .args(["-n"])
-        .arg(&resume)
-        .status()
-        .expect("sh runs");
-    assert!(checked.success(), "the resume script is not valid sh");
     assert_eq!(
         run(&root, "git", &["rev-parse", "--abbrev-ref", BRANCH]).trim(),
         BRANCH
     );
 
+    fs::write(work.join("release-interactive-engine"), "go").expect("the engine is released");
     kill_session(&session);
     await_true(|| !session_exists(&session), "the session goes away");
     fs::write(work.join("done"), "ok").expect("the marker is written");

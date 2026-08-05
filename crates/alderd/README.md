@@ -70,6 +70,7 @@ to poll are properties of the box, not durable project facts.
   "hintPollSeconds": 1,
   "debounceSeconds": 20,
   "maxIntervalSeconds": 1800,
+  "commandTimeoutSeconds": 600,
   "notify": "terminal-notifier -title alder -message",
   "alder": "alder"
 }
@@ -82,8 +83,9 @@ to poll are properties of the box, not durable project facts.
 | `hintPollSeconds` | 1 | How often to stat the local append marker between full polls. |
 | `debounceSeconds` | 20 | How long a fire condition must hold before running. |
 | `maxIntervalSeconds` | 1800 | Ceiling between runs. It also overrides the debounce, and it is the backstop for a deferral deadline the executor has not yet reviewed. |
-| `notify` | none | Shell command invoked with one message argument, on a repeated store outage. A standing condition is reported once, not once per poll. |
-| `alder` | `alder` | Path to the `alder` binary. |
+| `commandTimeoutSeconds` | 600 | Bound on one command run. A command still running at the bound is killed and the wake fails: nothing is noted, and the next poll retries it. A hung executor must not wedge the daemon. |
+| `notify` | none | Shell command invoked with one message argument, on a repeated store outage or an unreadable status. A standing condition is reported once, not once per poll. |
+| `alder` | `alder` | Path to the `alder` binary. The daemon's own `alder status` read carries a fixed 60-second bound; a CLI that hangs past it is killed and counted as an outage. |
 
 **Migrating an older config.** `driver.json` rejects unknown fields. A config
 written before the execution extraction must delete `engines`, `passDoc`,
@@ -97,13 +99,17 @@ delete those too. Until then the daemon refuses to start with:
 ```text
 invalid driver config `.alder/driver.json`: unknown field `engines`, expected
 one of `command`, `pollSeconds`, `hintPollSeconds`, `debounceSeconds`,
-`maxIntervalSeconds`, `notify`, `alder` at line 2 column 12
+`maxIntervalSeconds`, `commandTimeoutSeconds`, `notify`, `alder` at line 2
+column 12
 ```
 
 ## What one poll does
 
-1. Read the head and the loop fold. A `store_unavailable` result is retried
-   silently and notified after three consecutive polls.
+1. Read the head and the loop fold, bounded at 60 seconds — a hung `alder`
+   is killed and counted as an outage. A `store_unavailable` result, a
+   timeout, or a status document the wake rule cannot be decided from (no
+   head, or a loop section without `paused` — never read as unpaused) is
+   retried silently and notified after three consecutive polls.
 2. If the loop is paused, idle.
 3. Compute the trigger kinds that hold:
    `manual` (a nudge request is later in the log than the noted head),
@@ -118,12 +124,17 @@ Firing is strictly ordered:
 
 1. **Run the command.** `/bin/sh -c <command>` in the project root, with
    `ALDERD_TRIGGERS=<kinds>` (for example `log,due`) in its environment, and
-   wait for it. A non-zero exit is a failed poll: nothing is noted, and the
+   wait for it, at most `commandTimeoutSeconds`. A non-zero exit — or a
+   command killed at the bound — is a failed poll: nothing is noted, and the
    next poll runs the same wake again.
-2. **Note.** Write the head this run acted on, and the time, to
-   `.alder/alderd-notes.json`. The note comes last on purpose: a crash before
-   it re-runs the wake next poll, and a duplicate run is harmless — the
-   executor reads the fold, and nothing durable records wakes.
+2. **Note.** Write the head this run acted on, and the decision instant —
+   the time the trigger was judged, before the command ran, so a deadline
+   that passes while the command runs still earns its wake on the next poll
+   — to `.alder/alderd-notes.json`. The note comes last on purpose: a crash
+   before it re-runs the wake next poll, and a duplicate run is harmless —
+   the executor reads the fold, and nothing durable records wakes. A note
+   whose time sits in the future (the clock rolled back) is clamped to now
+   with a logged warning.
 
 Nothing else. The command exits; whatever it caused to be appended moves the
 head, and the next poll sees it. Two daemons pointed at one log at worst run

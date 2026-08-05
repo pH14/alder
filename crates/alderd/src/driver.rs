@@ -125,6 +125,7 @@ impl<E: Effects> Driver<E> {
             now: self.effects.now(),
             pending_since: self.pending_since,
         };
+        self.clamp_rolled_back_note(poll.now);
 
         match decide::decide(&self.config, &state, &self.notes, &poll) {
             Decision::Idle(reason) => {
@@ -139,8 +140,26 @@ impl<E: Effects> Driver<E> {
             }
             Decision::Fire(triggers) => {
                 self.pending_since = None;
-                self.fire(&state, &triggers)
+                self.fire(&state, &triggers, poll.now)
             }
+        }
+    }
+
+    /// A noted wake in the future can only mean the machine's clock rolled
+    /// back since the note was written. Left alone it would suppress the
+    /// max-interval ceiling and every review deadline until the wall clock
+    /// caught up with the old future; clamped to now — with a logged warning
+    /// and the clamp persisted — the worst cost is one early wake.
+    fn clamp_rolled_back_note(&mut self, now: DateTime<Utc>) {
+        if let Some(woke) = self.notes.last_wake_at
+            && woke > now
+        {
+            self.effects.log(&format!(
+                "the noted last wake ({woke}) is in the future — the clock \
+                 rolled back; clamping it to now ({now})"
+            ));
+            self.notes.last_wake_at = Some(now);
+            self.save_notes();
         }
     }
 
@@ -148,19 +167,26 @@ impl<E: Effects> Driver<E> {
         LoopState::from_status(&self.effects.alder(&["status"])?)
     }
 
-    /// Read the loop state, counting consecutive store outages so a standing
-    /// outage is announced once rather than every poll.
+    /// Read the loop state, counting consecutive outages so a standing one is
+    /// announced once rather than every poll. A malformed status document
+    /// counts too: a store that answers with something the wake rule cannot
+    /// be decided from is as unavailable as one that does not answer, and a
+    /// partial document must never quietly read as "unpaused at head 0".
     fn observed_state(&mut self) -> Result<LoopState> {
         match self.loop_state() {
             Ok(state) => {
                 self.outages = 0;
                 Ok(state)
             }
-            Err(error) if error.is("store_unavailable") => {
+            Err(error)
+                if error.is("store_unavailable")
+                    || error.is(crate::loop_state::MALFORMED_STATUS) =>
+            {
                 self.outages = self.outages.saturating_add(1);
                 if self.outages == OUTAGE_NOTICE_AFTER {
                     self.effects.notify(&format!(
-                        "the Alder store has been unavailable for {OUTAGE_NOTICE_AFTER} polls"
+                        "the Alder store has been unavailable or unreadable for \
+                         {OUTAGE_NOTICE_AFTER} polls"
                     ));
                 }
                 Err(error)
@@ -176,7 +202,18 @@ impl<E: Effects> Driver<E> {
     /// runs the same wake again. That is the harmless direction, because the
     /// command is idempotent by design: whatever it drives reads the fold,
     /// and nothing durable records wakes.
-    fn fire(&mut self, state: &LoopState, triggers: &[Trigger]) -> Result<()> {
+    ///
+    /// The recorded time is `decided_at` — the decision instant, before the
+    /// command ran — not the time the command finished. A review deadline
+    /// that passes *while* the command runs was not served by this wake (the
+    /// decision predates it), so it must still compare later than the note
+    /// and fire on the next poll.
+    fn fire(
+        &mut self,
+        state: &LoopState,
+        triggers: &[Trigger],
+        decided_at: DateTime<Utc>,
+    ) -> Result<()> {
         let names = trigger_names(triggers);
         self.effects.run_command(&self.config.command, &names)?;
         self.effects
@@ -184,7 +221,7 @@ impl<E: Effects> Driver<E> {
 
         self.notes = Notes {
             last_head: state.head,
-            last_wake_at: Some(self.effects.now()),
+            last_wake_at: Some(decided_at),
         };
         self.save_notes();
         Ok(())

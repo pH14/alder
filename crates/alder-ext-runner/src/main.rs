@@ -150,9 +150,10 @@ fn send(arguments: &[String]) -> Result<ExitCode, RunnerError> {
     }
     let handle = handle.ok_or_else(|| usage("send needs a handle"))?;
     let file = file.ok_or_else(|| usage("send needs --file"))?;
-    let table = config::load_tiers()?;
+    // No tier table: the delivery route was stamped into the session at
+    // start, and `send` reads the stamp rather than the config.
     let host = Host::new(current_dir()?);
-    ops::send(&host, table, &handle, &file, force)?;
+    ops::send(&host, &handle, &file, force)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -160,7 +161,12 @@ fn send(arguments: &[String]) -> Result<ExitCode, RunnerError> {
 fn kill(arguments: &[String]) -> Result<ExitCode, RunnerError> {
     let handle = one_handle(arguments, "kill")?;
     let host = Host::new(current_dir()?);
-    ops::kill(&host, &handle)?;
+    match ops::kill(&host, &handle)? {
+        ops::Killed::Killed => println!("killed {handle}"),
+        ops::Killed::AlreadyDead => {
+            println!("no execution answers to `{handle}`; nothing to kill");
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -200,16 +206,16 @@ fn record_limit(arguments: &[String]) -> Result<ExitCode, RunnerError> {
     }
     let provider = provider.ok_or_else(|| usage("limit needs a provider"))?;
     let path = config::limits_path();
-    let mut limits = Limits::load(&path)?;
+    // One locked read-modify-write: concurrent `limit` commands serialize
+    // instead of dropping each other's entries, and a corrupt file fails
+    // open — loudly — rather than blocking the record.
     if clear {
-        limits.clear(provider);
-        limits.save(&path)?;
+        Limits::update(&path, |limits| limits.clear(provider))?;
         println!("{} is no longer rate-limited", provider.as_str());
         return Ok(ExitCode::SUCCESS);
     }
     let until = Utc::now() + chrono::Duration::minutes(minutes);
-    limits.set(provider, until, why);
-    limits.save(&path)?;
+    Limits::update(&path, |limits| limits.set(provider, until, why))?;
     println!(
         "{} is rate-limited until {}",
         provider.as_str(),

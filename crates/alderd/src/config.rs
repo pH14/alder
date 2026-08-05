@@ -25,6 +25,11 @@ pub struct Config {
     pub debounce_seconds: u64,
     #[serde(default = "default_max_interval")]
     pub max_interval_seconds: u64,
+    /// How long the wake command may run before the daemon kills it and
+    /// treats the wake as failed (nothing is noted; the next poll retries).
+    /// A command that hangs must not wedge the daemon forever.
+    #[serde(default = "default_command_timeout")]
+    pub command_timeout_seconds: u64,
     /// Optional shell command invoked with one message argument.
     #[serde(default)]
     pub notify: Option<String>,
@@ -47,6 +52,10 @@ fn default_debounce() -> u64 {
 
 fn default_max_interval() -> u64 {
     1800
+}
+
+fn default_command_timeout() -> u64 {
+    600
 }
 
 fn default_alder() -> String {
@@ -81,6 +90,9 @@ impl Config {
         if self.hint_poll_seconds == 0 {
             return Err(DriverError::new("hintPollSeconds must be positive"));
         }
+        if self.command_timeout_seconds == 0 {
+            return Err(DriverError::new("commandTimeoutSeconds must be positive"));
+        }
         Ok(())
     }
 
@@ -90,6 +102,10 @@ impl Config {
 
     pub fn hint_poll(&self) -> Duration {
         Duration::from_secs(self.hint_poll_seconds)
+    }
+
+    pub fn command_timeout(&self) -> Duration {
+        Duration::from_secs(self.command_timeout_seconds)
     }
 }
 
@@ -113,10 +129,12 @@ mod tests {
         assert_eq!(config.hint_poll_seconds, 1);
         assert_eq!(config.debounce_seconds, 20);
         assert_eq!(config.max_interval_seconds, 1800);
+        assert_eq!(config.command_timeout_seconds, 600);
         assert_eq!(config.alder, "alder");
         assert!(config.notify.is_none());
         assert_eq!(config.poll(), Duration::from_secs(60));
         assert_eq!(config.hint_poll(), Duration::from_secs(1));
+        assert_eq!(config.command_timeout(), Duration::from_secs(600));
     }
 
     #[test]
@@ -126,6 +144,7 @@ mod tests {
             r#"{"command": " "}"#,
             r#"{"command": "c", "pollSeconds": 0}"#,
             r#"{"command": "c", "hintPollSeconds": 0}"#,
+            r#"{"command": "c", "commandTimeoutSeconds": 0}"#,
             // The fields that left with the execution extraction are unknown
             // now: a stale config fails loudly instead of half-working.
             r#"{"command": "c", "engines": {"claude": {"cmd": "claude"}}}"#,

@@ -93,6 +93,19 @@ fail() {
   exit 1
 }
 
+# Poll a condition (a shell command) until it holds or a bound elapses. This
+# script waits only on conditions it then asserts — never a fixed sleep whose
+# length is a guess about the machine.
+await() {
+  local what=$1
+  shift
+  for _ in $(seq 1 50); do
+    "$@" && return 0
+    sleep 0.2
+  done
+  fail "timed out waiting until $what"
+}
+
 REAL_BEFORE=$(real_sessions)
 
 mkdir -p "$SB/bin"
@@ -160,10 +173,7 @@ HANDLE=$(ALDER_EXT_RUNNER_CMD="$SB/stub.sh" \
 # The stub exits immediately, so its argv file appears at once. Waiting for
 # it is not a sleep in the start path; it is this script waiting for a
 # process the runner deliberately does not wait for.
-for _ in $(seq 1 20); do
-  [ -s "$SB/argv.txt" ] && break
-  sleep 0.2
-done
+await "the engine records its argv" test -s "$SB/argv.txt"
 
 echo "=== session list (sandbox tmux server) ==="
 tmux list-sessions -F '#{session_name}'
@@ -188,46 +198,52 @@ fi
 
 # The pane outlives the engine, and status reads it back: the stub has
 # exited, so the handle is done — not dead — and the worktree detail names
-# where the result lives. Half a second of settling is what makes this an
-# assertion rather than a race.
-sleep 0.5
+# where the result lives. The exited marker is the asserted condition, so it
+# is polled with a bound rather than slept toward.
+engine_marker_reads_exited() {
+  [ "$(tmux show-environment -t "=$SESSION_NAME" ALDER_EXT_RUNNER_ENGINE 2>/dev/null)" = \
+    "ALDER_EXT_RUNNER_ENGINE=exited" ]
+}
+await "the session records that its engine exited" engine_marker_reads_exited
 tmux has-session -t "=$SESSION_NAME" 2>/dev/null ||
   fail "the session died with the engine; the pane does not end '; exec bash'"
 [ "$(tmux show-environment -t "=$SESSION_NAME" ALDER_EXT_RUNNER_HANDLE)" = \
   "ALDER_EXT_RUNNER_HANDLE=$SESSION_NAME" ] ||
   fail "the session was not stamped with its handle at creation"
-[ "$(tmux show-environment -t "=$SESSION_NAME" ALDER_EXT_RUNNER_ENGINE)" = \
-  "ALDER_EXT_RUNNER_ENGINE=exited" ] ||
-  fail "the session does not expose that its engine exited"
 if tmux show-environment -t "=$SESSION_NAME" ALDER_ATTEMPT >/dev/null 2>&1; then
   fail "the runner stamped somebody else's marker into its session"
 fi
 STATUS=$("$RUNNER" status "$HANDLE" | head -n 1)
 [ "$STATUS" = "done" ] || fail "status says '$STATUS' for an exited engine, expected done"
 
-# The worktree, the branch, and the runner's own machinery — nothing else.
+# The worktree and the branch — and nothing of the runner's inside the
+# worktree: its machinery lives in the state directory, where the execution
+# cannot rewrite what the runner later executes.
+RESUME=$ALDER_EXT_RUNNER_STATE_DIR/$SESSION_NAME/resume
 [ -d "$SB/alder-ext-work-wv-1" ] || fail "worktree missing"
 [ "$(git -C "$SB/repo" rev-parse --abbrev-ref "$BRANCH")" = "$BRANCH" ] ||
   fail "branch missing"
-[ -x "$SB/alder-ext-work-wv-1/.alder-ext-runner/resume" ] ||
-  fail "a codex execution has no executable resume script"
-sh -n "$SB/alder-ext-work-wv-1/.alder-ext-runner/resume" ||
-  fail "the resume script is not valid sh"
+[ -x "$RESUME" ] ||
+  fail "a codex execution has no executable resume script in the state dir"
+sh -n "$RESUME" || fail "the resume script is not valid sh"
 for part in "codex exec resume" "gpt-5.6-luna" "model_reasoning_effort=high" \
   "sandbox_workspace_write.network_access=true" "writable_roots"; do
-  grep -q -- "$part" "$SB/alder-ext-work-wv-1/.alder-ext-runner/resume" ||
-    fail "the resume script omits: $part"
+  grep -q -- "$part" "$RESUME" || fail "the resume script omits: $part"
 done
-grep -q -- "$SB/repo/.git" "$SB/alder-ext-work-wv-1/.alder-ext-runner/resume" ||
+grep -q -- "$SB/repo/.git" "$RESUME" ||
   fail "the resume script does not name this repo's git dir"
 [ -e "$SB/alder-ext-work-wv-1/.alder" ] &&
   fail "the runner wrote somebody else's directory into the worktree"
+[ -e "$SB/alder-ext-work-wv-1/.alder-ext-runner" ] &&
+  fail "the runner wrote its machinery into the worker-writable worktree"
 
-# kill ends it; status then reads dead.
-"$RUNNER" kill "$HANDLE"
-sleep 0.2
-STATUS=$("$RUNNER" status "$HANDLE" | head -n 1)
-[ "$STATUS" = "dead" ] || fail "status says '$STATUS' after kill, expected dead"
+# kill ends it, verified; status then reads dead.
+"$RUNNER" kill "$HANDLE" | grep -q "killed $HANDLE" ||
+  fail "kill did not report the verified kill"
+status_reads_dead() {
+  [ "$("$RUNNER" status "$HANDLE" | head -n 1)" = "dead" ]
+}
+await "status reads dead after kill" status_reads_dead
 
 # The sandbox session is gone from the sandbox server, and the real server
 # never changed.

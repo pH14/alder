@@ -31,6 +31,13 @@ struct World {
     /// Whether the configured command fails, standing in for a wake command
     /// that crashed part-way.
     command_fails: bool,
+    /// How long the configured command takes, in clock seconds. The fake
+    /// advances its clock by this much inside `run_command`, standing in for
+    /// a slow executor pass.
+    command_duration_seconds: i64,
+    /// Serve a truncated status document — a loop section with no `paused` —
+    /// standing in for a store that answers with something unusable.
+    partial_status: bool,
     /// Every command run: `(command, triggers)` pairs, in order.
     commands: Vec<(String, String)>,
     /// The machine-local notes file, as bytes on the fake disk.
@@ -89,6 +96,15 @@ impl Effects for Fake {
         if let Some(error) = world.alder_error.clone() {
             return Err(error);
         }
+        if world.partial_status {
+            // Parsed exactly the way production parses it, so the error and
+            // its code are the real ones rather than a stub's.
+            return alderd::loop_state::LoopState::from_status(&json!({
+                "head": world.head,
+                "loop": {}
+            }))
+            .map(|_| unreachable!("a paused-less loop section must not parse"));
+        }
         match args {
             ["status"] => Ok(json!({
                 "head": world.head,
@@ -116,6 +132,8 @@ impl Effects for Fake {
         if world.command_fails {
             return Err(DriverError::new("the command exited with exit status: 1"));
         }
+        self.clock
+            .fetch_add(world.command_duration_seconds, Ordering::SeqCst);
         world.calls.push(format!("command {command} [{triggers}]"));
         world
             .commands
@@ -323,10 +341,36 @@ fn a_repeated_store_outage_is_reported_once() {
 }
 
 #[test]
-fn only_a_store_outage_counts_toward_the_outage_notice() {
-    // Any other failure is a local fault — a missing binary, a bad config —
-    // and the operator's own shell reports those. Counting them here would
-    // announce an outage the store is not having.
+fn a_partial_status_document_is_an_outage_never_default_unpaused() {
+    // A loop section missing `paused` must not decide anything — above all
+    // it must not read as "unpaused" and run the command — and it counts
+    // toward the outage notice like a store that did not answer at all.
+    let mut truncated = settled();
+    truncated.partial_status = true;
+    truncated.head = 42;
+    let mut driver = Driver::new(Fake::new(truncated), config());
+    for _ in 0..5 {
+        let error = driver
+            .poll_once()
+            .expect_err("a partial status is an error");
+        assert!(error.is("malformed_status"), "{error}");
+    }
+    assert!(
+        driver.effects().commands().is_empty(),
+        "a truncated status ran the command: {:?}",
+        driver.effects().commands()
+    );
+    let notices = driver.effects().world.borrow().notices.clone();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("unavailable"), "{notices:?}");
+}
+
+#[test]
+fn a_local_fault_never_counts_toward_the_outage_notice() {
+    // A store outage and an unusable status document count; any other
+    // failure is a local fault — a missing binary, a bad config — and the
+    // operator's own shell reports those. Counting them here would announce
+    // an outage the store is not having.
     let broken = World {
         alder_error: Some(DriverError::new("alder is not on PATH")),
         ..World::default()
@@ -415,4 +459,92 @@ fn a_deferral_deadline_runs_the_command_once_at_its_instant() {
     // And it, too, fires only once.
     driver.poll_once().unwrap();
     assert_eq!(driver.effects().commands().len(), 2);
+}
+
+#[test]
+fn a_deadline_that_passes_while_the_command_runs_fires_on_the_next_poll() {
+    // The wake is noted at its decision instant, not at the command's end.
+    // One deadline fires at minute 10; the command then runs for five
+    // minutes, during which the second deadline (minute 12) passes. Had the
+    // note carried the command's end (minute 15), that second deadline would
+    // be silently swallowed.
+    let mut deferred = settled();
+    deferred.command_duration_seconds = 300;
+    deferred.review_deadlines = vec![
+        DateTime::from_timestamp(1_800_000_000 + 600, 0).unwrap(),
+        DateTime::from_timestamp(1_800_000_000 + 720, 0).unwrap(),
+    ];
+    let mut driver = Driver::new(Fake::new(deferred), config());
+
+    driver.effects().advance(600);
+    driver.poll_once().unwrap();
+    assert_eq!(driver.effects().commands().len(), 1);
+
+    // The next poll happens at minute 15. The deadline at minute 12 is owed
+    // its wake: the decision that ran the command predates it.
+    driver.poll_once().unwrap();
+    assert_eq!(
+        driver.effects().commands().len(),
+        2,
+        "a deadline passing during the command run was swallowed by noting \
+         the command's end instead of the decision instant"
+    );
+    // The note advanced past both deadlines now; nothing more fires.
+    driver.poll_once().unwrap();
+    assert_eq!(driver.effects().commands().len(), 2);
+}
+
+#[test]
+fn a_noted_wake_in_the_future_is_clamped_to_now_with_a_warning() {
+    // The clock rolled back since the note was written: the notes claim a
+    // wake far in the future. Unclamped, the ceiling and every deadline
+    // would stay suppressed until the wall clock caught up.
+    let future = World {
+        notes_file: Some(
+            serde_json::to_vec(&json!({
+                "lastHead": 0,
+                "lastWakeAt": DateTime::from_timestamp(1_900_000_000, 0).unwrap(),
+            }))
+            .unwrap(),
+        ),
+        ..World::default()
+    };
+    let mut driver = Driver::new(Fake::new(future), config());
+
+    // The first poll clamps (warning logged, clamp persisted) and idles:
+    // as-if the wake had just happened.
+    driver.poll_once().unwrap();
+    assert!(driver.effects().commands().is_empty());
+    assert!(
+        driver
+            .effects()
+            .logs()
+            .iter()
+            .any(|line| line.contains("clock rolled back")),
+        "{:?}",
+        driver.effects().logs()
+    );
+    let notes: Value =
+        serde_json::from_slice(driver.effects().world.borrow().notes_file.as_ref().unwrap())
+            .unwrap();
+    let persisted: DateTime<Utc> = notes["lastWakeAt"]
+        .as_str()
+        .expect("the clamped note carries a wake time")
+        .parse()
+        .expect("the wake time parses");
+    assert_eq!(
+        persisted,
+        DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+        "the clamp was not persisted at the poll instant"
+    );
+
+    // The ceiling now measures from the clamped instant: it elapses on
+    // schedule instead of decades late.
+    driver.effects().advance(1800);
+    driver.poll_once().unwrap();
+    assert_eq!(
+        driver.effects().commands().len(),
+        1,
+        "the ceiling stayed suppressed by a future-dated note"
+    );
 }

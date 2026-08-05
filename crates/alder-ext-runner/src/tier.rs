@@ -190,8 +190,8 @@ impl Tier {
     /// git common dir, so the resumed execution can commit nothing.
     ///
     /// So the flags are not documented for anyone to retype. They are written
-    /// into the worktree at start, by the same table that built the launch,
-    /// and `send` runs the script for the caller.
+    /// into the runner's per-handle state directory at start, by the same
+    /// table that built the launch, and `send` runs the script for the caller.
     pub fn resume_script(&self, git_common_dir: Option<&str>) -> Option<String> {
         if self.provider != Provider::Codex {
             return None;
@@ -208,11 +208,12 @@ impl Tier {
             r#"#!/bin/sh
 # Resume this execution's codex session with a later message.
 #
-#     .alder-ext-runner/resume <codex-session-id> "<the message>"
+#     resume <codex-session-id> "<the message>"
 #
-# A session ID is mandatory. `--last` is unsafe here: something else may have
-# run codex in this directory, and that would resume the wrong session. The
-# runner's `.alder-ext-runner/codex-session` marker is the exact answer.
+# This script lives in the runner's per-handle state directory, beside the
+# `codex-session` marker. A session ID is mandatory. `--last` is unsafe here:
+# something else may have run codex in this directory, and that would resume
+# the wrong session. The `codex-session` marker is the exact answer.
 #
 # `codex exec resume` inherits nothing from the session it resumes, so the
 # model, the effort and the sandbox are repeated here exactly as this
@@ -220,7 +221,7 @@ impl Tier {
 # without them runs at another model's default and cannot commit.
 set -eu
 if [ $# -ne 2 ]; then
-  echo "usage: .alder-ext-runner/resume <codex-session-id> <message>" >&2
+  echo "usage: resume <codex-session-id> <message>" >&2
   exit 64
 fi
 session=$1
@@ -241,9 +242,9 @@ exec codex exec resume "$session" {flags} "$1"
     /// loses exactly the executions that die before their first tool call.
     /// This watcher starts before `codex exec`, snapshots the existing
     /// rollouts, and claims the first new rollout whose session metadata names
-    /// this worktree, leaving the ID in `.alder-ext-runner/codex-session` for
-    /// `send` to resume with. It is outside the sandbox and independent of the
-    /// model's progress.
+    /// this worktree, leaving the ID in the per-handle state directory's
+    /// `codex-session` marker for `send` to resume with. It is outside the
+    /// sandbox and independent of the model's progress.
     pub fn codex_session_stamp_script(&self) -> Option<&'static str> {
         (self.provider == Provider::Codex).then_some(CODEX_SESSION_STAMP_SCRIPT)
     }
@@ -256,12 +257,16 @@ exec codex exec resume "$session" {flags} "$1"
 const CODEX_SESSION_STAMP_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Record this Codex execution's session ID without relying on the model
 # reaching a tool call. Invoked by the pane immediately before `codex exec`.
+#
+# The marker is written next to this script, in the runner-owned per-handle
+# state directory — never into the worktree, whose contents the execution
+# itself controls.
 set -uo pipefail
 
 worktree=$(pwd -P)
 codex_home=${CODEX_HOME:-"$HOME/.codex"}
 sessions="$codex_home/sessions"
-stamp_dir=.alder-ext-runner
+stamp_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 marker="$stamp_dir/codex-session"
 log="$stamp_dir/codex-session-stamp.log"
 
@@ -523,8 +528,9 @@ mod tests {
             "{watcher}"
         );
         assert!(
-            watcher.contains("stamp_dir=.alder-ext-runner"),
-            "the marker must live under the runner's own directory: {watcher}"
+            watcher.contains(r#"stamp_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"#),
+            "the marker must live beside the script, in the runner-owned state \
+             directory rather than the worker-writable worktree: {watcher}"
         );
         assert!(
             watcher.find("snapshot=$(mktemp").unwrap()

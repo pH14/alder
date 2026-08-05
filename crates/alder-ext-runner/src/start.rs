@@ -41,13 +41,10 @@ use crate::{
 };
 
 /// Replaces the whole engine invocation, so a test can start a stub instead
-/// of a model. The prompt is still appended as the final argument.
+/// of a model. The value is split on whitespace — no shell quoting — and the
+/// prompt is still appended as the final argument. An empty or
+/// whitespace-only value is a hard error at start, never a silent fallback.
 pub const RUNNER_CMD_ENV: &str = "ALDER_EXT_RUNNER_CMD";
-
-/// The directory inside a worktree where the runner keeps its own files: the
-/// codex resume script, the codex session marker, and the stamp sidecar's
-/// log. Nothing else writes here and nothing here is the execution's output.
-pub const RUNNER_DIR: &str = ".alder-ext-runner";
 
 /// The session environment the runner stamps at creation, and reads back for
 /// adoption, `status`, and `send`. These are the runner's own names: the
@@ -55,6 +52,9 @@ pub const RUNNER_DIR: &str = ".alder-ext-runner";
 pub(crate) const HANDLE_ENV: &str = "ALDER_EXT_RUNNER_HANDLE";
 pub(crate) const ENGINE_ENV: &str = "ALDER_EXT_RUNNER_ENGINE";
 pub(crate) const TIER_ENV: &str = "ALDER_EXT_RUNNER_TIER";
+/// The provider the start resolved, stamped so `send` routes delivery by what
+/// actually launched rather than by whatever the tier table says later.
+pub(crate) const PROVIDER_ENV: &str = "ALDER_EXT_RUNNER_PROVIDER";
 pub(crate) const WORKTREE_ENV: &str = "ALDER_EXT_RUNNER_WORKTREE";
 /// Stamped by `send` when a delivery tore between paste and Enter, so the
 /// pane refuses further sends until a human (or `--force`) resolves it.
@@ -173,17 +173,22 @@ pub fn pane_command(
     engine: &[String],
     prompt: &str,
     session: &str,
-    stamp_codex_session: bool,
+    stamp_codex_session: Option<&Path>,
 ) -> String {
     let mut words = engine.to_vec();
     words.push(prompt.to_owned());
     let quoted: Vec<_> = words.iter().map(|word| crate::host::quote(word)).collect();
     let target = crate::host::quote(&format!("={session}"));
-    let stamp = if stamp_codex_session {
-        ".alder-ext-runner/stamp-codex-session; "
-    } else {
-        ""
+    // The watcher runs from the runner-owned state directory, never from the
+    // worktree: the worktree is the execution's to write, and the runner does
+    // not execute what a worker can rewrite.
+    let stamp = match stamp_codex_session {
+        Some(script) => format!("{}; ", crate::host::quote(&script.display().to_string())),
+        None => String::new(),
     };
+    // The exited marker is set by the pane itself, after the engine and
+    // before `exec bash`: a dead engine is visible on the session before any
+    // shell exists to receive keys.
     format!(
         "{stamp}{}; tmux set-environment -t {target} {ENGINE_ENV} {ENGINE_EXITED}; exec bash",
         quoted.join(" ")
@@ -244,6 +249,14 @@ pub fn start(
     if prompt.trim().is_empty() {
         return Err(RunnerError::new("the prompt file is empty; nothing to run"));
     }
+    // A set-but-empty override yields an empty engine argv, which would run
+    // the prompt itself as the command. That is never what anyone meant.
+    if override_command.is_some_and(|command| command.trim().is_empty()) {
+        return Err(RunnerError::new(format!(
+            "{RUNNER_CMD_ENV} is set but empty; unset it or name a command \
+             (the value is split on whitespace)"
+        )));
+    }
     let session = handle_for_branch(branch);
     // Two concurrent starts of one branch serialize on this exclusive
     // per-handle lock, taken before anything is observed or made and held
@@ -252,7 +265,7 @@ pub fn start(
     // refuses immediately on contention, or acquires the lock after the
     // winner finished and then sees the winner's live session below and
     // refuses; either way undo never removes a worktree a winner is using.
-    let _lock = host.lock_start(&session)?;
+    let _lock = host.lock_handle(&session)?;
     let worktree_parent = host.repo().parent().ok_or_else(|| {
         RunnerError::new(format!(
             "`{}` has no parent directory to put a worktree beside",
@@ -456,23 +469,27 @@ fn launch(
     let git_common_dir = git_common_dir(host);
     let engine = engine_command(launch.tier, Some(&git_common_dir), launch.override_command);
     // How a later message gets back into a one-shot execution. It lives in
-    // the worktree because that is where the pane's shell is sitting, and it
-    // is written by the table that built the launch so the two cannot drift
-    // apart.
+    // the runner-owned per-handle state directory — never in the worktree,
+    // which the execution itself writes — and it is written by the table that
+    // built the launch so the two cannot drift apart.
+    let state = host.handle_state_dir(launch.session);
     if launch.tier.resume_script(None).is_some()
         || launch.tier.codex_session_stamp_script().is_some()
     {
-        host.create_dir_all(&worktree.join(RUNNER_DIR))?;
+        host.create_dir_all(&state)?;
     }
     if let Some(script) = launch.tier.resume_script(Some(&git_common_dir)) {
-        host.write_executable(&worktree.join(RUNNER_DIR).join("resume"), &script)?;
+        host.write_executable(&state.join("resume"), &script)?;
     }
-    if let Some(script) = launch.tier.codex_session_stamp_script() {
-        host.write_executable(
-            &worktree.join(RUNNER_DIR).join("stamp-codex-session"),
-            script,
-        )?;
-    }
+    let stamp_script = launch
+        .tier
+        .codex_session_stamp_script()
+        .map(|script| -> Result<PathBuf> {
+            let path = state.join("stamp-codex-session");
+            host.write_executable(&path, script)?;
+            Ok(path)
+        })
+        .transpose()?;
     host.tmux_new_session(
         launch.session,
         worktree,
@@ -480,12 +497,13 @@ fn launch(
             &engine,
             launch.prompt,
             launch.session,
-            launch.tier.codex_session_stamp_script().is_some(),
+            stamp_script.as_deref(),
         ),
         &[
             (HANDLE_ENV, launch.session.to_owned()),
             (ENGINE_ENV, ENGINE_RUNNING.to_owned()),
             (TIER_ENV, launch.tier.name.to_owned()),
+            (PROVIDER_ENV, launch.tier.provider.as_str().to_owned()),
             (WORKTREE_ENV, worktree.display().to_string()),
         ],
     )?;
@@ -627,14 +645,18 @@ mod tests {
             &self.repo
         }
 
-        fn lock_start(&self, handle: &str) -> Result<StartLock> {
+        fn lock_handle(&self, handle: &str) -> Result<StartLock> {
             self.calls.borrow_mut().push(format!("lock {handle}"));
             if self.lock_contended {
                 return Err(RunnerError::new(format!(
-                    "another start of `{handle}` holds its lock; refusing to race it"
+                    "another operation on `{handle}` holds its lock; refusing to race it"
                 )));
             }
             Ok(StartLock::unlocked_for_tests())
+        }
+
+        fn handle_state_dir(&self, handle: &str) -> PathBuf {
+            PathBuf::from("/state").join(handle)
         }
 
         fn git(&self, args: &[&str]) -> Result<Run> {
@@ -752,6 +774,10 @@ mod tests {
                         .iter()
                         .find(|(name, _)| *name == TIER_ENV)
                         .map(|(_, value)| value.clone()),
+                    provider: environment
+                        .iter()
+                        .find(|(name, _)| *name == PROVIDER_ENV)
+                        .map(|(_, value)| value.clone()),
                     worktree: Some(cwd.to_path_buf()),
                     engine: EngineMarker::Running,
                 },
@@ -865,7 +891,8 @@ mod tests {
         assert!(host.called(&format!(
             "tmux new-session {SESSION} -c {WORKTREE} \
              -e ALDER_EXT_RUNNER_HANDLE={SESSION} -e ALDER_EXT_RUNNER_ENGINE=running \
-             -e ALDER_EXT_RUNNER_TIER=luna -e ALDER_EXT_RUNNER_WORKTREE={WORKTREE}"
+             -e ALDER_EXT_RUNNER_TIER=luna -e ALDER_EXT_RUNNER_PROVIDER=codex \
+             -e ALDER_EXT_RUNNER_WORKTREE={WORKTREE}"
         )));
         // The runner stamps nothing of anyone else's into the worktree: no
         // binaries, no configs, only its own resume machinery.
@@ -1258,15 +1285,20 @@ mod tests {
             "{pane}"
         );
 
-        // The resume machinery is written where its shell will be sitting,
-        // carrying the same rung, and the watcher starts before the model.
-        assert!(host.called(&format!("write {WORKTREE}/{RUNNER_DIR}/resume")));
-        assert!(host.called(&format!(
-            "write {WORKTREE}/{RUNNER_DIR}/stamp-codex-session"
-        )));
+        // The resume machinery is written into the runner-owned per-handle
+        // state directory — never the worker-writable worktree — carrying the
+        // same rung, and the watcher starts before the model.
+        assert!(host.called(&format!("write /state/{SESSION}/resume")));
+        assert!(host.called(&format!("write /state/{SESSION}/stamp-codex-session")));
         assert!(
-            pane.contains(".alder-ext-runner/stamp-codex-session;"),
-            "the Codex watcher must start before the model: {pane}"
+            !host.called(&format!("write {WORKTREE}/")),
+            "the runner wrote into the worker-writable worktree: {:#?}",
+            host.calls()
+        );
+        assert!(
+            pane.contains(&format!("'/state/{SESSION}/stamp-codex-session';")),
+            "the Codex watcher must start before the model, from the state \
+             directory: {pane}"
         );
 
         // A claude execution is not sandboxed this way and is given no such
@@ -1280,6 +1312,31 @@ mod tests {
     }
 
     #[test]
+    fn the_resolved_provider_is_stamped_into_the_session_at_start() {
+        // `send` routes by this stamp alone, so config drift after a start
+        // cannot change a live session's delivery protocol.
+        let host = Fake::new();
+        run_start(&host, "opus").unwrap();
+        assert!(host.called("-e ALDER_EXT_RUNNER_PROVIDER=claude"));
+
+        let host = Fake::new();
+        run_start(&host, "terra").unwrap();
+        assert!(host.called("-e ALDER_EXT_RUNNER_PROVIDER=codex"));
+    }
+
+    #[test]
+    fn an_empty_engine_override_is_a_hard_error_before_anything_exists() {
+        for value in ["", "   ", "\n\t"] {
+            let host = Fake::new();
+            let error = start(&host, BRANCH, tier("terra"), "prompt", Some(value))
+                .expect_err("an empty override must not launch the prompt as a command");
+            assert!(error.message.contains(RUNNER_CMD_ENV), "{error}");
+            assert!(error.message.contains("split on whitespace"), "{error}");
+            assert!(host.calls().is_empty(), "{:#?}", host.calls());
+        }
+    }
+
+    #[test]
     fn a_live_session_is_refused_before_anything_is_created() {
         let host = Fake::new();
         host.sessions.borrow_mut().insert(
@@ -1287,6 +1344,7 @@ mod tests {
             ObservedSession {
                 handle: Some(SESSION.to_owned()),
                 tier: Some("luna".to_owned()),
+                provider: Some("codex".to_owned()),
                 worktree: Some(PathBuf::from(WORKTREE)),
                 engine: EngineMarker::Running,
             },
@@ -1306,6 +1364,7 @@ mod tests {
             ObservedSession {
                 handle: Some(SESSION.to_owned()),
                 tier: Some("luna".to_owned()),
+                provider: Some("codex".to_owned()),
                 worktree: Some(PathBuf::from(WORKTREE)),
                 engine: EngineMarker::Unproven,
             },
@@ -1380,6 +1439,7 @@ mod tests {
             ObservedSession {
                 handle: Some(SESSION.to_owned()),
                 tier: None,
+                provider: None,
                 worktree: None,
                 engine: EngineMarker::Running,
             },
@@ -1410,6 +1470,7 @@ mod tests {
             ObservedSession {
                 handle: Some(SESSION.to_owned()),
                 tier: Some("luna".to_owned()),
+                provider: Some("codex".to_owned()),
                 worktree: Some(PathBuf::from(WORKTREE)),
                 engine: EngineMarker::Exited,
             },

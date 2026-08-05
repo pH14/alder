@@ -249,12 +249,18 @@ them.
   "pollSeconds": 60,
   "debounceSeconds": 20,
   "maxIntervalSeconds": 1800,
+  "commandTimeoutSeconds": 600,
   "notify": "terminal-notifier -title alder -message"
 }
 ```
 
 `command` is the shell command a wake runs, and the only required field; the
-remaining fields are timings and a notification hook. How that command runs
+remaining fields are timings and a notification hook.
+`commandTimeoutSeconds` (default 600) bounds one run of the command: a
+command still running at the bound is killed and the wake fails — nothing is
+noted, so the next poll retries it — because a hung executor must not wedge
+the daemon. The daemon's own `alder status` read carries a fixed 60-second
+bound of its own, after which it is an outage rather than a wedge. How that command runs
 the executor — which engines exist on this box, where the pass document
 lives, what sessions look like — is the command's own configuration, not the
 driver's.
