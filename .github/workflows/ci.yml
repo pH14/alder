@@ -66,14 +66,16 @@ jobs:
 
       - run: cargo nextest run --workspace --locked
 
-      # Shell-level tests of the sandbox teardown and of `alderd spawn`. Both
-      # stub the engine and use a private tmux server, so they need nothing
-      # beyond git, jq, tmux and the debug binaries the test run just built.
+      # Shell-level tests of the sandbox teardown and of `alder-ext-runner
+      # start`. Both stub the engine and use a private tmux server, so they
+      # need nothing beyond git, tmux and the debug binaries the test run
+      # just built. They live inside the runner crate so the crate stays
+      # movable to its own repository whole.
       - name: tmux sandbox teardown guard
-        run: scripts/tests/test-teardown-guard.sh
+        run: crates/alder-ext-runner/scripts/test-teardown-guard.sh
 
-      - name: alderd spawn
-        run: scripts/tests/verify-spawn.sh
+      - name: alder-ext-runner start
+        run: crates/alder-ext-runner/scripts/verify-start.sh target/debug/alder-ext-runner
 
   # GitHub has no per-job `paths:` filter, so the mutation sweep's path gate
   # lives here. A docs-only pull request should not tie up twelve runners.

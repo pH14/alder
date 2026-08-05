@@ -51,9 +51,9 @@ fn check(scenario: Scenario, name: &str, states: usize) {
     );
 }
 
-/// Baseline: one daemon, one executor, no faults. The fresh project fires once,
-/// the woken executor may append one statement, the follow-up wake finds
-/// nothing, and the loop quiesces recovered.
+/// Baseline: one daemon, one executor, no faults. The fresh project fires
+/// once, the executor behind the command may append one statement, the
+/// follow-up run finds nothing, and the loop quiesces recovered.
 fn lone_daemon() -> Scenario {
     Scenario::new()
 }
@@ -69,13 +69,12 @@ fn phone_writer() -> Scenario {
     }
 }
 
-/// A rotation request under daemon, session, and notes-file faults: the
-/// duplicate-wake windows, with a rotation in flight to lose.
+/// A rotation request under daemon and notes-file faults: the duplicate-run
+/// windows, with a second writer's request in flight.
 fn faults_everywhere() -> Scenario {
     Scenario {
         phone_rotation: true,
         daemon_crashes: 1,
-        session_crashes: 1,
         notes_losses: 1,
         ..Scenario::new()
     }
@@ -93,36 +92,34 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
 
 #[test]
 fn a_lone_daemon_wakes_once_per_change_and_quiesces() {
-    check(lone_daemon(), "lone daemon", 13);
+    check(lone_daemon(), "lone daemon", 11);
 }
 
 /// Property 1: a second writer's appends are the wake rule. Every phone
-/// statement moves the head past the daemon's notes, every wake is consumed
+/// statement moves the head past the daemon's notes, every run is consumed
 /// by noting the head, and the log never mentions either process.
 #[test]
 fn a_second_writer_only_ever_moves_the_head() {
-    check(phone_writer(), "phone writer", 1191);
+    check(phone_writer(), "phone writer", 880);
 }
 
-/// Property 2: missed and duplicated wakes are harmless. The daemon, the
-/// session, and the notes file each fail at every point; a delivered wake can
-/// be stranded unnoted and the same head can be woken twice; every `always`
-/// property — the log folds, mentions no readers, mirrors the rotation
-/// request — holds through all of it, and every terminal state is recovered.
+/// Property 2: missed and duplicated runs are harmless. The daemon and the
+/// notes file each fail at every point; a delivered wake can be stranded
+/// unnoted and the same head can be run twice; every `always` property — the
+/// log folds, mentions no readers, mirrors the rotation request — holds
+/// through all of it, and every terminal state is recovered.
 #[test]
-fn crashes_cost_duplicate_wakes_and_nothing_else() {
-    check(faults_everywhere(), "faults everywhere", 4506);
+fn crashes_cost_duplicate_runs_and_nothing_else() {
+    check(faults_everywhere(), "faults everywhere", 627);
 }
 
 /// The statements every scenario makes, in the order `properties` builds
 /// them.
-const CORE: [&str; 6] = [
+const CORE: [&str; 4] = [
     "every reachable log folds cleanly",
     "the log never mentions its own readers",
     "the rotation request mirrors the log",
     "every terminal state is progressing or blocked-and-named",
-    "the rotation ghost tracks the fold",
-    "a consumed rotation was performed first",
 ];
 
 fn core_and(extra: &[&'static str]) -> Vec<&'static str> {
@@ -147,17 +144,16 @@ fn each_scenario_registers_exactly_the_properties_its_flags_ask_for() {
     assert_eq!(registered(&lone_daemon()), core_and(&[]));
     assert_eq!(
         registered(&phone_writer()),
-        core_and(&["a rotation is performed and then consumed"])
+        core_and(&["a rotation request is served to a woken command"])
     );
     assert_eq!(
         registered(&faults_everywhere()),
         core_and(&[
             "a crash strands a delivered wake nothing recorded",
-            "a wake is delivered twice for the same head",
-            "lost notes cost a duplicate wake and nothing else",
-            "a rotation is performed and then consumed",
-            "a session crash is exercised",
+            "the command runs twice for the same head",
             "a daemon crash is exercised",
+            "lost notes cost a duplicate run and nothing else",
+            "a rotation request is served to a woken command",
         ])
     );
 }

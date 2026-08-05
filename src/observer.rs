@@ -569,7 +569,15 @@ pub fn reconcile(
                         status: "absent".to_owned(),
                         detail: "an open attempt has never been bound to a handle; no worker was launched"
                             .to_owned(),
-                        suggested_command: Some(format!("alderd spawn {}", attempt.work_id)),
+                        // Dispatch left alderd with the execution
+                        // extraction; how a worker is launched is the
+                        // executor's process (the pass skill), so the
+                        // suggestion states the act rather than naming a
+                        // binary that no longer has a spawn verb.
+                        suggested_command: Some(format!(
+                            "dispatch a worker for {}",
+                            attempt.work_id
+                        )),
                         metadata: json!({}),
                     });
                     continue;
@@ -1280,7 +1288,7 @@ mod tests {
         assert_eq!(finding_kinds(&findings), vec!["unspawned"]);
         assert_eq!(
             findings[0].suggested_command.as_deref(),
-            Some("alderd spawn active-work")
+            Some("dispatch a worker for active-work")
         );
 
         // Blocked work is spawnable too: a ruling arrives with the launch.

@@ -4,10 +4,15 @@ use serde_json::Value;
 
 use crate::error::{DriverError, Result};
 
-/// The loop section of `alder status --json`, plus the head that document
-/// reported. This is the driver's complete view of the durable log: it never
-/// reads work, attempts, or questions, because deciding anything about them
-/// would be judgment.
+/// The driver's read of the loop section of `alder status --json`, plus the
+/// head that document reported. This is the driver's complete view of the
+/// durable log: it never reads work, attempts, or questions, because deciding
+/// anything about them would be judgment.
+///
+/// Only the fields the driver's own triggers consume are parsed. The loop
+/// section carries more — the desired engine, the rotation request — but
+/// those belong to the configured command now, which reads status itself;
+/// parsing them here would be knowledge without a use.
 ///
 /// Everything here is a durable statement about the loop. Nothing records
 /// whether this driver has acted on any of it — the log never mentions its
@@ -21,25 +26,18 @@ use crate::error::{DriverError, Result};
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct LoopState {
     /// The current log head. Compared with the last head the driver acted on,
-    /// this is the whole wake rule.
+    /// this is the whole wake rule. Not read from the loop section (the head
+    /// sits at the document's top level); [`LoopState::from_status`] requires
+    /// it explicitly.
     #[serde(default)]
     pub head: u64,
-    #[serde(default)]
+    /// Required, never defaulted: a loop section that does not say whether
+    /// the loop is paused is a malformed document, and reading it as
+    /// "unpaused" would let a truncated status run the command over a pause.
     pub paused: bool,
-    #[serde(default)]
-    pub pause_reason: Option<String>,
-    #[serde(default)]
-    pub engine: Option<String>,
-    /// The sequence of the latest rotation request, if any was ever made.
-    #[serde(default)]
-    pub rotate_requested_seq: Option<u64>,
     /// The sequence of the latest nudge request, if any was ever made.
     #[serde(default)]
     pub nudge_requested_seq: Option<u64>,
-    /// The earliest `work block --until` deadline any blocked item carries:
-    /// the loop's next review rendezvous, kept for the human status line.
-    #[serde(default)]
-    pub review_at: Option<DateTime<Utc>>,
     /// Every blocked item's `work block --until` deadline, sorted. The due
     /// trigger checks each one: an item still blocked past its own deadline
     /// must not swallow the wake a later deadline is owed.
@@ -47,19 +45,35 @@ pub struct LoopState {
     pub review_deadlines: Vec<DateTime<Utc>>,
 }
 
+/// The code every malformed-status error carries. The driver counts these
+/// toward its outage notice: a store that answers with a document the wake
+/// rule cannot be decided from is as unavailable as one that does not answer.
+pub const MALFORMED_STATUS: &str = "malformed_status";
+
 impl LoopState {
     /// Extract the loop section and the head, ignoring everything else
     /// `status` reports.
+    ///
+    /// Fail closed on partial documents: the head and the loop section's
+    /// `paused` are required explicitly. A document missing either is an
+    /// error — never a default — because "unpaused at head 0" read off a
+    /// truncated status is indistinguishable from a real decision input.
     pub fn from_status(status: &Value) -> Result<Self> {
-        let section = status
-            .get("loop")
-            .ok_or_else(|| DriverError::new("`alder status --json` has no loop section"))?;
-        let mut state: Self = serde_json::from_value(section.clone())
-            .map_err(|error| DriverError::new(format!("unreadable loop section: {error}")))?;
-        state.head = status
-            .get("head")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| DriverError::new("`alder status --json` has no head"))?;
+        let section = status.get("loop").ok_or_else(|| {
+            DriverError::coded(
+                MALFORMED_STATUS,
+                "`alder status --json` has no loop section",
+            )
+        })?;
+        let mut state: Self = serde_json::from_value(section.clone()).map_err(|error| {
+            DriverError::coded(
+                MALFORMED_STATUS,
+                format!("unreadable loop section: {error}"),
+            )
+        })?;
+        state.head = status.get("head").and_then(Value::as_u64).ok_or_else(|| {
+            DriverError::coded(MALFORMED_STATUS, "`alder status --json` has no head")
+        })?;
         Ok(state)
     }
 }
@@ -89,14 +103,7 @@ mod tests {
         let state = LoopState::from_status(&status).unwrap();
         assert_eq!(state.head, 42);
         assert!(state.paused);
-        assert_eq!(state.pause_reason.as_deref(), Some("release freeze"));
-        assert_eq!(state.engine.as_deref(), Some("codex"));
-        assert_eq!(state.rotate_requested_seq, Some(17));
         assert_eq!(state.nudge_requested_seq, Some(41));
-        assert_eq!(
-            state.review_at.unwrap().to_rfc3339(),
-            "2026-08-04T15:00:00+00:00"
-        );
         assert_eq!(
             state
                 .review_deadlines
@@ -113,13 +120,34 @@ mod tests {
         }))
         .unwrap();
         assert!(!empty.paused);
-        assert!(empty.rotate_requested_seq.is_none());
-        assert!(empty.review_at.is_none());
+        assert!(empty.nudge_requested_seq.is_none());
         assert!(empty.review_deadlines.is_empty());
 
         assert!(LoopState::from_status(&json!({"head": 1})).is_err());
         assert!(LoopState::from_status(&json!({"loop": 7})).is_err());
         // A status document with no head cannot answer the wake rule.
         assert!(LoopState::from_status(&json!({"loop": {"paused": false}})).is_err());
+    }
+
+    #[test]
+    fn a_loop_section_without_paused_is_malformed_never_default_unpaused() {
+        // The exact partial document from the review: a loop section with no
+        // `paused`. Reading it as unpaused would run the command over a real
+        // pause the truncation ate.
+        let error = LoopState::from_status(&json!({"head": 42, "loop": {}}))
+            .expect_err("a paused-less loop section must not decide anything");
+        assert!(error.is(MALFORMED_STATUS), "{error}");
+
+        // Every malformed shape carries the code, so the driver counts it
+        // toward the outage notice rather than logging it invisibly forever.
+        for document in [
+            json!({"head": 1}),
+            json!({"loop": 7}),
+            json!({"loop": {"paused": false}}),
+            json!({"head": "not a number", "loop": {"paused": false}}),
+        ] {
+            let error = LoopState::from_status(&document).expect_err("malformed");
+            assert!(error.is(MALFORMED_STATUS), "{document}: {error}");
+        }
     }
 }

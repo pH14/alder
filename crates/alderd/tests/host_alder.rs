@@ -1,11 +1,14 @@
-//! The `alder` shell-out, and the rest of `Host` that reaches the world
-//! without tmux.
+//! The `alder` shell-out, the wake command, and the rest of `Host` that
+//! reaches the world.
 //!
 //! Every case here runs a real subprocess. The `alder` binary is a stub script
 //! the test writes, which records how it was called and answers with whatever
 //! the case needs, so what is checked is the contract the driver leans on:
 //! `--json` appended, the project root as the working directory, stdin closed,
-//! and each shape of failure mapped onto a `DriverError`.
+//! and each shape of failure mapped onto a `DriverError`. The wake command is
+//! held to its own contract the same way: `ALDERD_TRIGGERS` in the
+//! environment, the project root as its working directory, and a non-zero
+//! exit reported as an error.
 
 use std::{
     fs,
@@ -33,11 +36,10 @@ fn stub(directory: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
-/// A config whose only interesting fields are the two shell-outs.
+/// A config whose only interesting fields are the shell-outs.
 fn config(alder: &Path, notify: Option<&str>) -> Config {
     serde_json::from_value(json!({
-        "engines": {"claude": {"cmd": "claude"}},
-        "passDoc": ".agent/skills/pass/SKILL.md",
+        "command": "true",
         "alder": alder.display().to_string(),
         "notify": notify,
     }))
@@ -99,6 +101,91 @@ printf '{{"work_id": "al-1", "state": "open"}}\n'
     // An `alder` that asks a question must see EOF rather than block a daemon
     // nobody is watching.
     assert_eq!(read(&stdin), "closed\n");
+}
+
+#[test]
+fn the_wake_command_gets_the_triggers_the_root_and_no_stdin() {
+    let root = TempDir::new().expect("a project root");
+    let record = root.path().join("record");
+    let host = Host::new(root.path().to_path_buf(), &config(Path::new("alder"), None));
+
+    host.run_command(
+        &format!(
+            r#"printf '%s|%s|' "$ALDERD_TRIGGERS" "$(pwd -P)" >'{record}'; if IFS= read -r _; then printf 'open' >>'{record}'; else printf 'closed' >>'{record}'; fi"#,
+            record = record.display()
+        ),
+        "log,due",
+    )
+    .expect("the command runs");
+
+    let recorded = read(&record);
+    let mut parts = recorded.split('|');
+    assert_eq!(parts.next(), Some("log,due"));
+    assert_eq!(
+        fs::canonicalize(parts.next().expect("a cwd")).expect("the printed directory exists"),
+        fs::canonicalize(root.path()).expect("the root exists"),
+        "the command must run in the project root"
+    );
+    // A command that asks a question must see EOF rather than block.
+    assert_eq!(parts.next(), Some("closed"));
+}
+
+#[test]
+fn a_failing_wake_command_reports_its_exit_status() {
+    let root = TempDir::new().expect("a project root");
+    let host = Host::new(root.path().to_path_buf(), &config(Path::new("alder"), None));
+    let error = host
+        .run_command("exit 7", "due")
+        .expect_err("a non-zero exit is a failure");
+    assert!(error.message.contains("the command exited with"), "{error}");
+}
+
+#[test]
+fn a_hung_wake_command_is_killed_at_the_configured_timeout() {
+    let root = TempDir::new().expect("a project root");
+    let survivor = root.path().join("survived");
+    let host = Host::new(
+        root.path().to_path_buf(),
+        &serde_json::from_value(json!({
+            "command": "true",
+            "alder": "alder",
+            "commandTimeoutSeconds": 1,
+        }))
+        .expect("the generated config is valid"),
+    );
+
+    let started = Instant::now();
+    let error = host
+        .run_command(
+            &format!("sleep 30 && touch '{}'", survivor.display()),
+            "due",
+        )
+        .expect_err("a hung command must become a failed wake, not a wedge");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the daemon waited out the hang instead of killing it"
+    );
+    assert!(error.message.contains("commandTimeoutSeconds"), "{error}");
+    assert!(
+        error.message.contains("not noted"),
+        "the error must say the wake will be retried: {error}"
+    );
+    assert!(
+        !survivor.exists(),
+        "the killed command still ran to its end"
+    );
+}
+
+#[test]
+fn a_chatty_alder_cannot_deadlock_the_bounded_wait() {
+    // The bounded wait polls the child's exit while reader threads drain its
+    // pipes. A status document far larger than any pipe buffer proves the
+    // drain is real: without it the child would block on a full pipe, never
+    // exit, and be killed at the timeout instead of answering.
+    let big = "a".repeat(512 * 1024);
+    let (_root, host) = project(&format!("printf '{{\"work_id\": \"%s\"}}\\n' '{big}'"), 0);
+    let document = host.alder(&["status"]).expect("the large document reads");
+    assert_eq!(document["work_id"].as_str().map(str::len), Some(big.len()));
 }
 
 #[test]
@@ -187,7 +274,7 @@ fn notify_hands_the_message_to_the_configured_command() {
 }
 
 #[test]
-fn both_host_logging_seams_write_their_messages_to_stderr() {
+fn host_logging_writes_its_messages_to_stderr() {
     let output = Command::new(std::env::current_exe().expect("the test binary has a path"))
         .args(["--exact", LOG_CHILD, "--ignored", "--nocapture"])
         .output()
@@ -200,20 +287,18 @@ fn both_host_logging_seams_write_their_messages_to_stderr() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("alderd: effects log message"), "{stderr}");
-    assert!(stderr.contains("alderd: spawn log message"), "{stderr}");
 }
 
 /// This half runs in a child so its process-wide stderr is the parent test's
 /// observable output. `Host::say` is intentionally a host effect, not a
-/// formatting helper, and both traits must preserve it.
+/// formatting helper.
 #[test]
-#[ignore = "runs under both_host_logging_seams_write_their_messages_to_stderr"]
+#[ignore = "runs under host_logging_writes_its_messages_to_stderr"]
 fn host_logs_reach_stderr_child() {
     let root = TempDir::new().expect("a project root");
     let host = Host::new(root.path().to_path_buf(), &config(Path::new("alder"), None));
 
     Effects::log(&host, "effects log message");
-    alderd::spawn::SpawnHost::log(&host, "spawn log message");
 }
 
 #[test]

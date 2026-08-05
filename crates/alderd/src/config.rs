@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, path::Path, time::Duration};
+use std::{fs, path::Path, time::Duration};
 
 use serde::Deserialize;
 
@@ -6,18 +6,16 @@ use crate::error::{DriverError, Result};
 
 /// The driver's local configuration, read from `.alder/driver.json`.
 ///
-/// `.alder/` is gitignored, so this is deliberately machine-local: which
-/// engines exist and how aggressively to poll are properties of the box the
-/// daemon runs on, not durable project facts.
+/// `.alder/` is gitignored, so this is deliberately machine-local: what
+/// command runs the executor and how aggressively to poll are properties of
+/// the box the daemon runs on, not durable project facts.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
-    /// Engine name to the interactive CLI that provides it.
-    pub engines: BTreeMap<String, Engine>,
-    /// The pass prompt document a bootstrap injection points at.
-    pub pass_doc: String,
-    #[serde(default = "default_session")]
-    pub tmux_session: String,
+    /// The shell command a wake runs. It receives the trigger names in
+    /// `ALDERD_TRIGGERS` and is the whole of what a wake does; sessions,
+    /// engines, and prompts are its business, never the daemon's.
+    pub command: String,
     #[serde(default = "default_poll")]
     pub poll_seconds: u64,
     /// How often to stat the local append marker between full polls.
@@ -27,29 +25,17 @@ pub struct Config {
     pub debounce_seconds: u64,
     #[serde(default = "default_max_interval")]
     pub max_interval_seconds: u64,
-    /// How long one engine session may serve wakes before it is rotated.
-    /// Passes are not counted — nothing durable records them — so session
-    /// rotation is by wall-clock age.
-    #[serde(default = "default_max_session_age")]
-    pub max_session_age_seconds: u64,
+    /// How long the wake command may run before the daemon kills it and
+    /// treats the wake as failed (nothing is noted; the next poll retries).
+    /// A command that hangs must not wedge the daemon forever.
+    #[serde(default = "default_command_timeout")]
+    pub command_timeout_seconds: u64,
     /// Optional shell command invoked with one message argument.
     #[serde(default)]
     pub notify: Option<String>,
     /// Path to the `alder` binary. The driver reaches the log only through it.
     #[serde(default = "default_alder")]
     pub alder: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Engine {
-    pub cmd: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-}
-
-fn default_session() -> String {
-    "alder-executor".to_owned()
 }
 
 fn default_poll() -> u64 {
@@ -68,8 +54,8 @@ fn default_max_interval() -> u64 {
     1800
 }
 
-fn default_max_session_age() -> u64 {
-    21_600
+fn default_command_timeout() -> u64 {
+    600
 }
 
 fn default_alder() -> String {
@@ -95,19 +81,8 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.engines.is_empty() {
-            return Err(DriverError::new("at least one engine must be configured"));
-        }
-        for (name, engine) in &self.engines {
-            if engine.cmd.trim().is_empty() {
-                return Err(DriverError::new(format!("engine `{name}` has no command")));
-            }
-        }
-        if self.pass_doc.trim().is_empty() {
-            return Err(DriverError::new("passDoc cannot be empty"));
-        }
-        if self.tmux_session.trim().is_empty() {
-            return Err(DriverError::new("tmuxSession cannot be empty"));
+        if self.command.trim().is_empty() {
+            return Err(DriverError::new("command cannot be empty"));
         }
         if self.poll_seconds == 0 {
             return Err(DriverError::new("pollSeconds must be positive"));
@@ -115,8 +90,8 @@ impl Config {
         if self.hint_poll_seconds == 0 {
             return Err(DriverError::new("hintPollSeconds must be positive"));
         }
-        if self.max_session_age_seconds == 0 {
-            return Err(DriverError::new("maxSessionAgeSeconds must be positive"));
+        if self.command_timeout_seconds == 0 {
+            return Err(DriverError::new("commandTimeoutSeconds must be positive"));
         }
         Ok(())
     }
@@ -127,6 +102,10 @@ impl Config {
 
     pub fn hint_poll(&self) -> Duration {
         Duration::from_secs(self.hint_poll_seconds)
+    }
+
+    pub fn command_timeout(&self) -> Duration {
+        Duration::from_secs(self.command_timeout_seconds)
     }
 }
 
@@ -143,31 +122,35 @@ mod tests {
 
     #[test]
     fn defaults_fill_in_every_optional_field() {
-        let (_directory, path) = write(
-            r#"{"engines": {"claude": {"cmd": "claude"}}, "passDoc": ".agent/skills/pass/SKILL.md"}"#,
-        );
+        let (_directory, path) = write(r#"{"command": "alder-pass"}"#);
         let config = Config::load(&path).unwrap();
-        assert_eq!(config.tmux_session, "alder-executor");
+        assert_eq!(config.command, "alder-pass");
         assert_eq!(config.poll_seconds, 60);
+        assert_eq!(config.hint_poll_seconds, 1);
         assert_eq!(config.debounce_seconds, 20);
         assert_eq!(config.max_interval_seconds, 1800);
-        assert_eq!(config.max_session_age_seconds, 21_600);
+        assert_eq!(config.command_timeout_seconds, 600);
         assert_eq!(config.alder, "alder");
         assert!(config.notify.is_none());
-        assert!(config.engines["claude"].args.is_empty());
         assert_eq!(config.poll(), Duration::from_secs(60));
+        assert_eq!(config.hint_poll(), Duration::from_secs(1));
+        assert_eq!(config.command_timeout(), Duration::from_secs(600));
     }
 
     #[test]
     fn every_invalid_field_is_rejected_by_name() {
         for body in [
-            r#"{"engines": {}, "passDoc": "p"}"#,
-            r#"{"engines": {"c": {"cmd": " "}}, "passDoc": "p"}"#,
-            r#"{"engines": {"c": {"cmd": "c"}}, "passDoc": " "}"#,
-            r#"{"engines": {"c": {"cmd": "c"}}, "passDoc": "p", "tmuxSession": " "}"#,
-            r#"{"engines": {"c": {"cmd": "c"}}, "passDoc": "p", "pollSeconds": 0}"#,
-            r#"{"engines": {"c": {"cmd": "c"}}, "passDoc": "p", "maxSessionAgeSeconds": 0}"#,
-            r#"{"engines": {"c": {"cmd": "c"}}, "passDoc": "p", "unknown": 1}"#,
+            r#"{}"#,
+            r#"{"command": " "}"#,
+            r#"{"command": "c", "pollSeconds": 0}"#,
+            r#"{"command": "c", "hintPollSeconds": 0}"#,
+            r#"{"command": "c", "commandTimeoutSeconds": 0}"#,
+            // The fields that left with the execution extraction are unknown
+            // now: a stale config fails loudly instead of half-working.
+            r#"{"command": "c", "engines": {"claude": {"cmd": "claude"}}}"#,
+            r#"{"command": "c", "passDoc": "p"}"#,
+            r#"{"command": "c", "tmuxSession": "s"}"#,
+            r#"{"command": "c", "maxSessionAgeSeconds": 1}"#,
             r#"not json"#,
         ] {
             let (_directory, path) = write(body);

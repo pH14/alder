@@ -801,7 +801,7 @@ hm-2b7-attempt-1  recorded active, observed absent
   suggested: alder attempt end hm-2b7-attempt-1 --outcome lost --why "external handle absent"
 
 hm-4c8-attempt-1  an open attempt has never been bound to a handle; no worker was launched
-  suggested: alderd spawn hm-4c8
+  suggested: dispatch a worker for hm-4c8
 ```
 
 An execution outliving its ended attempt surfaces the same way: the probe

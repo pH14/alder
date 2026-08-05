@@ -2,10 +2,10 @@
 //!
 //! Both engines write their own token usage into local transcripts, exactly as
 //! the API reported it, so spend can be read off the disk without an API call,
-//! an API key, or a running session. `alderd budget` sums it over a trailing
+//! an API key, or a running session. `alder-ext-runner budget` sums it over a trailing
 //! window and says whether either provider is currently rate-limited. That is
-//! all it does: no caps, no percentages, no thresholds. An executor deciding
-//! which rung to dispatch on reads the number and judges.
+//! all it does: no caps, no percentages, no thresholds. A caller deciding
+//! which rung to start on reads the number and judges.
 //!
 //! The two providers record different things, so the two halves are honest
 //! about measuring different things:
@@ -170,7 +170,7 @@ pub fn report(
         })
         .collect();
     Report {
-        schema: "alderd.budget.v0",
+        schema: "alder-ext-runner.budget.v0",
         since,
         until: now,
         hours,
@@ -336,7 +336,7 @@ fn number(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// Read the report the way `alderd budget` does.
+/// Read the report the way `alder-ext-runner budget` does.
 pub fn run(now: DateTime<Utc>, hours: i64, limits: &Limits) -> Result<Report> {
     Ok(report(now, hours, limits, &codex_home(), &claude_home()))
 }

@@ -1,0 +1,21 @@
+[package]
+name = "alder-ext-runner"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Give a prompt to a model at some effort that runs somewhere; get a handle"
+
+# This crate is deliberately self-contained: it depends on no other crate in
+# this workspace and nothing in this workspace depends on it, so it can move to
+# its own repository by copying the directory. tests/boundary.rs holds that.
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"

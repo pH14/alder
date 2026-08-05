@@ -1,17 +1,20 @@
-//! The dispatch ladder: six named rungs, each pinning a model and an effort.
+//! The dispatch ladder: named rungs, each pinning a model and an effort.
 //!
-//! A tier name is the only thing a dispatcher ever types. Everything the
-//! engine is actually run with — provider, model, reasoning effort, sandbox
-//! and approval policy — is pinned here, in one table, so that "which model
-//! did this attempt run on" is answered by the log rather than by whatever the
-//! CLI's own default happened to be that week.
+//! A tier name is the only thing a caller ever types. Everything the engine is
+//! actually run with — provider, model, reasoning effort, sandbox and approval
+//! policy — is pinned here, in one table, so that "which model did this run
+//! on" is answered by the launch rather than by whatever the CLI's own default
+//! happened to be that week.
 //!
 //! That is the whole reason an unknown tier is a hard error. Falling through
-//! to a CLI default would launch a worker at an unknown model and an unknown
-//! effort, record nothing about it, and look exactly like a successful
-//! dispatch.
+//! to a CLI default would launch an execution at an unknown model and an
+//! unknown effort, record nothing about it, and look exactly like a
+//! successful start.
+//!
+//! The built-in table below is the default; a machine-local config file may
+//! replace it — see [`crate::config`].
 
-use crate::error::{DriverError, Result};
+use crate::error::{Result, RunnerError};
 
 /// Which CLI runs a rung, and which account its spend and rate limits land on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,8 +31,8 @@ impl Provider {
         }
     }
 
-    /// Both providers, in ladder order. Used by `alderd budget` so it reports
-    /// every provider whether or not anything was spent on it.
+    /// Both providers, in ladder order. Used by `alder-ext-runner budget` so
+    /// it reports every provider whether or not anything was spent on it.
     pub const ALL: [Provider; 2] = [Provider::Codex, Provider::Claude];
 
     pub fn parse(name: &str) -> Result<Self> {
@@ -37,7 +40,7 @@ impl Provider {
             .into_iter()
             .find(|provider| provider.as_str() == name)
             .ok_or_else(|| {
-                DriverError::new(format!(
+                RunnerError::new(format!(
                     "unknown provider `{name}`; known providers are codex and claude"
                 ))
             })
@@ -49,8 +52,8 @@ impl Provider {
 pub struct Tier {
     pub name: &'static str,
     pub provider: Provider,
-    /// The full model name, as it is passed to the CLI and stamped on the
-    /// attempt. Never an alias: an alias moves under us.
+    /// The full model name, as it is passed to the CLI. Never an alias: an
+    /// alias moves under us.
     pub model: &'static str,
     pub effort: &'static str,
     /// The rung of equal standing on the other provider's ladder, used when
@@ -58,10 +61,7 @@ pub struct Tier {
     pub counterpart: &'static str,
 }
 
-/// The tier a dispatch gets when it names none. Ordinary work, ordinary rung.
-pub const DEFAULT_TIER: &str = "terra";
-
-/// The six rungs. Two ladders of three, paired across by standing.
+/// The built-in table: two ladders of three, paired across by standing.
 pub const TIERS: [Tier; 6] = [
     Tier {
         name: "luna",
@@ -107,40 +107,41 @@ pub const TIERS: [Tier; 6] = [
     },
 ];
 
-/// Look one rung up by name. An unknown name is a hard error, never a
-/// fallback: a dispatcher that misspells a tier must hear about it before a
-/// worker is launched, not read it off an attempt afterwards.
-pub fn tier(name: &str) -> Result<&'static Tier> {
-    TIERS.iter().find(|tier| tier.name == name).ok_or_else(|| {
-        DriverError::new(format!(
+/// Look one rung up by name in the active table. An unknown name is a hard
+/// error, never a fallback: a caller that misspells a tier must hear about it
+/// before an execution is launched, not read it off a transcript afterwards.
+pub fn lookup<'table>(table: &'table [Tier], name: &str) -> Result<&'table Tier> {
+    table.iter().find(|tier| tier.name == name).ok_or_else(|| {
+        RunnerError::new(format!(
             "unknown tier `{name}`; the rungs are {}",
-            names().join(", ")
+            names(table).join(", ")
         ))
     })
 }
 
-pub fn names() -> Vec<&'static str> {
-    TIERS.iter().map(|tier| tier.name).collect()
+pub fn names(table: &[Tier]) -> Vec<&str> {
+    table.iter().map(|tier| tier.name).collect()
 }
 
 impl Tier {
-    /// The rung of equal standing on the other ladder.
-    pub fn counterpart(&self) -> &'static Tier {
-        tier(self.counterpart).expect("every counterpart is a rung of the table")
+    /// The rung of equal standing on the other ladder. The config loader
+    /// validates the pairing, so a table in use always resolves.
+    pub fn counterpart<'table>(&self, table: &'table [Tier]) -> &'table Tier {
+        lookup(table, self.counterpart).expect("every counterpart is a rung of the table")
     }
 
-    /// The engine invocation, one shell word per element, with the goal as the
-    /// final argument. Nothing here is typed into a terminal: the words become
-    /// argv, so a goal containing quotes, semicolons or the word `Enter` is
-    /// just a string.
+    /// The engine invocation, one shell word per element, with the prompt as
+    /// the final argument. Nothing here is typed into a terminal: the words
+    /// become argv, so a prompt containing quotes, semicolons or the word
+    /// `Enter` is just a string.
     ///
-    /// `git_common_dir` is the dispatching project's own `.git`, which a
-    /// codex worker needs as a second writable root — see [`writable_roots`].
-    pub fn command(&self, goal: &str, git_common_dir: Option<&str>) -> Vec<String> {
+    /// `git_common_dir` is the launching repository's own `.git`, which a
+    /// codex execution needs as a second writable root — see [`writable_roots`].
+    pub fn command(&self, prompt: &str, git_common_dir: Option<&str>) -> Vec<String> {
         let mut words: Vec<String> = match self.provider {
-            // approval_policy=never and workspace-write let the worker commit
-            // on its branch unattended; network access lets it reach the log
-            // through `alder`, which pushes to the store remote.
+            // approval_policy=never and workspace-write let the execution
+            // commit on its branch unattended; network access lets it reach
+            // whatever remotes its work needs.
             Provider::Codex => [
                 "codex",
                 "exec",
@@ -173,54 +174,54 @@ impl Tier {
             .map(|word| (*word).to_owned())
             .collect(),
         };
-        words.push(goal.to_owned());
+        words.push(prompt.to_owned());
         words
     }
 
-    /// The script that relays a ruling back into a one-shot worker, or `None`
-    /// for a provider whose workers sit at an interactive prompt and are
-    /// simply typed at.
+    /// The script that resumes a one-shot execution with a later message, or
+    /// `None` for a provider whose executions sit at an interactive prompt and
+    /// are simply typed at.
     ///
     /// `codex exec resume` inherits *nothing* from the session it resumes: no
-    /// model, no reasoning effort, no sandbox. Resuming a luna worker with a
-    /// bare `codex exec resume <id> "<ruling>"` silently continues it at
+    /// model, no reasoning effort, no sandbox. Resuming a luna execution with a
+    /// bare `codex exec resume <id> "<message>"` silently continues it at
     /// whatever model the CLI defaults to — it says so, in a warning nobody is
     /// watching for — with a sandbox that has neither network access nor the
-    /// git common dir, so the resumed worker can neither commit nor append.
+    /// git common dir, so the resumed execution can commit nothing.
     ///
-    /// So the flags are not documented for an executor to retype. They are
-    /// written into the worktree at spawn, by the same table that built the
-    /// launch, and the relay is one short command.
+    /// So the flags are not documented for anyone to retype. They are written
+    /// into the runner's per-handle state directory at start, by the same
+    /// table that built the launch, and `send` runs the script for the caller.
     pub fn resume_script(&self, git_common_dir: Option<&str>) -> Option<String> {
         if self.provider != Provider::Codex {
             return None;
         }
         let mut words = self.command("", git_common_dir);
-        words.pop(); // the empty goal
+        words.pop(); // the empty prompt
         // `codex exec` becomes `codex exec resume "$session"`; the rest of the
-        // invocation is repeated exactly as the worker was launched with.
+        // invocation is repeated exactly as the execution was launched with.
         let flags: Vec<String> = words
             .drain(2..)
-            .map(|word| crate::effects::quote(&word))
+            .map(|word| crate::host::quote(&word))
             .collect();
         Some(format!(
             r#"#!/bin/sh
-# Resume this worker's codex session with a ruling from the executor.
+# Resume this execution's codex session with a later message.
 #
-#     .alder/resume <codex-session-id> "<the ruling>"
+#     resume <codex-session-id> "<the message>"
 #
-# A session ID is mandatory. `--last` is unsafe here: a worker may have run a
-# consult in this directory, and that would resume the consult instead of this
-# worker. The attempt's `codex-session` metadata is the exact answer.
+# This script lives in the runner's per-handle state directory, beside the
+# `codex-session` marker. A session ID is mandatory. `--last` is unsafe here:
+# something else may have run codex in this directory, and that would resume
+# the wrong session. The `codex-session` marker is the exact answer.
 #
 # `codex exec resume` inherits nothing from the session it resumes, so the
-# model, the effort and the sandbox are repeated here exactly as this worker
-# was spawned with them ({tier}: {model}, effort {effort}). A resume without
-# them runs at another model's default, cannot commit, and cannot reach the
-# log.
+# model, the effort and the sandbox are repeated here exactly as this
+# execution was started with them ({tier}: {model}, effort {effort}). A resume
+# without them runs at another model's default and cannot commit.
 set -eu
 if [ $# -ne 2 ]; then
-  echo "usage: .alder/resume <codex-session-id> <ruling>" >&2
+  echo "usage: resume <codex-session-id> <message>" >&2
   exit 64
 fi
 session=$1
@@ -234,16 +235,16 @@ exec codex exec resume "$session" {flags} "$1"
         ))
     }
 
-    /// A launcher-owned watcher for a Codex worker's session ID.
+    /// A launcher-owned watcher for a Codex execution's session ID.
     ///
     /// `CODEX_THREAD_ID` is only available *inside* the Codex turn, after the
-    /// pane has already been created. Putting the stamp in the brief therefore
-    /// loses exactly the workers that die before their first tool call. This
-    /// watcher starts before `codex exec`, snapshots the existing rollouts,
-    /// and claims the first new rollout whose session metadata names this
-    /// worktree. It is outside the sandbox and independent of the model's
-    /// progress. The marker lets reconciliation surface a repair if its log
-    /// append loses a race or the log is temporarily unavailable.
+    /// pane has already been created. Asking the model to report it therefore
+    /// loses exactly the executions that die before their first tool call.
+    /// This watcher starts before `codex exec`, snapshots the existing
+    /// rollouts, and claims the first new rollout whose session metadata names
+    /// this worktree, leaving the ID in the per-handle state directory's
+    /// `codex-session` marker for `send` to resume with. It is outside the
+    /// sandbox and independent of the model's progress.
     pub fn codex_session_stamp_script(&self) -> Option<&'static str> {
         (self.provider == Provider::Codex).then_some(CODEX_SESSION_STAMP_SCRIPT)
     }
@@ -251,23 +252,26 @@ exec codex exec resume "$session" {flags} "$1"
 
 /// Starts a detached watcher rather than waiting for Codex to boot. The
 /// session files are the local source of truth that `codex exec resume` uses,
-/// and session_meta gives both the stable UUID and the worker's cwd. `jq` is
-/// already part of the operator environment that runs the tmux observer.
+/// and session_meta gives both the stable UUID and the execution's cwd. `jq`
+/// is part of the operator environment the runner already assumes.
 const CODEX_SESSION_STAMP_SCRIPT: &str = r#"#!/usr/bin/env bash
-# Stamp a Codex worker attempt without relying on the worker reaching a tool
-# call. Invoked by the pane immediately before `codex exec`.
+# Record this Codex execution's session ID without relying on the model
+# reaching a tool call. Invoked by the pane immediately before `codex exec`.
+#
+# The marker is written next to this script, in the runner-owned per-handle
+# state directory — never into the worktree, whose contents the execution
+# itself controls.
 set -uo pipefail
 
-attempt=${ALDER_ATTEMPT:?ALDER_ATTEMPT is required}
 worktree=$(pwd -P)
 codex_home=${CODEX_HOME:-"$HOME/.codex"}
 sessions="$codex_home/sessions"
-stamp_dir=.alder
+stamp_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 marker="$stamp_dir/codex-session"
 log="$stamp_dir/codex-session-stamp.log"
 
 mkdir -p "$stamp_dir"
-snapshot=$(mktemp "${TMPDIR:-/tmp}/alder-codex-sessions.XXXXXX")
+snapshot=$(mktemp "${TMPDIR:-/tmp}/alder-ext-codex-sessions.XXXXXX")
 if [ -d "$sessions" ]; then
   find "$sessions" -type f -name '*.jsonl' -print 2>/dev/null >"$snapshot" || true
 else
@@ -299,14 +303,7 @@ find_new_session() {
       temporary="$marker.$$.tmp"
       printf '%s\n' "$session_id" >"$temporary"
       mv -f "$temporary" "$marker"
-      for _ in {1..60}; do
-        if .alder/bin/alder attempt edit "$attempt" --meta "codex-session=$session_id"; then
-          exit 0
-        fi
-        sleep 1
-      done
-      printf 'could not stamp %s on %s after 60 attempts\n' "$session_id" "$attempt" >&2
-      exit 1
+      exit 0
     fi
     sleep 1
   done
@@ -315,16 +312,17 @@ find_new_session() {
 disown || true
 "#;
 
-/// The second writable root a codex worker cannot commit without.
+/// The second writable root a codex execution cannot commit without.
 ///
-/// A worker lives in a linked git worktree, whose `.git` is a *file* pointing
-/// into the dispatching project's `.git/worktrees/<name>`. The index, the
-/// objects and the branch ref all live over there, outside the sandbox's
-/// workspace, so a `workspace-write` worker that is given only its own
-/// checkout fails on the first commit with
+/// An execution lives in a linked git worktree, whose `.git` is a *file*
+/// pointing into the launching repository's `.git/worktrees/<name>`. The
+/// index, the objects and the branch ref all live over there, outside the
+/// sandbox's workspace, so a `workspace-write` execution that is given only
+/// its own checkout fails on the first commit with
 /// `Unable to create '…/index.lock': Operation not permitted`. Naming the
-/// common dir writable fixes exactly that and nothing else: the executor's
-/// working tree stays read-only to the worker, which is the part that matters.
+/// common dir writable fixes exactly that and nothing else: the launching
+/// repository's working tree stays read-only to the execution, which is the
+/// part that matters.
 fn writable_roots(git_common_dir: Option<&str>) -> String {
     let roots: Vec<&str> = git_common_dir.into_iter().collect();
     format!(
@@ -345,14 +343,21 @@ mod tests {
 
     use super::*;
 
+    fn tier(name: &str) -> &'static Tier {
+        lookup(&TIERS, name).expect("a built-in rung")
+    }
+
     #[test]
     fn every_rung_pins_a_model_and_an_effort() {
-        assert_eq!(names(), ["luna", "terra", "sol", "sonnet", "opus", "fable"]);
+        assert_eq!(
+            names(&TIERS),
+            ["luna", "terra", "sol", "sonnet", "opus", "fable"]
+        );
         for rung in &TIERS {
             assert!(!rung.model.is_empty(), "{} has no model", rung.name);
             assert!(!rung.effort.is_empty(), "{} has no effort", rung.name);
             // The command carries both, so neither can be left to the CLI.
-            let command = rung.command("goal", Some("/projects/alder/.git"));
+            let command = rung.command("prompt", Some("/projects/alder/.git"));
             assert!(
                 command.iter().any(|word| word.contains(rung.model)),
                 "{} does not pass its model: {command:?}",
@@ -365,8 +370,8 @@ mod tests {
             );
             assert_eq!(
                 command.last().map(String::as_str),
-                Some("goal"),
-                "{} does not end with the goal",
+                Some("prompt"),
+                "{} does not end with the prompt",
                 rung.name
             );
         }
@@ -397,16 +402,14 @@ mod tests {
                 ("fable", "claude", "claude-fable-5", "xhigh", "sol"),
             ]
         );
-        assert_eq!(DEFAULT_TIER, "terra");
-        assert!(tier(DEFAULT_TIER).is_ok());
     }
 
     #[test]
     fn an_unknown_tier_is_an_error_that_names_the_rungs() {
         for name in ["", "gpt-5.6-luna", "Luna", "sonnet-5", "haiku"] {
-            let error = tier(name).expect_err("unknown tiers are rejected");
+            let error = lookup(&TIERS, name).expect_err("unknown tiers are rejected");
             assert!(error.message.contains(name), "{error}");
-            for rung in names() {
+            for rung in names(&TIERS) {
                 assert!(error.message.contains(rung), "{error} omits {rung}");
             }
         }
@@ -415,14 +418,14 @@ mod tests {
     #[test]
     fn counterparts_pair_the_ladders_across_providers() {
         for rung in &TIERS {
-            let other = rung.counterpart();
+            let other = rung.counterpart(&TIERS);
             assert_ne!(
                 rung.provider, other.provider,
                 "{} falls back within its own provider",
                 rung.name
             );
             assert_eq!(
-                other.counterpart().name,
+                other.counterpart(&TIERS).name,
                 rung.name,
                 "{} and {} do not pair",
                 rung.name,
@@ -433,9 +436,7 @@ mod tests {
 
     #[test]
     fn each_provider_runs_its_own_cli_with_the_pinned_policy() {
-        let luna = tier("luna")
-            .unwrap()
-            .command("do the thing", Some("/projects/alder/.git"));
+        let luna = tier("luna").command("do the thing", Some("/projects/alder/.git"));
         assert_eq!(
             luna,
             [
@@ -456,9 +457,7 @@ mod tests {
                 "do the thing",
             ]
         );
-        let opus = tier("opus")
-            .unwrap()
-            .command("do the thing", Some("/projects/alder/.git"));
+        let opus = tier("opus").command("do the thing", Some("/projects/alder/.git"));
         assert_eq!(
             opus,
             [
@@ -477,17 +476,16 @@ mod tests {
     #[test]
     fn a_codex_rung_writes_a_resume_that_repeats_its_whole_invocation() {
         let script = tier("luna")
-            .unwrap()
             .resume_script(Some("/projects/alder/.git"))
-            .expect("codex rungs relay by resuming");
+            .expect("codex rungs resume");
         assert!(script.starts_with("#!/bin/sh"), "{script}");
         assert!(
             script.contains("codex exec resume \"$session\""),
             "{script}"
         );
         // Everything the launch pinned, pinned again: resume inherits none of
-        // it, and a resumed worker at the wrong model or without the sandbox
-        // roots is worse than no relay at all.
+        // it, and a resumed execution at the wrong model or without the
+        // sandbox roots is worse than no resume at all.
         for flag in [
             "'-m' 'gpt-5.6-luna'",
             "'model_reasoning_effort=high'",
@@ -498,9 +496,12 @@ mod tests {
         ] {
             assert!(script.contains(flag), "the resume drops {flag}: {script}");
         }
-        // The goal placeholder never reaches it; the ruling does.
+        // The prompt placeholder never reaches it; the message does.
         assert!(script.trim_end().ends_with("\"$1\""), "{script}");
-        assert!(!script.contains("''"), "an empty goal leaked in: {script}");
+        assert!(
+            !script.contains("''"),
+            "an empty prompt leaked in: {script}"
+        );
         assert!(
             script.contains("if [ $# -ne 2 ]; then"),
             "a bare resume must fail: {script}"
@@ -510,15 +511,14 @@ mod tests {
             "a resume must never guess from the newest session: {script}"
         );
 
-        // A claude worker sits at a prompt and is typed at, so there is
+        // A claude execution sits at a prompt and is typed at, so there is
         // nothing to write.
-        assert!(tier("opus").unwrap().resume_script(None).is_none());
+        assert!(tier("opus").resume_script(None).is_none());
     }
 
     #[test]
-    fn a_codex_launch_gets_a_sidecar_that_stamps_before_the_worker_can_act() {
+    fn a_codex_launch_gets_a_sidecar_that_stamps_before_the_model_can_act() {
         let watcher = tier("terra")
-            .unwrap()
             .codex_session_stamp_script()
             .expect("codex launches need a session watcher");
         assert!(watcher.contains("find_new_session"), "{watcher}");
@@ -528,15 +528,22 @@ mod tests {
             "{watcher}"
         );
         assert!(
-            watcher.contains("attempt edit \"$attempt\" --meta \"codex-session=$session_id\""),
-            "the watcher never appends its stamp: {watcher}"
+            watcher.contains(r#"stamp_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"#),
+            "the marker must live beside the script, in the runner-owned state \
+             directory rather than the worker-writable worktree: {watcher}"
         );
         assert!(
             watcher.find("snapshot=$(mktemp").unwrap()
                 < watcher.find(") </dev/null >>\"$log\" 2>&1 &").unwrap(),
             "the snapshot must happen before the detached watcher can see Codex: {watcher}"
         );
-        assert!(tier("opus").unwrap().codex_session_stamp_script().is_none());
+        // The runner knows nothing that is not its own: the sidecar records
+        // its marker locally and calls no other tool to announce it.
+        assert!(
+            !watcher.contains("alder "),
+            "the sidecar reaches outside the runner: {watcher}"
+        );
+        assert!(tier("opus").codex_session_stamp_script().is_none());
     }
 
     #[test]
@@ -546,7 +553,6 @@ mod tests {
         fs::write(
             &resume,
             tier("luna")
-                .unwrap()
                 .resume_script(Some("/projects/alder/.git"))
                 .unwrap(),
         )
@@ -568,7 +574,7 @@ mod tests {
         fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
 
         let bare = Command::new(&resume)
-            .arg("the ruling")
+            .arg("the message")
             .env("PATH", &bin)
             .output()
             .unwrap();
@@ -584,7 +590,7 @@ mod tests {
         );
 
         let resumed = Command::new(&resume)
-            .args(["019fb2ef-d507-7201-bc36-79d6d5b82336", "the ruling"])
+            .args(["019fb2ef-d507-7201-bc36-79d6d5b82336", "the message"])
             .env("PATH", &bin)
             .output()
             .unwrap();
@@ -595,7 +601,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(called).unwrap(),
-            "exec resume 019fb2ef-d507-7201-bc36-79d6d5b82336 -m gpt-5.6-luna -c model_reasoning_effort=high -c approval_policy=never -c sandbox_mode=workspace-write -c sandbox_workspace_write.network_access=true -c sandbox_workspace_write.writable_roots=[\"/projects/alder/.git\"] the ruling\n"
+            "exec resume 019fb2ef-d507-7201-bc36-79d6d5b82336 -m gpt-5.6-luna -c model_reasoning_effort=high -c approval_policy=never -c sandbox_mode=workspace-write -c sandbox_workspace_write.network_access=true -c sandbox_workspace_write.writable_roots=[\"/projects/alder/.git\"] the message\n"
         );
     }
 
