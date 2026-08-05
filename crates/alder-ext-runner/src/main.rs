@@ -122,10 +122,11 @@ fn status(arguments: &[String]) -> Result<ExitCode, RunnerError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `send <handle> --file <path>`.
+/// `send <handle> --file <path> [--force]`.
 fn send(arguments: &[String]) -> Result<ExitCode, RunnerError> {
     let mut handle: Option<String> = None;
     let mut file: Option<PathBuf> = None;
+    let mut force = false;
     let mut iterator = arguments.iter();
     while let Some(argument) = iterator.next() {
         match argument.as_str() {
@@ -136,6 +137,7 @@ fn send(arguments: &[String]) -> Result<ExitCode, RunnerError> {
                         .ok_or_else(|| usage("--file needs a path"))?,
                 ));
             }
+            "--force" => force = true,
             other if other.starts_with('-') => {
                 return Err(usage(&format!("unknown argument `{other}`")));
             }
@@ -150,7 +152,7 @@ fn send(arguments: &[String]) -> Result<ExitCode, RunnerError> {
     let file = file.ok_or_else(|| usage("send needs --file"))?;
     let table = config::load_tiers()?;
     let host = Host::new(current_dir()?);
-    ops::send(&host, table, &handle, &file)?;
+    ops::send(&host, table, &handle, &file, force)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -261,7 +263,7 @@ alder-ext-runner — give a prompt to a model at some effort; get a handle
 
 usage: alder-ext-runner start --repo <path> --branch <name> --tier <name> --prompt-file <path>
        alder-ext-runner status <handle>
-       alder-ext-runner send <handle> --file <path>
+       alder-ext-runner send <handle> --file <path> [--force]
        alder-ext-runner kill <handle>
        alder-ext-runner limit <provider> [--minutes <n>] [--clear] [--why <text>]
        alder-ext-runner budget [--hours <n>] [--json]
@@ -274,6 +276,9 @@ start   Launch one execution: a worktree beside the repo on the given branch,
 status  One word about a handle: running, done (the engine exited; the branch
         holds whatever it left), or dead (nothing answers to the handle).
 send    Deliver a local file's contents as input to the running execution.
+        Delivery is at-least-once. A send that tears between paste and Enter
+        leaves the pane refusing further sends until a human resolves it or
+        --force delivers anyway.
 kill    End the execution. The worktree and branch remain.
 limit   Record that a provider is rate-limited, so start serves its rungs
         from the other ladder until then.

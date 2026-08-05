@@ -9,8 +9,8 @@ use std::path::Path;
 
 use crate::{
     error::{Result, RunnerError},
-    host::Host,
-    start::RUNNER_DIR,
+    host::{EngineMarker, Host},
+    start::{RUNNER_DIR, TORN_ENV},
     tier::{Provider, Tier},
 };
 
@@ -39,10 +39,12 @@ pub fn status(host: &Host, handle: &str) -> Result<Status> {
             detail: None,
         });
     };
-    let word = if observed.engine_live {
-        "running"
-    } else {
+    // Only a proven-exited engine reads `done`; a session that cannot prove
+    // its engine's state reads `running`, never presumed finished.
+    let word = if observed.engine == EngineMarker::Exited {
         "done"
+    } else {
+        "running"
     };
     let detail = match (&observed.tier, &observed.worktree) {
         (Some(tier), Some(worktree)) => {
@@ -72,7 +74,24 @@ pub fn kill(host: &Host, handle: &str) -> Result<()> {
 /// one-shot engine has no prompt to paste at. In neither route does the
 /// runner inspect the pane or synchronize on the execution's progress:
 /// delivery is at-least-once and reports exactly one accepted send.
-pub fn send(host: &Host, table: &'static [Tier], handle: &str, file: &Path) -> Result<()> {
+///
+/// **The torn-send contract.** A delivery has two effects — paste, then one
+/// submitting Enter — and can tear between them, leaving pasted text sitting
+/// unsubmitted in the pane. When Enter fails, `send` retries it once
+/// immediately; if that also fails it stamps the session with a torn marker
+/// and reports loudly that unsubmitted text sits in the pane. Every later
+/// `send` sees the marker and refuses — the pane is dirty, and pasting more
+/// text at it would corrupt whatever a human or the engine makes of the
+/// residue — until someone resolves it: kill or submit the pane by hand, or
+/// pass `force`, which delivers anyway and clears the marker once its own
+/// Enter lands.
+pub fn send(
+    host: &Host,
+    table: &'static [Tier],
+    handle: &str,
+    file: &Path,
+    force: bool,
+) -> Result<()> {
     use crate::host::RunnerHost;
     if !file.is_file() {
         return Err(RunnerError::new(format!(
@@ -90,13 +109,31 @@ pub fn send(host: &Host, table: &'static [Tier], handle: &str, file: &Path) -> R
     })?;
     let tier = crate::tier::lookup(table, tier_name)?;
 
+    // A previous send tore between paste and Enter: the pane holds
+    // unsubmitted text, and pasting more at it would mix two messages.
+    let torn = host.tmux_environment(handle, TORN_ENV)?.is_some();
+    if torn && !force {
+        return Err(RunnerError::new(format!(
+            "the pane for `{handle}` holds unsubmitted text from a torn send; \
+             kill or submit it first, or pass --force to deliver anyway"
+        )));
+    }
+
     let buffer = format!("alder-ext-send-{}", std::process::id());
     let delivered = match tier.provider {
         Provider::Claude => {
-            if !observed.engine_live {
+            if observed.engine == EngineMarker::Exited {
                 return Err(RunnerError::new(format!(
                     "cannot deliver to the exited interactive engine for `{handle}`; \
                      start a fresh execution"
+                )));
+            }
+            if observed.engine != EngineMarker::Running {
+                // Fail-safe: never paste at a pane that cannot prove an
+                // engine is running to receive it.
+                return Err(RunnerError::new(format!(
+                    "session `{handle}` cannot prove an engine is running (no engine \
+                     marker); refusing to paste at it"
                 )));
             }
             // tmux reads the local file itself into a server buffer; no
@@ -154,7 +191,35 @@ pub fn send(host: &Host, table: &'static [Tier], handle: &str, file: &Path) -> R
         host.tmux_delete_buffer(&buffer);
         return Err(error);
     }
-    host.tmux_submit(handle)?;
+    // The paste landed; from here the only honest outcomes are "submitted"
+    // or "torn, and the session says so". One immediate retry covers a
+    // transiently busy server; a second failure is recorded on the session
+    // itself so every later send refuses the dirty pane.
+    if let Err(first) = host.tmux_submit(handle)
+        && let Err(second) = host.tmux_submit(handle)
+    {
+        if let Err(mark) = host.tmux_set_session_environment(handle, TORN_ENV, "1") {
+            eprintln!(
+                "alder-ext-runner: could not stamp the torn-send marker on \
+                 `{handle}`: {mark}"
+            );
+        }
+        return Err(RunnerError::new(format!(
+            "DELIVERY TORN for `{handle}`: the text was pasted but Enter failed \
+             twice ({first}; retry: {second}). Unsubmitted text sits in the pane; \
+             kill or submit it by hand, or resend with --force"
+        )));
+    }
+    if torn {
+        // `--force` delivered over a torn pane and its Enter landed, which
+        // submits the residue along with this message: resolved.
+        if let Err(clear) = host.tmux_unset_session_environment(handle, TORN_ENV) {
+            eprintln!(
+                "alder-ext-runner: could not clear the torn-send marker on \
+                 `{handle}`: {clear}"
+            );
+        }
+    }
     println!("sent once to {handle}");
     Ok(())
 }

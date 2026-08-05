@@ -13,7 +13,7 @@ branch you gave at start; the runner never reads or interprets it.
 ```text
 alder-ext-runner start --repo <path> --branch <name> --tier <name> --prompt-file <path>
 alder-ext-runner status <handle>
-alder-ext-runner send <handle> --file <path>
+alder-ext-runner send <handle> --file <path> [--force]
 alder-ext-runner kill <handle>
 ```
 
@@ -32,7 +32,12 @@ execution instead of doubling it: a live engine under the handle is refused,
 an exited pane is replaced (its result is already safe on the branch), an
 existing worktree is adopted only after git proves it is on the expected
 branch, and residue from a torn `git worktree add`/`remove` is swept using
-git's registry as the authority.
+git's registry as the authority. *Concurrent* starts of one branch serialize
+too: the whole sequence runs under an exclusive per-handle file lock (in the
+runner's state directory), so of two simultaneous starts one wins and the
+other refuses — either immediately on lock contention, or because it then
+sees the winner's live session — and never removes a worktree the winner is
+using.
 
 **`status`** prints one word:
 
@@ -51,16 +56,27 @@ unknown provenance must never be presumed finished.
 **`send`** delivers a local file's contents as input to the execution. The
 mechanics are internal and invisible in the contract: an interactive engine
 (claude) gets the file loaded into a tmux buffer and pasted raw, so no byte
-of it can become shell syntax or a key name, and an exited interactive engine
-is refused rather than typed at; a one-shot engine (codex) gets the bytes
-base64-armored into a command that resumes the recorded codex session through
-the generated `.alder-ext-runner/resume` script — queued in the pane while
-the engine still runs, executed by the holding shell once it exits. `codex
-exec resume` inherits nothing from the session it resumes, so the resume
-script repeats the model, effort and sandbox exactly as the launch pinned
-them; it requires the exact session ID (recorded by a launcher-owned sidecar
-into `.alder-ext-runner/codex-session`) and never guesses from `--last`.
-Delivery is at-least-once and the runner never reads the pane afterwards.
+of it can become shell syntax or a key name; an exited interactive engine is
+refused rather than typed at, and so is a session that cannot *prove* an
+engine is running (no engine marker) — the runner never pastes at a pane of
+unknown provenance. A one-shot engine (codex) gets the bytes base64-armored
+into a command that resumes the recorded codex session through the generated
+`.alder-ext-runner/resume` script — queued in the pane while the engine
+still runs, executed by the holding shell once it exits. `codex exec resume`
+inherits nothing from the session it resumes, so the resume script repeats
+the model, effort and sandbox exactly as the launch pinned them; it requires
+the exact session ID (recorded by a launcher-owned sidecar into
+`.alder-ext-runner/codex-session`) and never guesses from `--last`.
+
+Delivery is **at-least-once** and the runner never reads the pane afterwards.
+A delivery has two effects — paste, then one submitting Enter — and can tear
+between them, leaving pasted text sitting unsubmitted. When Enter fails,
+`send` retries it once immediately; if that also fails it stamps the session
+with a torn marker and reports loudly. From then on the pane refuses every
+further send — pasting more text at unsubmitted residue would mix two
+messages — until a human kills or submits the pane, or a send with `--force`
+delivers anyway (its Enter submits the residue along with the new message and
+clears the marker).
 
 **`kill`** ends the session. The worktree and branch remain — they are the
 result.
@@ -162,8 +178,10 @@ extraction is only worth having if the boundary holds:
 
 - it depends on **no other crate in this workspace**, and nothing in this
   workspace depends on it — `tests/boundary.rs` asserts both directions
-  against `cargo metadata` and greps this crate's sources for the alder log
-  ref path, loudly;
+  against `cargo metadata` for *every* workspace member (after proving each
+  expected package is actually present, so a rename cannot silently drop it
+  from coverage) and sweeps every file in this crate for alder's log ref
+  namespaces, loudly;
 - it stamps only its own names into sessions (`ALDER_EXT_RUNNER_HANDLE`,
   `ALDER_EXT_RUNNER_ENGINE`, `ALDER_EXT_RUNNER_TIER`,
   `ALDER_EXT_RUNNER_WORKTREE`) and writes only its own directory
@@ -172,10 +190,12 @@ extraction is only worth having if the boundary holds:
   result is good.
 
 Because nothing reaches into it and it reaches into nothing, this crate is
-**trivially movable to its own repository**: copy the directory, and every
-test still passes (the boundary test then holds vacuously, which is the
-correct answer). Its tmux sandbox teardown is a crate-local copy
-(`scripts/tmux-sandbox.sh`) for exactly that reason.
+**trivially movable to its own repository**: copy the directory, and
+everything except the boundary test's counterpart list still passes. That
+test then fails loudly — deliberately, rather than passing vacuously — and
+deleting the workspace counterpart list along with the workspace is the one
+conscious edit the move requires. Its tmux sandbox teardown is a crate-local
+copy (`scripts/tmux-sandbox.sh`) for exactly that reason.
 
 ## Testing
 

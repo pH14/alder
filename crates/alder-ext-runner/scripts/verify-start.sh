@@ -35,7 +35,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 CRATE=$(cd "$HERE/.." && pwd)
 
-for tool in git tmux; do
+for tool in git tmux python3; do
   command -v "$tool" >/dev/null ||
     { echo "$tool is required to run this verification" >&2; exit 2; }
 done

@@ -35,7 +35,7 @@ use chrono::{DateTime, Utc};
 
 use crate::{
     error::{Result, RunnerError},
-    host::RunnerHost,
+    host::{EngineMarker, RunnerHost},
     limits::Limits,
     tier::Tier,
 };
@@ -56,6 +56,9 @@ pub(crate) const HANDLE_ENV: &str = "ALDER_EXT_RUNNER_HANDLE";
 pub(crate) const ENGINE_ENV: &str = "ALDER_EXT_RUNNER_ENGINE";
 pub(crate) const TIER_ENV: &str = "ALDER_EXT_RUNNER_TIER";
 pub(crate) const WORKTREE_ENV: &str = "ALDER_EXT_RUNNER_WORKTREE";
+/// Stamped by `send` when a delivery tore between paste and Enter, so the
+/// pane refuses further sends until a human (or `--force`) resolves it.
+pub(crate) const TORN_ENV: &str = "ALDER_EXT_RUNNER_TORN";
 pub(crate) const ENGINE_RUNNING: &str = "running";
 pub(crate) const ENGINE_EXITED: &str = "exited";
 
@@ -95,6 +98,13 @@ impl Started {
 
 /// The handle for one branch: deterministic, so a crashed start re-run against
 /// the same branch converges on the same session instead of doubling it.
+///
+/// Known, accepted risk: the slug is lossy (`work/al-1` and `work_al_1` both
+/// become `alder-ext-work-al-1`), so two colliding branches share a handle,
+/// and the "kill it before starting" refusal can then attribute the running
+/// session to the wrong branch — an operator following that message could
+/// kill the other branch's execution. A collision refusal was considered and
+/// rejected; this comment is the documentation of the risk.
 pub fn handle_for_branch(branch: &str) -> String {
     let slug: String = branch
         .chars()
@@ -235,6 +245,14 @@ pub fn start(
         return Err(RunnerError::new("the prompt file is empty; nothing to run"));
     }
     let session = handle_for_branch(branch);
+    // Two concurrent starts of one branch serialize on this exclusive
+    // per-handle lock, taken before anything is observed or made and held
+    // (as a guard) across the whole sequence — session check, worktree cut
+    // or adoption, tmux new-session, marker stamping. The loser either
+    // refuses immediately on contention, or acquires the lock after the
+    // winner finished and then sees the winner's live session below and
+    // refuses; either way undo never removes a worktree a winner is using.
+    let _lock = host.lock_start(&session)?;
     let worktree_parent = host.repo().parent().ok_or_else(|| {
         RunnerError::new(format!(
             "`{}` has no parent directory to put a worktree beside",
@@ -247,9 +265,16 @@ pub fn start(
     let worktree_present = verify_worktree(host, &worktree, branch)?;
 
     if let Some(observed) = host.tmux_session(&session)? {
-        if observed.engine_live {
+        if observed.engine != EngineMarker::Exited {
+            // A proven-running engine is refused; so is a session that
+            // carries no marker at all, which proves nothing and therefore
+            // must be neither killed nor typed over.
+            let why = match observed.engine {
+                EngineMarker::Running => "is already running",
+                _ => "exists but cannot prove its engine exited",
+            };
             return Err(RunnerError::new(format!(
-                "handle `{session}` is already running; kill it before starting another \
+                "handle `{session}` {why}; kill it before starting another \
                  execution on `{branch}`"
             )));
         }
@@ -469,7 +494,10 @@ fn launch(
 }
 
 /// Undo what this run made, best effort and loudly. An adopted worktree is
-/// never removed: it existed before this start and may hold work.
+/// never removed: it existed before this start and may hold work. A worktree
+/// this run did cut is still only removed if no session answers to the handle
+/// at undo time — a session that exists (however it got there) may be using
+/// the worktree, and a worktree is never pulled out from under a live pane.
 fn undo(
     host: &impl RunnerHost,
     made: &Made,
@@ -484,6 +512,24 @@ fn undo(
         }
     }
     if made.worktree && !worktree_adopted {
+        match host.tmux_session(session) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                host.log(&format!(
+                    "a session still answers to {session}; leaving the worktree {} in place",
+                    worktree.display()
+                ));
+                return;
+            }
+            Err(error) => {
+                host.log(&format!(
+                    "cannot prove no session answers to {session} ({error}); leaving the \
+                     worktree {} in place",
+                    worktree.display()
+                ));
+                return;
+            }
+        }
         host.log(&format!(
             "removing the worktree {} after a failure",
             worktree.display()
@@ -547,9 +593,10 @@ mod tests {
         sessions: RefCell<BTreeMap<String, crate::host::ObservedSession>>,
         crash_after: RefCell<Option<&'static str>>,
         fail_tmux: bool,
+        lock_contended: bool,
     }
 
-    use crate::host::{ObservedSession, Run};
+    use crate::host::{ObservedSession, Run, StartLock};
 
     impl Fake {
         fn new() -> Self {
@@ -578,6 +625,16 @@ mod tests {
     impl RunnerHost for Fake {
         fn repo(&self) -> &Path {
             &self.repo
+        }
+
+        fn lock_start(&self, handle: &str) -> Result<StartLock> {
+            self.calls.borrow_mut().push(format!("lock {handle}"));
+            if self.lock_contended {
+                return Err(RunnerError::new(format!(
+                    "another start of `{handle}` holds its lock; refusing to race it"
+                )));
+            }
+            Ok(StartLock::unlocked_for_tests())
         }
 
         fn git(&self, args: &[&str]) -> Result<Run> {
@@ -696,7 +753,7 @@ mod tests {
                         .find(|(name, _)| *name == TIER_ENV)
                         .map(|(_, value)| value.clone()),
                     worktree: Some(cwd.to_path_buf()),
-                    engine_live: true,
+                    engine: EngineMarker::Running,
                 },
             );
             self.crash_if("tmux new-session");
@@ -1231,7 +1288,7 @@ mod tests {
                 handle: Some(SESSION.to_owned()),
                 tier: Some("luna".to_owned()),
                 worktree: Some(PathBuf::from(WORKTREE)),
-                engine_live: true,
+                engine: EngineMarker::Running,
             },
         );
         let error = run_start(&host, "terra").unwrap_err();
@@ -1239,6 +1296,107 @@ mod tests {
         assert!(!host.called("git worktree add"));
         assert!(!host.called("tmux new-session"));
         assert!(!host.called("tmux kill-session"));
+    }
+
+    #[test]
+    fn a_session_that_cannot_prove_its_engine_exited_is_refused_not_replaced() {
+        let host = Fake::new();
+        host.sessions.borrow_mut().insert(
+            SESSION.to_owned(),
+            ObservedSession {
+                handle: Some(SESSION.to_owned()),
+                tier: Some("luna".to_owned()),
+                worktree: Some(PathBuf::from(WORKTREE)),
+                engine: EngineMarker::Unproven,
+            },
+        );
+        let error = run_start(&host, "terra").unwrap_err();
+        assert!(
+            error.message.contains("cannot prove its engine exited"),
+            "{error}"
+        );
+        assert!(!host.called("tmux kill-session"));
+        assert!(!host.called("tmux new-session"));
+        assert!(!host.called("git worktree add"));
+    }
+
+    #[test]
+    fn a_start_that_loses_the_handle_lock_refuses_cleanly_and_removes_nothing() {
+        // The loser of a double start: the winner holds the per-handle lock,
+        // so this start must refuse before observing or making anything, and
+        // it must undo nothing — the winner's worktree and session are not
+        // its to touch.
+        let host = Fake {
+            lock_contended: true,
+            ..Fake::new()
+        };
+        let error = run_start(&host, "terra").unwrap_err();
+        assert!(error.message.contains("holds its lock"), "{error}");
+
+        let calls = host.calls();
+        assert_eq!(
+            calls,
+            vec![format!("lock {SESSION}")],
+            "a lock loser did more than ask for the lock: {calls:#?}"
+        );
+        assert!(!host.called("git worktree add"));
+        assert!(!host.called("tmux new-session"));
+        assert!(!host.called("git worktree remove"));
+        assert!(!host.called(&format!("remove {WORKTREE}")));
+        assert!(!host.called("tmux kill-session"));
+    }
+
+    #[test]
+    fn the_lock_is_taken_before_anything_is_observed_and_a_start_takes_it_once() {
+        let host = Fake::new();
+        run_start(&host, "terra").unwrap();
+        let calls = host.calls();
+        assert_eq!(
+            calls.first().map(String::as_str),
+            Some(format!("lock {SESSION}").as_str()),
+            "the lock is no longer the first thing a start does: {calls:#?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("lock "))
+                .count(),
+            1,
+            "{calls:#?}"
+        );
+    }
+
+    #[test]
+    fn undo_leaves_a_worktree_alone_while_any_session_answers_to_the_handle() {
+        // Even a worktree this run cut is not removed while a session with
+        // the handle exists at undo time: whatever created that session may
+        // be sitting in the worktree.
+        let host = Fake::new();
+        host.worktrees
+            .borrow_mut()
+            .insert(PathBuf::from(WORKTREE), BRANCH.to_owned());
+        host.sessions.borrow_mut().insert(
+            SESSION.to_owned(),
+            ObservedSession {
+                handle: Some(SESSION.to_owned()),
+                tier: None,
+                worktree: None,
+                engine: EngineMarker::Running,
+            },
+        );
+        undo(
+            &host,
+            &Made {
+                worktree: true,
+                session: false,
+            },
+            SESSION,
+            Path::new(WORKTREE),
+            false,
+        );
+        assert!(!host.called("git worktree remove"), "{:#?}", host.calls());
+        assert!(host.worktrees.borrow().contains_key(Path::new(WORKTREE)));
+        assert!(host.called("leaving the worktree"), "{:#?}", host.calls());
     }
 
     #[test]
@@ -1253,7 +1411,7 @@ mod tests {
                 handle: Some(SESSION.to_owned()),
                 tier: Some("luna".to_owned()),
                 worktree: Some(PathBuf::from(WORKTREE)),
-                engine_live: false,
+                engine: EngineMarker::Exited,
             },
         );
         let started = run_start(&host, "terra").unwrap();

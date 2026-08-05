@@ -14,8 +14,26 @@ use std::{
 
 use crate::{
     error::{Result, RunnerError},
-    start::{ENGINE_ENV, ENGINE_EXITED, HANDLE_ENV, TIER_ENV, WORKTREE_ENV},
+    start::{ENGINE_ENV, ENGINE_EXITED, ENGINE_RUNNING, HANDLE_ENV, TIER_ENV, WORKTREE_ENV},
 };
+
+/// What the engine marker on a session proves. A missing or unrecognized
+/// marker proves nothing, and nothing is the fail-safe reading on both sides:
+/// an unproven engine is never pasted at (it cannot prove anything is
+/// listening) and its pane is never replaced (it cannot prove its work is
+/// done).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngineMarker {
+    /// The session is stamped `running`: an engine is provably going.
+    Running,
+    /// The session is stamped `exited`: the engine provably finished and its
+    /// holding shell remains.
+    Exited,
+    /// No marker, or a marker this runner never stamps: a session of unknown
+    /// provenance, live for no purpose.
+    #[default]
+    Unproven,
+}
 
 /// The identity and engine state observable on an existing tmux session, read
 /// back from the environment the runner stamped at creation.
@@ -24,7 +42,7 @@ pub struct ObservedSession {
     pub handle: Option<String>,
     pub tier: Option<String>,
     pub worktree: Option<PathBuf>,
-    pub engine_live: bool,
+    pub engine: EngineMarker,
 }
 
 /// What a shell-out did, once it ran at all.
@@ -35,10 +53,60 @@ pub struct Run {
     pub stderr: String,
 }
 
+/// An exclusive per-handle start lock, released when dropped. Holding it is
+/// what lets two concurrent starts of one branch serialize instead of racing
+/// each other's worktree and session effects.
+#[derive(Debug)]
+pub struct StartLock {
+    _file: Option<std::fs::File>,
+}
+
+impl StartLock {
+    /// A lock that guards nothing, for hosts that are not the real world.
+    #[cfg(test)]
+    pub(crate) fn unlocked_for_tests() -> Self {
+        Self { _file: None }
+    }
+}
+
+/// Take an exclusive advisory lock on `path`, refusing immediately if another
+/// process (or another handle to the same file) already holds it. Refusing is
+/// the point: the loser of a double start must not stand in line behind the
+/// winner and then re-run the same prompt — it reports the contention and the
+/// caller retries once the winner's session is observable.
+pub(crate) fn acquire_start_lock(path: &Path, handle: &str) -> Result<StartLock> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            RunnerError::new(format!("cannot create `{}`: {error}", parent.display()))
+        })?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| {
+            RunnerError::new(format!("cannot open lock `{}`: {error}", path.display()))
+        })?;
+    match file.try_lock() {
+        Ok(()) => Ok(StartLock { _file: Some(file) }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(RunnerError::new(format!(
+            "another start of `{handle}` holds its lock; refusing to race it"
+        ))),
+        Err(std::fs::TryLockError::Error(error)) => Err(RunnerError::new(format!(
+            "cannot lock `{}` for `{handle}`: {error}",
+            path.display()
+        ))),
+    }
+}
+
 /// Everything a start does to the world.
 pub trait RunnerHost {
     /// The repository executions are launched from.
     fn repo(&self) -> &Path;
+    /// Take the exclusive start lock for one handle, held (by the caller
+    /// keeping the returned guard alive) across the whole start sequence.
+    fn lock_start(&self, handle: &str) -> Result<StartLock>;
     /// Run `git <args>` in the repository. An error means git could not be
     /// run at all; a git command that ran and failed comes back as `Run`.
     fn git(&self, args: &[&str]) -> Result<Run>;
@@ -138,6 +206,24 @@ impl Host {
         let _ = self.run("tmux", &["delete-buffer", "-b", buffer]);
     }
 
+    /// Stamp one variable into a session's environment after creation. Used
+    /// for the torn-send marker only; identity is stamped at `new-session`.
+    pub fn tmux_set_session_environment(
+        &self,
+        session: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
+        let target = format!("={session}");
+        self.tmux_ok(&["set-environment", "-t", &target, name, value])
+    }
+
+    /// Remove one variable from a session's environment.
+    pub fn tmux_unset_session_environment(&self, session: &str, name: &str) -> Result<()> {
+        let target = format!("={session}");
+        self.tmux_ok(&["set-environment", "-u", "-t", &target, name])
+    }
+
     fn tmux_ok(&self, args: &[&str]) -> Result<()> {
         let output = self.run("tmux", args)?;
         if output.status.success() {
@@ -165,6 +251,11 @@ impl RunnerHost for Host {
         &self.repo
     }
 
+    fn lock_start(&self, handle: &str) -> Result<StartLock> {
+        let path = crate::config::state_dir().join(format!("start-{handle}.lock"));
+        acquire_start_lock(&path, handle)
+    }
+
     fn git(&self, args: &[&str]) -> Result<Run> {
         let output = self.run("git", args)?;
         Ok(Run {
@@ -183,10 +274,15 @@ impl RunnerHost for Host {
             handle: environment(HANDLE_ENV)?,
             tier: environment(TIER_ENV)?,
             worktree: environment(WORKTREE_ENV)?.map(PathBuf::from),
-            // Anything but an explicit exited marker is conservatively a live
-            // engine: a session of unknown provenance must be refused, never
-            // typed over.
-            engine_live: environment(ENGINE_ENV)?.as_deref() != Some(ENGINE_EXITED),
+            // Only an explicit marker proves anything. A missing marker is
+            // fail-safe in both directions: never pasted at (nothing proves
+            // an engine is listening) and never replaced (nothing proves its
+            // work is done).
+            engine: match environment(ENGINE_ENV)?.as_deref() {
+                Some(ENGINE_RUNNING) => EngineMarker::Running,
+                Some(ENGINE_EXITED) => EngineMarker::Exited,
+                _ => EngineMarker::Unproven,
+            },
         }))
     }
 
@@ -320,6 +416,21 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    #[test]
+    fn the_start_lock_is_exclusive_per_path_and_released_on_drop() {
+        let state = tempfile::TempDir::new().expect("a state directory");
+        let path = state.path().join("locks/start-alder-ext-work-x.lock");
+
+        let held = acquire_start_lock(&path, "alder-ext-work-x").expect("the first lock is taken");
+        let refused = acquire_start_lock(&path, "alder-ext-work-x")
+            .expect_err("a concurrent start is refused, not queued");
+        assert!(refused.message.contains("holds its lock"), "{refused}");
+
+        drop(held);
+        acquire_start_lock(&path, "alder-ext-work-x")
+            .expect("a released lock is free for the next start");
+    }
 
     #[test]
     fn shell_words_survive_quotes_intact() {

@@ -98,6 +98,9 @@ fn start_runs_against_a_private_tmux_server_and_a_throwaway_repo() {
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .env("TMUX_TMPDIR", sockets.path())
+        // The start lock is machine-local state; keep it inside the sandbox
+        // rather than in the operator's real state directory.
+        .env("ALDER_EXT_RUNNER_STATE_DIR", work.path().join("state"))
         .env(SESSION_ENV, &session)
         .env(SOCKET_ENV, &socket)
         .env(WORK_ENV, work.path())

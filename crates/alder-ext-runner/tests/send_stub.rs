@@ -28,12 +28,20 @@ struct Stub {
     calls: PathBuf,
     finding: PathBuf,
     sentinel: PathBuf,
+    /// While this file exists, the stub's `send-keys` (Enter) fails.
+    enter_fails: PathBuf,
+    /// The stub's stateful torn marker: `set-environment` writes it,
+    /// `set-environment -u` removes it, `show-environment` answers from it.
+    torn: PathBuf,
     path: std::ffi::OsString,
 }
 
 /// A stub tmux that records every call and answers `show-environment` from
 /// the variables this test exports, plus a worktree carrying a resume script
-/// and (optionally) a codex-session marker.
+/// and (optionally) a codex-session marker. A variable exported empty reads
+/// as absent, the way real tmux answers for an unset session variable. The
+/// torn marker is stateful across invocations, so a send that stamps it is
+/// visible to the next send.
 fn stub() -> Stub {
     let temporary = TempDir::new().unwrap();
     let worktree = temporary.path().join("worktree");
@@ -42,6 +50,8 @@ fn stub() -> Stub {
     write_executable(&runner_dir.join("resume"), "#!/bin/sh\nexit 0\n");
 
     let calls = temporary.path().join("tmux-calls");
+    let enter_fails = temporary.path().join("enter-fails");
+    let torn = temporary.path().join("torn-marker");
     let tools = temporary.path().join("tools");
     fs::create_dir_all(&tools).unwrap();
     write_executable(
@@ -51,17 +61,35 @@ fn stub() -> Stub {
 printf '%s\n' "$*" >> "{calls}"
 case "$1" in
   has-session) exit 0 ;;
+  send-keys) [ -e "{enter_fails}" ] && exit 1 || exit 0 ;;
+  set-environment)
+    if [ "$2" = "-u" ]; then rm -f "{torn}"; else printf '%s' "$5" > "{torn}"; fi
+    ;;
   show-environment)
     case "$4" in
-      ALDER_EXT_RUNNER_HANDLE) printf 'ALDER_EXT_RUNNER_HANDLE=%s\n' "$STUB_HANDLE" ;;
-      ALDER_EXT_RUNNER_ENGINE) printf 'ALDER_EXT_RUNNER_ENGINE=%s\n' "$STUB_ENGINE" ;;
-      ALDER_EXT_RUNNER_TIER) printf 'ALDER_EXT_RUNNER_TIER=%s\n' "$STUB_TIER" ;;
-      ALDER_EXT_RUNNER_WORKTREE) printf 'ALDER_EXT_RUNNER_WORKTREE=%s\n' "$STUB_WORKTREE" ;;
+      ALDER_EXT_RUNNER_HANDLE)
+        [ -n "$STUB_HANDLE" ] || exit 1
+        printf 'ALDER_EXT_RUNNER_HANDLE=%s\n' "$STUB_HANDLE" ;;
+      ALDER_EXT_RUNNER_ENGINE)
+        [ -n "$STUB_ENGINE" ] || exit 1
+        printf 'ALDER_EXT_RUNNER_ENGINE=%s\n' "$STUB_ENGINE" ;;
+      ALDER_EXT_RUNNER_TIER)
+        [ -n "$STUB_TIER" ] || exit 1
+        printf 'ALDER_EXT_RUNNER_TIER=%s\n' "$STUB_TIER" ;;
+      ALDER_EXT_RUNNER_WORKTREE)
+        [ -n "$STUB_WORKTREE" ] || exit 1
+        printf 'ALDER_EXT_RUNNER_WORKTREE=%s\n' "$STUB_WORKTREE" ;;
+      ALDER_EXT_RUNNER_TORN)
+        [ -e "{torn}" ] || exit 1
+        printf 'ALDER_EXT_RUNNER_TORN=%s\n' "$(cat "{torn}")" ;;
+      *) exit 1 ;;
     esac
     ;;
 esac
 "##,
-            calls = calls.display()
+            calls = calls.display(),
+            enter_fails = enter_fails.display(),
+            torn = torn.display()
         ),
     );
     let mut path = vec![tools];
@@ -84,19 +112,23 @@ esac
         calls,
         finding,
         sentinel,
+        enter_fails,
+        torn,
         path,
         _temporary: temporary,
     }
 }
 
-fn send(stub: &Stub, engine: &str, tier: &str) -> Output {
+fn send_with(stub: &Stub, engine: &str, tier: &str, extra: &[&str]) -> Output {
+    let mut arguments = vec![
+        "send",
+        "alder-ext-work-hm",
+        "--file",
+        stub.finding.to_str().unwrap(),
+    ];
+    arguments.extend_from_slice(extra);
     Command::new(env!("CARGO_BIN_EXE_alder-ext-runner"))
-        .args([
-            "send",
-            "alder-ext-work-hm",
-            "--file",
-            stub.finding.to_str().unwrap(),
-        ])
+        .args(arguments)
         .env("PATH", &stub.path)
         .env("STUB_HANDLE", "alder-ext-work-hm")
         .env("STUB_ENGINE", engine)
@@ -105,6 +137,10 @@ fn send(stub: &Stub, engine: &str, tier: &str) -> Output {
         .env_remove("ALDER_EXT_RUNNER_CONFIG")
         .output()
         .expect("the runner runs")
+}
+
+fn send(stub: &Stub, engine: &str, tier: &str) -> Output {
+    send_with(stub, engine, tier, &[])
 }
 
 fn calls(stub: &Stub) -> String {
@@ -212,6 +248,107 @@ fn a_codex_engine_receives_an_armored_resume_never_raw_bytes() {
         "{calls}"
     );
     assert!(!calls.contains("display-message"), "{calls}");
+}
+
+#[test]
+fn a_torn_enter_marks_the_pane_and_later_sends_refuse_until_force_resolves_it() {
+    let stub = stub();
+
+    // First send tears between paste and Enter: the stub makes every
+    // send-keys fail. The runner retries Enter once, then stamps the torn
+    // marker and reports loudly.
+    fs::write(&stub.enter_fails, "").unwrap();
+    let torn = send(&stub, "running", "opus");
+    assert!(
+        !torn.status.success(),
+        "a torn Enter was reported as delivered: {}",
+        String::from_utf8_lossy(&torn.stdout)
+    );
+    let complaint = String::from_utf8_lossy(&torn.stderr).into_owned();
+    assert!(complaint.contains("DELIVERY TORN"), "{complaint}");
+    assert!(
+        complaint.contains("alder-ext-work-hm") && complaint.contains("Unsubmitted text"),
+        "the torn diagnostic does not name the session and the residue: {complaint}"
+    );
+    let after_tear = calls(&stub);
+    assert_eq!(
+        after_tear
+            .lines()
+            .filter(|call| call.starts_with("send-keys"))
+            .count(),
+        2,
+        "Enter was not retried exactly once: {after_tear}"
+    );
+    assert!(
+        after_tear.contains("set-environment -t =alder-ext-work-hm ALDER_EXT_RUNNER_TORN 1"),
+        "the torn marker was not stamped on the session: {after_tear}"
+    );
+    assert!(stub.torn.exists(), "the stub recorded no torn marker");
+
+    // Enter works again, but the pane still holds unsubmitted text: the next
+    // send refuses before pasting anything.
+    fs::remove_file(&stub.enter_fails).unwrap();
+    let refused = send(&stub, "running", "opus");
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("holds unsubmitted text"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let after_refusal = calls(&stub);
+    assert_eq!(
+        after_refusal
+            .lines()
+            .filter(|call| call.starts_with("load-buffer"))
+            .count(),
+        1,
+        "the refused send still pasted at the dirty pane: {after_refusal}"
+    );
+
+    // --force delivers anyway; its Enter lands, which submits the residue
+    // along with this message and clears the marker.
+    let forced = send_with(&stub, "running", "opus", &["--force"]);
+    assert!(
+        forced.status.success(),
+        "--force did not deliver: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&forced.stdout).contains("sent once to alder-ext-work-hm"),
+        "{}",
+        String::from_utf8_lossy(&forced.stdout)
+    );
+    assert!(
+        !stub.torn.exists(),
+        "a delivered --force send left the torn marker behind"
+    );
+    assert!(
+        calls(&stub).contains("set-environment -u -t =alder-ext-work-hm ALDER_EXT_RUNNER_TORN"),
+        "{}",
+        calls(&stub)
+    );
+}
+
+#[test]
+fn a_pane_that_cannot_prove_a_running_engine_is_refused_not_pasted_at() {
+    let stub = stub();
+    // No engine marker at all: a session of unknown provenance. Fail-safe is
+    // to never paste at a pane that cannot prove an engine is listening.
+    let output = send(&stub, "", "opus");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot prove an engine is running"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = calls(&stub);
+    assert!(
+        !calls.lines().any(|call| call.starts_with("set-buffer")
+            || call.starts_with("load-buffer")
+            || call.starts_with("paste-buffer")
+            || call.starts_with("send-keys")),
+        "an unproven engine received a delivery: {calls}"
+    );
 }
 
 #[test]

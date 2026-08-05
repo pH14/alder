@@ -127,8 +127,10 @@ Firing is strictly ordered:
 
 Nothing else. The command exits; whatever it caused to be appended moves the
 head, and the next poll sees it. Two daemons pointed at one log at worst run
-duplicate wakes, which cost nothing for the same reason a crash costs
-nothing.
+duplicate wakes, and a duplicate wake is safe because the runner's `start`
+serializes per handle behind an exclusive lock and refuses while an execution
+is live — the second wake refuses rather than doubling or disturbing the
+first.
 
 Trigger kinds are provenance, never scope: a command run for `due` still has
 to read the complete state, because the driver cannot know what else changed
