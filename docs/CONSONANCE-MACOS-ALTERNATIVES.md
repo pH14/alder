@@ -1,158 +1,170 @@
 # Consonance on macOS / Apple Silicon (M3+): Alternatives Design Memo
 
-Status: **v2**, for review. v1 written 2026-08-06 from the task brief plus
-Apple-documentation verification; v2 same day, after cross-review against an
-independent second memo (GPT-authored) that had two sources this session did
-not: the Consonance repo itself (including the retained
-`spike/as2h-host-count` branch at `500f95d` and bead `hm-ssz`) and the local
-macOS 26.4.1 SDK headers. §0.1 lists what changed and why; §9 records the
-full adjudication — what was accepted, what was rejected, and the reasons.
+Status: **v3**, for review. v1 2026-08-06 (task brief + Apple-doc
+verification); v2 same day after cross-review against an independent memo
+with repo + SDK access; v3 same day after a second round of that
+cross-review, which corrected two real defects in the B design (dynamic-PC
+uniqueness under uninstrumented assembly; the x28 register choice), updated
+the kpc history (the EL-filtered leg *was* run — guest-blind), and split B
+into a correctness baseline (B0) and an optimized fast path (B1). §0.1 has
+the change log; §9 has the full accept/reject adjudication for both rounds.
 
-Evidence labels: [VERIFIED-DOC] checked against Apple's online documentation
-on 2026-08-06 (§8); [SDK] cited by the cross-review memo from the local
-macOS 26.4.1 SDK headers, re-verify in CI against our own SDK; [REPO-EVID]
-measured results retained in the Consonance repo (spike branch / beads);
-[XNU] cited to apple-oss-distributions/xnu at commit `f6217f89…`, re-verify
-against the shipping release; [CITED] third-party shipping source; [MEASURE
-M-nn] on-hardware only, ledger in §7. Where a design names a counter, event,
-or mechanism, that exact one is meant; no silent substitution.
+Evidence labels: [VERIFIED-DOC] checked against Apple's online docs
+2026-08-06 (§8); [SDK] cited from the local macOS 26.4.1 SDK headers by the
+cross-review, re-verify in CI; [REPO-EVID] measured results retained in the
+Consonance repo (spike branch commits `500f95d`, `8501faa1`; bead `hm-ssz`);
+[XNU] apple-oss-distributions/xnu at `f6217f89…`, re-verify against
+shipping; [LINUX] torvalds/linux mainline source; [ARM] Arm architecture
+documentation; [CITED] third-party shipping source; [MEASURE M-nn]
+on-hardware only, ledger §7. Where a design names a counter, event, or
+mechanism, that exact one is meant; no silent substitution.
 
 ---
 
 ## 0. Verdict
 
-There is **no credible hardware work-clock path** on shipping macOS for
-M3-or-later — this is now supported by measurement, not just absence of API.
-There **are** two credible software paths that preserve the bit-identical
-contract, and the two memos converged on them independently:
+No credible hardware work-clock path exists on shipping macOS for
+M3-or-later — now supported by measurement on both counter banks, not just
+absence of API. Two software paths preserve the bit-identical contract, and
+three independent review rounds have converged on them:
 
-1. **Primary spike — Alternative B, guest software work clock (`SW_EDGE_v1`)
-   on direct-EL1 Hypervisor.framework.** The work clock is architectural
-   guest state maintained by our owned toolchain in every executable guest
-   component; deadlines fire as guest-initiated `HVC` (EL1) / `SVC→HVC`
-   (EL0) exits — exact, overshoot-impossible, wall-clock-free. The debug
-   architecture is *not* on the correctness path (changed from v1). Public
-   API only; `com.apple.security.hypervisor` entitlement; no root, no SIP
-   change. Estimated 1.2–5× [MEASURE M-01]; correctness never traded for
-   the estimate — miss the envelope and the tier demotes, the contract
-   stays.
+1. **Primary — Alternative B: a guest-carried software work clock on
+   direct-EL1 Hypervisor.framework**, now split into:
+   - **B0, the correctness baseline:** a versioned clock (`SW_EDGE_v1`)
+     checked at *every* validated chunk with an NZCV-neutral three-
+     instruction sequence ending in a reserved `BRK`; the authoritative
+     stop is the `BRK` itself, before the chunk's first original
+     instruction. No single-step dependency, no sparse-gap reasoning, no
+     flag-liveness proof. Budget state in always-resident per-vCPU memory
+     (or an audited register — explicitly *not* `x28`; see §3B).
+   - **B1, the optimized sparse-guard path (only after B0 passes):** an
+     absolute site counter plus a guard graph with a mechanically proven
+     maximum gap, armed so the first `BRK` provably lands at `work < W`,
+     then qualified single-step to `work == W`. If Apple's step behavior
+     fails qualification, B1 dies and B0 survives.
+   Public API only; `com.apple.security.hypervisor`; no root, no SIP
+   change. Performance: **"credible low-overhead research path"** — no
+   ratio is claimed until the full instrumented Linux image is measured
+   (M-01); the planning envelope stays 1.2–5× with demote-don't-relax.
+2. **Parallel fallback — E1: deterministic x86-64 TCG** with an exact
+   translated `BR_INST_RETIRED.CONDITIONAL` clock; ~10–100×; no Apple
+   virtualization surface at all.
 
-2. **Parallel fallback — Alternative E1, deterministic x86-64 TCG with an
-   exact translated `BR_INST_RETIRED.CONDITIONAL` clock.** Reuses the
-   existing x86-64 guest, machine contract, and film format; needs no Apple
-   virtualization surface at all; ~10–100×. Its slow path can start in
-   parallel because it is independent of everything Apple.
+Closed or demoted: **A** (kpc/kperf) is a measured NO-GO on both banks —
+configurable counters guest-blind across all EL masks, fixed counters
+unfilterably contaminated [REPO-EVID] — leaving only a half-day corrected
+RAWPMU probe, now with the added gate that RAWPMU must demonstrate exact
+guest-only counting *before* any PMI/period test is worth running. **C**
+(debug stepping) is B1's landing primitive and a slow oracle behind its
+hardware gate. **D** (vEL2 sans PMU) closed by construction. **F**
+(replay-only) folds into B/E with a sharpened contract: portable films
+require software-authoritative V-time on *both* platforms (§3F). **G**
+(Asahi bare metal) adjacent, not macOS, M3/M4 PMU still TBA.
 
-Closed or demoted:
+### 0.1 Change log
 
-- **Host kpc/kperf (A): strong NO-GO as an architecture.** Retained M4
-  measurements show the tested configurable counters are **guest-blind**
-  (constant 74/312 regardless of guest work) while the fixed counters carry
-  the guest slope but with **unfilterable** kernel contamination — current
-  XNU hardwires fixed counters to count all modes and exposes no privilege
-  filter for them [REPO-EVID][XNU]. One corrected RAWPMU/force-all probe
-  (the prior probe had an ordering flaw) is worth **half a day** on an
-  already-rooted M4, no more. v1 ranked this as spike #2; that is
-  withdrawn.
-- **Debug-architecture-only (C):** oracle / slow replay engine, gated on
-  one hardware question (exact one-retired-instruction stepping); also the
-  landing subroutine inside B's debug workflows. Not a product path.
-- **vEL2 without a PMU (D):** closed by construction — trap ordinal is not
-  a work clock; every viable variant reduces to B or C.
-- **Replay-only (F):** not a fourth mechanism; replay still needs an
-  authoritative position clock, so it folds into B (shared `SW_EDGE_v1`),
-  E (TCG), or C.
-- **Linux bare metal on M-series (G):** adjacent, leaves macOS, and not
-  ready on M3/M4 (PMU support marked TBA in Asahi's feature tables
-  [CITED]).
+v1 → v2 (first cross-review round): kpc withdrawn as a spike (guest-blind
+configurable bank, unfilterable fixed bank [REPO-EVID][XNU]); B's deadline
+carrier moved off the debug channel onto HVC/SVC; LL/SC excluded (exclusive-
+monitor clearing); pending-IRQ per-run clearing ⇒ software latch [SDK];
+WFI/WFE compiled out; fail-closed negative tests; E split into x86-64
+product fallback (film-compat) + arm64 oracle; clock-carrier A/B opened.
 
-### 0.1 What changed v1 → v2
+v2 → v3 (second round):
 
-1. **A is dead as a spike.** v1's EL-filter hypothesis assumed (i) the
-   configurable counter bank sees guest execution and (ii) fixed counters
-   are kpc-filterable. Repo evidence refutes (i) on M4; XNU's
-   `monotonic_arm64.c` refutes (ii) (fixed counters hardwired to all modes,
-   owned by monotonic, not kpc config) [REPO-EVID][XNU]. The two xnu
-   readings reconcile: the `CFGWORD_EL*EN` filter words v1 cited do exist
-   in the kpc configurable path — they are moot if that bank never counts
-   the guest. Replaced by a half-day corrected closure probe (§5.3).
-2. **B's correctness carrier moved off the debug channel.** v1 fired
-   deadlines via `BRK` + `hv_vcpu_set_trap_debug_exceptions`. v2 fires them
-   as branches to an `HVC` thunk at EL1 and `SVC` into a patched IRQ-masked
-   EL1 trampoline at EL0. Only architecturally guaranteed synchronous traps
-   remain on the kill path; debug exceptions are demoted to debug/landing
-   workflows and an optional measured optimization (M-03 is no longer
-   kill-relevant for record/replay).
-3. **New closure obligations adopted into B:** LL/SC excluded (host exits
-   and debug operations can clear the exclusive monitor and change retry
-   paths — a determinism leak v1 missed); LSE-only builds enforced by
-   audit. Pending IRQ state is cleared after each `hv_vcpu_run` [SDK], so
-   injection uses a software latch reasserted every entry until acceptance.
-   WFI/WFE are compiled out in favor of deterministic idle hypercalls
-   (v1's WFE-invisibility analysis is kept as defense-in-depth, not load-
-   bearing). Negative tests (fail-closed on uninstrumented edges, forbidden
-   encodings, W^X violations, raw WFI) added to the acceptance floor.
-4. **Clock-state variant question opened honestly:** v1's reserved-register
-   monotonic counter vs the cross-review's memory-backed countdown. Each
-   has a named hazard (restore-path clobber vs non-atomic-RMW erasure).
-   Day-one payload A/Bs both (§3B, §9-R2).
-5. **E split into E1/E2.** E1: x86-64 TCG as the product fallback with an
-   exact `BR_INST_RETIRED.CONDITIONAL` translated clock — film-compatible
-   with the Intel backend, which v1's arm64-oracle framing missed. E2:
-   arm64 TCG icount retained as the cheap differential oracle for B
-   payloads. Stock icount and stock QEMU record/replay are explicitly *not*
-   the clock/contract (§3E).
-6. **Perf envelope for B widened** from v1's 1.1–1.4× to 1.2–5× pending
-   M-01, with the demote-don't-relax rule adopted.
-7. Inventory additions [SDK]: per-run-cleared pending interrupts; opaque
-   GIC state save/restore that may legitimately fail to restore across OS
-   versions (reinforces v1's decision to avoid the vGIC); a PMU-access
-   trap configuration surface in the macOS 26 SDK's `hv_vm_config.h`
-   (upgrades v1's M-04 from "hope it traps" to "configure it and verify").
-8. Terminology aligned to the repo: recordings are **films**; the new unit
-   is named and versioned (`SW_EDGE_v1`) and is never described as, or
-   converted to, hardware `BR_RETIRED`. Films made with hardware clocks
-   and films made with `SW_EDGE_v1` are distinct artifacts; where both
-   clocks are carried, both are logged, and each side lands on its own.
+1. **B split into B0/B1.** v2's single design mixed two sound formulations
+   (quantized injection at guard sites; exact landing via arm-early + step)
+   in a way that invited misreading and hid the proof obligations. B0 makes
+   the per-chunk check universal and the `BRK` authoritative; B1 carries
+   the sparse-guard optimization with its guard-graph and `work < W`
+   invariants stated as host-checked assertions.
+2. **Dynamic-position uniqueness corrected.** v2 claimed (W, PC) names a
+   unique dynamic instruction while permitting uninstrumented assembly.
+   False as stated: an uninstrumented loop revisits its PC with the clock
+   frozen. New invariant, mechanically verified on final binaries: **every
+   executable cycle contains an instrumentation site** — including entry
+   assembly, vDSO, usercopy, crypto, and handwritten userspace. Moments
+   are named by versioned **site ID + phase**, not raw PC.
+3. **Register choice corrected.** v2 nominated `x28`; arm64 Linux uses
+   `x28` as the kernel `tsk` alias throughout `entry.S`, and entry/exit,
+   `cpu_switch_to`, signal return, and ptrace save/replace/restore it
+   [LINUX]. `-ffixed-x28` on C code does not touch any of that. Carrier
+   baseline is per-vCPU always-resident memory; a register carrier is an
+   optimization chosen only after auditing the exact kernel configuration
+   (re-aliasing `tsk` is a small owned-kernel patch, but it is a patch,
+   with a post-link verifier obligation either way).
+4. **NZCV handling corrected.** v2's `cmp`-based check relied on
+   pass-verified flag liveness. The sharper problem is epistemic: a
+   liveness bug miscompiles *deterministically*, so dual-run comparison
+   cannot see it. Default check is now NZCV-neutral
+   (non-flag-setting `SUB` + `CBNZ`); the semantic oracle in the
+   acceptance harness is the **uninstrumented** program's semantics, not
+   another instrumented run.
+5. **Carrier decision re-opened as a gate.** Round 1 pushed the deadline
+   carrier off `BRK` onto HVC/SVC; round 2 argues `BRK` back in (precise,
+   unmaskable, EC 0x3C with immediate in ESR, routed outward under
+   `MDCR_EL2.TDE` [ARM][VERIFIED-DOC]). Resolution: the carrier is a
+   day-one *measured choice* — `BRK` preferred if its gate passes
+   (uniform EL0/EL1, no kernel transit), `HVC`/`SVC→HVC` the standing
+   fallback. Consequence either way: with debug trapping enabled, **all**
+   guest debug exceptions route to the host, and Hypervisor.framework has
+   no public synchronous-exception injection — guest self-debugging
+   (ptrace step, hw breakpoints, kprobes, BRK-based WARN/BUG) is forbidden
+   initially or manually synthesized into guest EL1 by the VMM.
+6. **kpc history corrected.** The EL-filtered leg was *not* "never run":
+   commit `8501faa1` ran it as root on M4/macOS 26.5 — configurable
+   `INST_BRANCH` fixed at 74 for guest loops of 0, 10⁶, and 10⁷ branches
+   across EL0, EL1, and EL0|EL1 masks; `INST_ALL` fixed at 312; the fixed
+   instruction counter simultaneously tracked the guest work [REPO-EVID].
+   Whatever the physical EL arrangement, XNU/hvf disables or swaps
+   configurable PMCs across guest entry. PMI remains untested but cannot
+   rescue a guest-blind counter; probe order updated accordingly (§5.3).
+7. **Portable-film contract sharpened (§3F):** identical fully
+   instrumented image on both platforms; software work authoritative for
+   guest-visible V-time on both; hardware PMU demoted to
+   accelerator/oracle; existing uninstrumented films are not portable.
+8. **Identity handling corrected:** `hv_vcpu_config_get_feature_reg` is a
+   getter [SDK `hv_vcpu_config.h`] — a platform fingerprint *detects*
+   incompatibility, it does not sanitize. The owned guest compiles in a
+   fixed feature contract and never reads host ID registers; the VMM
+   refuses record/replay on fingerprint mismatch.
+9. Performance claims demoted: no ratio asserted until the full
+   instrumented Linux image is measured (hand loops over-represent
+   instrumentation); v1's 1.1–1.4× is withdrawn as unsubstantiated.
 
 ---
 
 ## 1. Ground rules
 
-The two properties any design must carry, verbatim from the program:
+- **P1 (no nondeterministic results):** every guest-visible
+  nondeterministic result (time, entropy, identity, counters) is trapped
+  or made unreachable and replaced by a deterministic value.
+- **P2 (exact async injection):** every asynchronous event is injected at
+  an exact, reproducible point in guest work — never at wall-clock time.
 
-- **P1 (no nondeterministic results):** every guest-visible nondeterministic
-  result (time, entropy, identity, counters) is trapped or made unreachable
-  and replaced by a deterministic value.
-- **P2 (exact async injection):** every asynchronous event is injected at an
-  exact, reproducible point in guest work — never at wall-clock time.
-
-Binding constraints: bit-identical is never relaxed; cooperative guest
-(owned kernel, userspace, toolchain) allowed; shipping Apple software only,
+Binding constraints: bit-identical never relaxed; cooperative guest (owned
+kernel, userspace, toolchain) allowed; shipping Apple software only,
 privilege posture stated per design; "unsupported" is a result.
 
-Established facts carried forward:
+Established facts:
 
-- E1. vEL2 on M4/macOS 26.5 advertises `PMCR_EL0.N = 0`, no `PMICNTR`
-  [ESTABLISHED, `docs/APPLE-SILICON.md`].
-- E2. Plain-EL1 exit vocabulary is CANCELED / EXCEPTION / VTIMER_ACTIVATED
-  / UNKNOWN [VERIFIED-DOC][SDK `hv_vcpu_types.h`]; `hv_vcpus_exit` is an
-  immediate kick, not a deadline [SDK `hv_vcpu.h`]; `CNTVCT_EL0` =
-  `mach_absolute_time() − offset` — epoch movable, slope not
-  [SDK][VERIFIED-DOC `hv_vcpu_set_vtimer_offset` ≙ `CNTVOFF_EL2`].
-- E3 (updated). Host-side counting on M4/macOS 26.5, from the retained
-  spike branch [REPO-EVID]: configurable `INST_BRANCH` constant at 74 and
-  `INST_ALL` at 312 across varying guest loop sizes (guest-blind);
-  fixed instruction counter guest-sloped but with state-dependent +8,
-  +73/74, +82 and rare async host/kernel contributions (guest-inclusive,
-  contaminated, unfilterable). `thread_selfcounts` is a private read-only
-  SPI (`bsd/sys/resource_private.h` [XNU]) usable without root but
-  unfilterable — a heuristic, never a position authority.
-- E4. The silicon counts precisely (rr on M1/M2 under Linux, Apple
-  taken-branch event 0x90). The gap is Apple's software surface. Event IDs
-  are microarchitecture/database-specific: never carry an event number
-  across M-generations without resolving it from that machine's kpep
-  database and logging the database hash.
+- E1. vEL2 on M4/macOS 26.5: `PMCR_EL0.N = 0`, no `PMICNTR`
+  [ESTABLISHED].
+- E2. Plain-EL1 exits: CANCELED / EXCEPTION / VTIMER_ACTIVATED / UNKNOWN
+  [VERIFIED-DOC][SDK]; `hv_vcpus_exit` immediate kick [SDK]; `CNTVCT_EL0`
+  = `mach_absolute_time() − offset`, epoch not slope [SDK][VERIFIED-DOC].
+- E3 (final form). Host-side counting on M4/macOS 26.5 [REPO-EVID,
+  `500f95d` + `8501faa1`, bead `hm-ssz`]: configurable counters
+  guest-blind (constants 74/312 independent of guest work, across EL0 /
+  EL1 / EL0|EL1 masks — the EL-filter leg *was* run); fixed counters
+  guest-inclusive but contaminated (+8, +73/74, +82, rare async) and
+  hardwired all-modes with no filter [XNU `monotonic_arm64.c`]; RAWPMU
+  enumeration flawed in the retained probe (queried before
+  `kpc_force_all_ctrs_set(1)`) — genuinely unknown, probe §5.3.
+- E4. The silicon counts precisely (rr on M1/M2 under Linux, event 0x90).
+  Event IDs are per-microarchitecture/database; never carried across
+  M-generations without resolving from that machine's kpep database and
+  logging its hash.
 
 ---
 
@@ -160,306 +172,278 @@ Established facts carried forward:
 
 ### 2.1 Hypervisor.framework, plain-EL1 guest (substrate for B, C, F)
 
-Privilege posture for this whole subsection: ordinary signed process with
-`com.apple.security.hypervisor` — "required to use the Hypervisor APIs in
-any process" [VERIFIED-DOC], macOS 11.0+. No root, no SIP change. Real
-product posture.
+Posture: ordinary signed process, `com.apple.security.hypervisor`
+("required to use the Hypervisor APIs in any process" [VERIFIED-DOC]),
+macOS 11.0+. No root, no SIP change.
 
 | Facility | Surface | Carries | Notes |
 |---|---|---|---|
-| Run/exit loop | `hv_vcpu_run`; exits CANCELED / EXCEPTION / VTIMER_ACTIVATED / UNKNOWN [VERIFIED-DOC][SDK] | execution substrate | no PMU/work exit exists |
-| Synchronous traps | `hv_vcpu_exit_exception_t { syndrome, virtual_address, physical_address }` [VERIFIED-DOC] | **P2 carrier**: `HVC`/`SVC`-driven doorbells; MMIO exits; fault-driven dirty tracking | guest `HVC` arrives as EXCEPTION with `EC_AA64_HVC` — the PSCI conduit every hvf VMM uses [CITED: QEMU `target/arm/hvf/hvf.c`]; exact syndrome path day-one confirm [M-18] |
-| Debug traps | `hv_vcpu_set_trap_debug_exceptions` ("debug exceptions exit the guest… equivalent is `MDCR_EL2.TDE`") [VERIFIED-DOC]; `MDSCR_EL1`, `DBGB/W{V,C}R0–15_EL1`, `SPSR_EL1`, `ELR_EL1` in `hv_sys_reg_t` [VERIFIED-DOC] | debug/landing workflows only (v2) | Apple documents **no** "exactly one retired instruction" contract [SDK]; gate M-03 before any authoritative use |
-| Interrupts | `hv_vcpu_set_pending_interrupt` (IRQ/FIQ) [VERIFIED-DOC] | **P2 delivery** | pending state cleared after each `hv_vcpu_run` [SDK `hv_vcpu.h`]: VMM keeps a deterministic software latch, reasserts every entry until guest acceptance |
-| Timer | `hv_vcpu_set_vtimer_offset` / `_mask` [VERIFIED-DOC] | nothing deterministic | epoch only; VTIMER_ACTIVATED used, if at all, as an invisible pacing stop |
-| Guest counter control | `HV_SYS_REG_CNTKCTL_EL1` accessible [VERIFIED-DOC] | **P1**: owned kernel traps guest-EL0 counter reads to itself, serves V-time | |
-| PMU access | no PMU regs in `hv_sys_reg_t` [VERIFIED-DOC]; macOS 26 SDK `hv_vm_config.h` exposes PMU-access trap configuration [SDK] | **P1**: PMU unreachable, now configurable rather than assumed | verify trap-vs-undef behavior [M-04] |
-| Memory | `hv_vm_map/unmap/protect` [VERIFIED-DOC] | snapshot/restore; software dirty log via write-protect faults | no public dirty log — speed gap, not correctness [M-19 for `hv_vm_protect` fault behavior] |
-| Kick | `hv_vcpus_exit` → CANCELED [VERIFIED-DOC][SDK] | stop-look-resume only | must be semantically invisible [M-11]; **never** an injection point |
-| GIC | `hv_gic_create` (GICv3, macOS 15+) [VERIFIED-DOC]; opaque state save/restore may legitimately fail across software versions [SDK `hv_gic_state.h`] | — | deliberately unused: PV event controller + IRQ-pin latch instead; if ever used, fail closed on restore incompatibility |
-| ID/feature regs | `hv_vcpu_config_get_feature_reg` [VERIFIED-DOC] | platform fingerprint in snapshots | |
+| Run/exit loop | `hv_vcpu_run`; 4 exit reasons [VERIFIED-DOC][SDK] | substrate | no PMU/work exit |
+| Synchronous traps | `hv_vcpu_exit_exception_t { syndrome, virtual_address, physical_address }` [VERIFIED-DOC] | **P2**: doorbells, MMIO, fault-driven dirty tracking | `HVC` → `EC_AA64_HVC` (PSCI conduit precedent) [CITED: QEMU hvf]; `BRK` → EC 0x3C, immediate in ESR, precise and unmaskable [ARM], routed outward under debug trapping ≙ `MDCR_EL2.TDE` [VERIFIED-DOC]; both carriers gated day-one [M-18, M-22] |
+| Debug traps | `hv_vcpu_set_trap_debug_exceptions` [VERIFIED-DOC]; `MDSCR_EL1`, `DBGB/W{V,C}R0–15_EL1`, `SPSR_EL1`, `ELR_EL1` [VERIFIED-DOC] | B0 carrier candidate (`BRK`); B1 stepping; debug workflows | **all** guest debug exceptions route outward when enabled; no public synchronous-exception injection ⇒ guest self-debug forbidden or VMM-synthesized (§3B); no documented one-retired-instruction contract [SDK] ⇒ gate M-03 |
+| Interrupts | `hv_vcpu_set_pending_interrupt` [VERIFIED-DOC]; pending cleared after each run [SDK] | last-resort delivery only | baseline is synchronous PV dispatch at stops; the hardware pin is gated on acceptance-point determinism [M-20] and never left pending across instrumentation |
+| Timer | `hv_vcpu_set_vtimer_offset`/`_mask` [VERIFIED-DOC] | nothing deterministic | epoch only; VTIMER exits at most invisible pacing stops |
+| Guest counter control | `HV_SYS_REG_CNTKCTL_EL1` [VERIFIED-DOC] | **P1** | owned kernel traps guest-EL0 counter reads to itself |
+| PMU access | no PMU regs in `hv_sys_reg_t` [VERIFIED-DOC]; PMU-access trap config in macOS 26 `hv_vm_config.h` [SDK] | **P1** | configure trap + audit absence [M-04] |
+| Memory | `hv_vm_map/unmap/protect` [VERIFIED-DOC] | snapshot; SW dirty log via write-protect faults | no dirty log — speed, not correctness [M-19] |
+| Kick | `hv_vcpus_exit` → CANCELED | stop-look-resume only | invisibility gate [M-11]; never an injection point |
+| GIC | `hv_gic_create` [VERIFIED-DOC]; opaque state, restore may fail across versions [SDK `hv_gic_state.h`] | — | unused; PV event controller instead |
+| ID/feature regs | `hv_vcpu_config_get_feature_reg` — **getter** [SDK `hv_vcpu_config.h`] | fingerprint = refusal check only | guest never reads host ID regs; fixed feature contract compiled in |
 
 ### 2.2 Virtual EL2 (macOS 15+, M3+)
 
-`hv_vm_config_set_el2_enabled` [VERIFIED-DOC, macOS 15.0+; M3+ hardware].
-No PMU behind it (E1). Each vEL1→vEL2 trap multiplies exit cost through
-Apple's NV-style emulation [M-05]. See §3D: without a work source of its
-own it cannot be a clock; with one it is redundant. Closed except as a
-possible future single-step accelerator (§3C) or if Apple ships a nested
-PMU (§6).
+`hv_vm_config_set_el2_enabled` [VERIFIED-DOC]. No PMU behind it (E1);
+multiplied trap cost [M-05]; youngest emulation surface. Closed except as
+a possible C-accelerator (§3C) or if Apple ships a nested PMU (§6).
 
-### 2.3 Host performance counters — now measured, and negative
+### 2.3 Host performance counters — measured, negative
 
-What v1 treated as open hypotheses, the retained spike resolves [REPO-EVID],
-and XNU source explains [XNU]:
-
-- **Configurable kpc counters are guest-blind on the tested M4**: constants
-  (74 / 312) independent of guest work. The EL-filter config words exist in
-  the kpc configurable path, but a bank that never counts guest execution
-  has nothing to filter.
-- **Fixed counters are guest-inclusive but unfilterable**: owned by the
-  monotonic subsystem, hardwired to count all modes
-  (`osfmk/arm64/monotonic_arm64.c`), with no privilege filter; RAWPMU's
-  exposed register list does not include fixed-counter `PMCR1`
-  (`osfmk/arm64/kpc.c`). The observed +8/+73/74/+82 contamination therefore
-  **cannot be excluded by any current configuration**, root or not.
-- **Privilege**: kpc ownership is root or a root-blessed PID
-  (`bsd/kern/kern_kpc.c`, `osfmk/kperf/kperfbsd.c`, `bsd/kern/kern_ktrace.c`);
-  the private-entitlement bypass is compiled for development/debug kernels,
-  not release [XNU]. SIP posture: unrecorded in the spike — unknown, do not
-  claim [M-07].
-- **One genuine loose end**: the prior RAWPMU probe read configuration
-  before `kpc_force_all_ctrs_set(1)`; XNU can hide RAWPMU config until
-  force-all is held, so "RAWPMU 0/0" is a probe flaw, not evidence. The
-  corrected probe (§5.3) is the only thing left to run, capped at half a
-  day. The ARM kpc PMI reload path appears to reload configurable counters
-  only — a successful generic `kpc_set_period` return must not be read as
-  fixed-counter PMI support [XNU].
-
-`thread_selfcounts`: private SPI, read-only, current-thread, may return
-`ENOTSUP`, includes charged kernel work — heuristic only (E3).
+Full statement in E3. Consequences: no EL mask, no root posture, and no
+private framework makes the configurable bank see the guest on the tested
+system; the guest-inclusive fixed bank cannot be filtered by any current
+configuration [XNU]; kpc privilege is root/blessed-PID with the
+entitlement bypass compiled for development kernels [XNU];
+`thread_selfcounts` is a private read-only unfilterable SPI
+[XNU `resource_private.h`] — heuristic only. Sole remaining question:
+RAWPMU after `kpc_force_all_ctrs_set(1)` (§5.3).
 
 ### 2.4 Structural absences
 
-No `perf_event_open` analogue; no public per-thread PMI with delivery
-contract; no work-deadline run; no dirty log; no guest PMU; no counter
-slope control; no documented exact single-step retirement contract;
-Virtualization.framework has no vCPU surface at all.
+No `perf_event_open` analogue; no per-thread PMI delivery contract; no
+work-deadline run; no dirty log; no guest PMU; no counter-slope control;
+no exact single-step retirement contract; no synchronous-exception
+injection; Virtualization.framework has no vCPU surface.
 
 ---
 
 ## 3. Alternatives
 
-Tiers: **T0** ≤1.4× native-virt, **T1** 1.4–3×, **T2** 3–100×, **T3**
->10³×. All figures are planning envelopes until measured.
+Tiers: **T0** ≤1.4×, **T1** 1.4–3×, **T2** 3–100×, **T3** >10³×.
+Planning envelopes, not measurements.
 
-### B. Guest software work clock (`SW_EDGE_v1`) on direct-EL1 HVF  ← primary
+### B. Guest software work clock (`SW_EDGE_v1`) — primary, in two stages
 
-The inversion that dissolves the Apple dependence: stop asking the host to
-observe guest work; make the guest carry its work clock as architectural
-state. macOS then only needs to (a) run the guest, (b) deliver synchronous
-`HVC`/`SVC`-class exits at exact instruction boundaries — architecturally
-guaranteed — and (c) let us read/write guest state at stops. All three are
-public and verified (§2.1).
+The inversion: stop asking the host to observe guest work; make the guest
+carry its clock as architectural state. macOS then only has to run the
+guest, deliver synchronous exits precisely, and expose guest state at
+stops — all verified public surface (§2.1).
 
-- **Unit.** `SW_EDGE_v1` = entry into a validated instrumented execution
-  chunk (basic-block-grained; a pass-enforced bound K on sites between
-  consecutive deadline checks). Versioned, named, never described as or
-  converted to hardware `BR_RETIRED`. V-time = f(SW_EDGE) — the same
-  pure-function contract as `docs/PARAVIRT-CLOCK.md`, new unit. The
-  instrumentation instructions are outside the logical clock; films bind to
-  the exact guest image hash (already true of every backend).
-- **Clock state — two candidate carriers, A/B'd on day one (§5.1):**
-  - *Reserved-register monotonic* (v1): `x28` counter, `add x28, x28, #1`
-    per chunk — single-instruction, interrupt-atomic, readable at any stop
-    including CANCELED pauses; `x27` threshold. Hazard: every guest
-    context-restore path (signal frames, `switch_to`, `setcontext`,
-    `ptrace`, exception return) must be patched/audited to never restore
-    stale x27/x28 [owned-kernel patch list; violations caught structurally
-    by the differential harness].
-  - *Memory-backed countdown* (cross-review): per-vCPU `remaining` cell,
-    fixed always-mapped VA in every address space. Hazard (named here
-    because the cross-review's sketch omits it): a naive
-    `ldr/sub/str` is not atomic against interposed instrumented exception
-    handlers — the write-back deterministically erases handler work and can
-    clobber a host-installed deadline. The update must be single-copy
-    atomic (LSE `ldadd`-class) or provably unpreemptable at every site.
-  Either carrier passes or fails the same oracle; pick by evidence, not
-  taste.
-- **Deadline firing (correctness path — no debug architecture).** At each
-  check site: decrement/compare; on zero/threshold, EL1 branches to an
-  `HVC` thunk; EL0 branches to an `SVC` stub entering a patched,
-  IRQ-masked EL1 trampoline that immediately executes `HVC`. Host receives
-  EXCEPTION/`EC_AA64_HVC` [CITED; syndrome path day-one, M-18], reads the
-  exact position, updates the V-time page, installs events, resumes at the
-  continuation label. Overshoot is impossible by construction: the deadline
-  is *reached by the guest*, not delivered to it. `BRK`-to-host from EL0
-  (skipping the kernel transit) is a measured optimization behind M-03,
-  never the baseline.
-- **Injection (P2).** Only at deadline stops and synchronous traps. Either
-  the cooperative kernel dispatches the event synchronously from the
-  doorbell, or the VMM sets a software pending latch and reasserts
-  `hv_vcpu_set_pending_interrupt` on every entry until the guest accepts
-  [SDK per-run clearing]. PV event controller (shared-memory bitmap + IRQ
-  pin) instead of the vGIC; GIC opaque-state restore risk avoided entirely.
-  No asynchronous host kick participates in correctness; CANCELED pauses
-  are invisible stops [M-11].
-- **P1 inventory** (each source, its carrier): guest-EL0 counter reads
-  trapped *inside the guest* via `CNTKCTL_EL1.EL0{V,P}CTEN=0`
-  [VERIFIED-DOC reg access]; kernel-side `CNTVCT/CNTPCT/CNTVCTSS` reads
-  made unreachable — no arch-timer clocksource, link-time encoding audit
-  over every executable image; vDSO serves V-time only; PMU access
-  configured to trap [SDK, M-04] *and* absent from the image by audit;
-  RNDR expected absent on M-silicon [M-12] and forbidden by audit
-  regardless; entropy via virtio-rng from the seeded monitor; identity
-  (`MIDR/MPIDR`) pinned where settable (MPIDR is [VERIFIED-DOC]; MIDR
-  M-13) else recorded in the platform fingerprint; PAC disabled in the
-  owned kernel (IMPDEF QARMA out of guest-visible state); **WFI/WFE
-  compiled out** into deterministic idle hypercalls — idle advances V-time
-  only by the deterministic warp-to-next-deadline policy, never by host
-  time; the event stream is disabled.
-- **Executable closure (what invalidates counts — enforced, not assumed):**
-  boot and exception assembly, vDSO, loader, all userspace, all libraries,
-  and inline assembly are instrumented or statically verified; modules,
-  BPF JIT, userspace JIT, and writable+executable mappings disabled or
-  routed through the same verifier; alternatives/static-key/text-patching
-  disabled or revalidated atomically; signal/context restoration cannot
-  clobber clock state; clock loads/stores permanently resident and
-  unfaultable; **LL/SC excluded — LSE-only builds** (host exits and debug
-  operations can clear the exclusive monitor and change retry paths;
-  `LDXR/STXR` encodings forbidden by the same audit); no instrumentation
-  sequence counts itself. CAS-retry loops remain deterministic on a
-  serialized-vCPU schedule (values change only at injected points).
-- **Exact landing at arbitrary recorded points** (debug/branch workflows,
-  not record/replay correctness): set the deadline to `W − K`, take the
-  guaranteed-undershoot doorbell, then single-step (MDSCR.SS + SPSR.SS,
-  step exits [VERIFIED-DOC surface]) to (SW_EDGE == W, PC == target).
-  Within one W value at most one dynamic instance of any PC exists (every
-  chunk entry is a site), so (W, PC) names a unique instruction instance —
-  this is what makes landing sound where a bare PC breakpoint (which names
-  a PC, not its k-th dynamic visit) is only an accelerator. Gated on M-03;
-  until it passes, landing workflows are served by E2/C-class re-execution.
-- **Snapshot/restore/branch.** At a doorbell boundary: full RAM; all
-  public CPU/system/SIMD-FP/debug registers; clock state (`work`,
-  `remaining`/threshold, next deadline); pending-event latches; device
-  state; input-log cursor; canonical serialized hash. Dirty tracking via
-  `hv_vm_protect` write-protect faults is a later accelerator [M-19];
-  its absence costs speed, not correctness. Branching = restore + a
-  different injected future; requires the same record-capable clock, which
-  B has.
-- **SMP.** One runnable vCPU at a time, quantum-interleaved by work;
-  concurrent host execution of vCPUs would expose nondeterministic memory
-  interleavings and is out of contract (unchanged from other backends).
-- **Privilege posture.** `com.apple.security.hypervisor` only. No root,
-  no SIP change, no private API.
-- **Performance tier.** T0–T1 target, honestly bracketed 1.2–5×
-  [M-01, M-15]; >~5× median / >~10× p99 demotes the tier, never weakens
-  the contract.
-- **Determinism risks.** hvf-injected guest-visible nondeterminism (the
-  §5.1 kill condition); count-integrity bugs in either clock carrier
-  (caught structurally by the dual-run differential); closure gaps
-  (mitigated fail-closed: negative tests must fail); host-side counter
-  phenomena like the M4 +73/74 are irrelevant by construction — the clock
-  is guest state.
-- **Fragility.** Low-to-medium: public documented API, no GIC opaque
-  state, no debug dependence on the correctness path; requalify
-  HVC/interrupt/step behavior per macOS update with the automated gate.
-- **Verdict.** Primary spike (§5.1).
+**Unit and Moments.** `SW_EDGE_v1` = executed validated instrumentation
+sites. A **Moment** (event coordinate in a film) is `(work, site_id,
+phase)` — versioned site IDs from the build, not raw PCs. V-time =
+f(work), per `docs/PARAVIRT-CLOCK.md`, software-authoritative (§3F).
 
-### E. Deterministic emulation (two distinct roles)
+**Site coverage invariant (mechanically verified on final binaries):**
+every executable cycle contains a site — compiled code by the pass;
+handwritten assembly (entry paths, vDSO, usercopy, crypto, string
+routines) by hand-placed sites in every loop; anything unverifiable is
+rejected at image assembly. This is what makes Moments unique and replay
+landings well-defined; v2's allowance of site-free assembly loops was an
+error (§0.1-2).
 
-**E1 — x86-64 TCG/DBT as the product fallback.** Execute the *existing*
-x86-64 Consonance guest and machine contract under single-threaded TCG on
-macOS/arm64 (QEMU supports this host/guest pair [CITED: QEMU build-platform
-and emulation docs]). Stock `icount` is machinery, not the clock: it
-budgets translation-block instructions and is incompatible with
-multithreaded TCG [CITED: QEMU icount docs]. Two honest clock options:
-introduce `TCG_INSN_v1` as a new film coordinate, or — preferred —
-extend the x86 translator so the budget decrements **only** on
-instructions satisfying the pinned `BR_INST_RETIRED.CONDITIONAL` contract,
-with the counter op executing after retirement and forcing an outer-loop
-exit before the next guest instruction at zero. The event-class boundary
-(`Jcc`, `LOOP*`, `JCXZ/JECXZ/JRCXZ`, macro-fusion, faulting/non-retiring
-cases, model errata) must be differentially validated against the
-supported Intel/KVM backend — one unexplained retirement/count/landing
-mismatch kills *film compatibility* (it may proceed under a new named
-clock). Stock QEMU record/replay is explicitly insufficient: it records
-host clocks as nondeterministic inputs and replays them, whereas Consonance
-requires same-seed independent runs to eliminate or seed those values
-[CITED: QEMU replay docs]. Determinism closure: emulator-supplied
-RDTSC/CPUID/MSR/RNG identity; all virtual clocks derived from branch work;
-no host RTC/RNG/audio/passthrough; one TCG vCPU or explicit deterministic
-schedule; pinned QEMU version, machine type, CPU model, build options,
-device set; no icount auto-adjust or host-time idle warp. Posture:
-ordinary process; **no** hypervisor entitlement; JIT needs
-`com.apple.security.cs.allow-jit` + `MAP_JIT` [VERIFIED-DOC-class,
-documented entitlement], interpreter mode avoids even that at higher cost.
-Tier T2 (~10–100×; >~100× reclassifies it as an oracle, not discarded).
-Apple-fragility: lowest of any option. Spike spec §5.2.
+#### B0 — correctness baseline
 
-**E2 — arm64 TCG icount as the cheap differential oracle for B.** Same
-payloads, third opinion in every divergence triage (B-run-1 vs B-run-2 vs
-E2), and the forensic re-execution engine while M-03 is unproven. Unit
-named `TCG_INSN`-class, never conflated with `SW_EDGE_v1` or hardware
-events.
+Per-chunk check, NZCV-neutral, `BRK`-carried (carrier gate below):
+
+```asm
+    sub     xB, xB, #1        // budget decrement; no flags touched
+    cbnz    xB, 1f            // budget remaining: continue
+    brk     #0x5A5A           // authoritative stop, BEFORE the chunk's
+1:                            //   first original instruction
+    ; original chunk instructions (statically bounded length)
+```
+
+- Budget `xB` lives in always-resident per-vCPU memory in the first
+  implementation (load/decrement/store must then be single-copy atomic —
+  LSE `ldadd`-class — so interposed handlers cannot be erased); a
+  register-resident budget is adopted only after the kernel audit (§0.1-3:
+  not `x28`; arm64 Linux aliases it as `tsk` in `entry.S` [LINUX];
+  whichever register is chosen, entry/exit, `cpu_switch_to`, signal
+  return, `ptrace`, and `setcontext` paths are patched and a post-link
+  verifier enforces that nothing else writes it).
+- Zero fires **before** any original instruction of the chunk executes:
+  injection points are exact chunk boundaries by construction. No
+  single-step on the correctness path; no sparse-gap reasoning; no
+  flag-liveness proof (the sequence is NZCV-neutral; no-wrap holds
+  because the host installs budgets ≥ 1 and only sites decrement).
+- **Carrier gate [M-22]:** `BRK #imm` from EL0 and EL1, ≥10⁶ reps under
+  host load — require EXCEPTION exit, EC 0x3C, correct immediate and PC,
+  no guest-vector execution, exact one-time continuation after the VMM
+  advances PC. If `BRK` fails the gate, the fallback carrier is: EL1
+  branches to an `HVC` thunk; EL0 executes `SVC` into a patched
+  IRQ-masked EL1 trampoline that immediately `HVC`s [M-18 syndrome
+  confirmation]. The clock design is carrier-independent.
+- **Debug-channel reservation (consequence of trapping):** all guest
+  debug exceptions route to the host; there is no public way to inject a
+  synchronous exception back. Initially the owned guest simply has no
+  self-debug: no kprobes, no ptrace single-step, no hw breakpoints,
+  WARN/BUG via a non-BRK mechanism or reserved immediates. If guest-side
+  debug is ever wanted, the VMM synthesizes the exception manually
+  (write `ELR_EL1`/`SPSR_EL1`/`ESR_EL1`, redirect PC to the vector) —
+  deterministic, but it is built machinery, not a free behavior.
+- **Event delivery:** synchronous PV dispatch is the baseline — at a
+  stop, the VMM posts events to the shared event page; the doorbell
+  return path (or the EL1 trampoline, for EL0 stops) invokes the kernel's
+  dispatcher at that exact boundary, honoring the kernel's soft-mask
+  state. Hardware IRQ-pin injection is last-resort, gated on
+  acceptance-point determinism [M-20], and never left pending across
+  instrumentation sequences.
+
+#### B1 — optimized sparse guards + exact landing (only after B0 passes)
+
+1. Absolute site counter (`work`) incremented at every site; sparse
+   **guard** sites carry the budget check.
+2. Guard graph with a **mechanically proven maximum gap K** (sites
+   between consecutive guards on every path): every CFG cycle contains a
+   guard; function entries guard call paths (covering indirect calls and
+   recursion); exception vectors and landing pads guard exceptional
+   paths; long acyclic runs get interior guards.
+3. To reach target W: arm so that **every possible first `BRK` satisfies
+   `work < W`** (arm at `W − K` against the proven gap), and the host
+   *asserts* `work < W` at the stop — a violated assertion is a verifier
+   bug and halts, never a silent overshoot.
+4. Qualified single-step from there to the canonical boundary with
+   `work == W`; inject before the first original instruction.
+5. Step qualification [M-03] must pass first: ≥10⁶ steps across faults,
+   SVC/HVC, ERET, pending events, idle, LSE (and demonstrate the LL/SC
+   hazard to justify its exclusion); exactly one retirement or a
+   precisely classified non-retirement per exit; one unexplained step
+   kills B1 — **B0 survives**.
+
+B1 exists because B0's per-chunk check is the dominant overhead; sparse
+guards move the steady-state cost to (rare) guard checks plus a bounded
+stepping phase at landings. Record-mode injection can also run pure-B0
+style (stop at the first guard past W and *define* the Moment there —
+quantized injection, sound and cheap); exact-W landing is required for
+replaying arbitrary recorded Moments and for debug/branch workflows.
+
+#### Shared P1 inventory (both stages)
+
+Guest-EL0 counter reads trapped in-guest via `CNTKCTL_EL1.EL0{V,P}CTEN=0`
+[VERIFIED-DOC reg]; kernel-side counter reads unreachable (no arch-timer
+clocksource) + link-time encoding audit (`CNTVCT/CNTVCTSS/CNTPCT`, `RNDR`,
+`LDXR/STXR`, raw `WFI/WFE`, PMU regs) over every image; vDSO serves
+V-time (= f(work), readable in-guest); PMU access configured to trap
+[SDK][M-04] and absent by audit; entropy via virtio-rng from the seeded
+monitor; **identity**: fixed feature contract compiled into the guest —
+it never reads host ID registers; the VMM records the platform
+fingerprint (`hv_vcpu_config_get_feature_reg` — getter only [SDK]) into
+films and refuses replay on mismatch; PAC disabled; WFI/WFE compiled out
+into deterministic idle hypercalls (V-time warps only by the deterministic
+next-deadline policy); alternatives/static-keys/text-patching pinned at
+build; modules, BPF JIT, userspace JIT, and W+X mappings disabled;
+LSE-only atomics.
+
+#### Snapshot / restore / branch
+
+At a stop: full RAM; all public CPU/system/SIMD-FP/debug registers; clock
+state (work, budget, armed deadline); pending-event latches; device
+state; input-log cursor; canonical hash. Dirty tracking via
+`hv_vm_protect` write-protect faults later [M-19]. Branching = restore +
+different injected future (B is record-capable, so branching works on
+macOS).
+
+#### Posture, tier, risks, fragility
+
+Entitlement only; no root/SIP. Tier: research path until M-01 measures
+the **full instrumented Linux image** (hand loops over-represent
+instrumentation); envelope 1.2–5×, demote-don't-relax. Risks: hvf-side
+guest-visible nondeterminism (kill condition, §5.1); carrier-gate
+failure (falls back HVC/SVC); closure gaps (fail-closed by verifier +
+negative tests); semantic miscompilation by the pass (caught by the
+uninstrumented-oracle gate, §5.1 — *not* by dual-run, which identical
+wrongness defeats). Fragility low-to-medium: public documented API;
+requalify per macOS update with the automated gate.
+
+### E. Deterministic emulation
+
+**E1 — x86-64 TCG product fallback.** Existing x86-64 guest and machine
+contract under single-threaded TCG on macOS/arm64 [CITED: QEMU docs].
+Stock `icount` is machinery, not the clock (TB budgets; MTTCG-
+incompatible) [CITED]; stock record/replay records host clocks as inputs
+and is insufficient for same-seed independent runs [CITED]. Clock: either
+a new `TCG_INSN_v1` coordinate, or preferably a translator extension
+decrementing only on instructions satisfying the pinned
+`BR_INST_RETIRED.CONDITIONAL` contract, counting after retirement,
+forcing an outer-loop exit before the next instruction at zero; event-
+class boundary (`Jcc`, `LOOP*`, `JCXZ/JECXZ/JRCXZ`, fusion, faulting
+cases, errata) differentially validated against the Intel/KVM backend —
+one unexplained mismatch kills *film compatibility* (a fresh coordinate
+may proceed). Closure: emulator-supplied TSC/CPUID/MSR/RNG; virtual
+clocks from branch work; no host RTC/RNG/audio/passthrough; one vCPU or
+serialized schedule; pinned QEMU/machine/CPU/build/devices; no host-time
+idle warp. Posture: plain process; JIT needs
+`com.apple.security.cs.allow-jit` + `MAP_JIT` [VERIFIED-DOC-class];
+interpreter avoids both at higher cost. Tier T2 (10–100×; >100× ⇒
+oracle). Lowest Apple fragility of any option.
+
+**E2 — arm64 TCG icount oracle** for B payloads: third opinion in
+divergence triage; forensic re-execution while M-03 is unproven; unit
+named `TCG_INSN`-class, never conflated with `SW_EDGE_v1`.
 
 ### C. Debug-architecture-only execution
 
-Step exits after every putative retired instruction; host classifies
-retirement, updates the authoritative count, injects due events before the
-next instruction. Public surface exists [VERIFIED-DOC]; what does **not**
-exist is a documented exact one-instruction retirement contract across
-exceptions, IRQ acceptance, ERET, and idle [SDK] — that is the hardware
-gate: [M-03] ≥10⁶ steps across exceptions, EL transitions, ERET, page
-faults, pending IRQs, LSE atomics, deterministic idle; require exactly one
-retirement or a precisely classified non-retirement per exit, zero
-PC/PSTATE/count divergence from an interpreter; one unexplained skip,
-duplicate, or livelock kills authoritative use. LL/SC unsafe here for the
-same exclusive-monitor reason — LSE-only guests. Cost: direct host
-stepping ~10³–10⁵×; a vEL2-hosted variant (step exceptions handled at
-virtual EL2 without leaving the VM) might reach ~10²–10⁴× at the price of
-nested-virt fragility [M-05] — both are estimates requiring measurement.
-Role: validation oracle and slow replay engine if the gate passes; landing
-subroutine for B's debug workflows; never the product path. Breakpoints do
-not change the completeness argument (a PC, not its k-th visit); they
-accelerate known straight-line replay segments only.
+Step-per-instruction with host classification. Public surface exists; the
+missing piece is a documented exact retirement contract — gate M-03 (see
+B1 step 5). Direct host stepping ~10³–10⁵×; a vEL2-hosted variant (debug
+exceptions handled at virtual EL2 without leaving the VM) might reach
+~10²–10⁴× at nested-virt fragility [M-05] — both unmeasured. Role:
+validation oracle, slow replay engine, B1's landing primitive. LL/SC
+unsafe under stepping — LSE-only guests. Breakpoints identify a PC, not
+its k-th dynamic visit: accelerators only, never position authority.
 
-### A. Host-side kpc/kperf — closed, minus one half-day probe
+### A. Host kpc/kperf — closed; one gated half-day probe
 
-Mechanism as v1 §A, now moot: the tested configurable path is guest-blind
-on M4, the fixed path is guest-inclusive but unfilterably contaminated
-(§2.3) [REPO-EVID][XNU]. Root-or-blessed-PID, private frameworks, per-chip
-private event databases, release-kernel entitlement bypass absent: lab
-posture at best, very high fragility. Remaining value: (1) the corrected
-RAWPMU/force-all probe, §5.3, strictly time-boxed; (2) `thread_selfcounts`
-as a free sanity heuristic beside B's authoritative clock. Kill list for
-the probe: guest-flat counts, any host contamination, fixed-period no-op,
-missed/duplicate overflow, unbounded skid, or overflow that does not
-produce a prompt userspace vCPU exit — any one closes the route
-permanently.
+Measured NO-GO (E3). Remaining probe, strictly ordered: (1) record
+model/build/UID/signature/entitlements/`csrutil status`/event-DB hash/
+core type; (2) `kpc_force_all_ctrs_set(1)` and require readback 1
+**before** enumerating FIXED/CONFIGURABLE/POWER/RAWPMU (the retained H3b
+enumerated first — flaw, not finding); (3) **only if** RAWPMU then
+demonstrates exact guest-only counting (host positive control, then guest
+loops N ∈ {0, 10³, 10⁶, 10⁷} with Δ=N over ≥10⁶ windows under load) do
+period/overflow tests proceed: overflow must return `hv_vcpu_run` to
+userspace before the guest passes the target (in-kernel sample with
+transparent re-entry is useless); measure loss/duplication/skid; prove
+early-arm + landing never overshoots. The ARM kpc reload path appears
+configurable-only [XNU] — a generic `kpc_set_period` success is not
+fixed-PMI evidence. Kill on any failure; B and E1 proceed regardless.
 
-### D. Virtual-EL2 monitor without a PMU — closed by construction
+### D. vEL2 monitor without a PMU — closed by construction
 
-A monitor counts only what it observes; ordinary EL0/EL1 execution between
-traps is unbounded, so a trap-free loop passes any logical deadline without
-the monitor regaining control. That falsifier needs no spike — it is true
-by construction. The only viable completions insert per-checkpoint HVCs
-(= B with a costlier per-checkpoint transition) or single-step everything
-(= C, possibly cheaper under vEL2 as noted there). Re-open only if Apple
-ships a nested PMU (§6).
+A monitor counts only what it observes; a trap-free loop passes any
+deadline. Viable completions reduce to B (per-checkpoint HVC at higher
+cost) or C (stepping, possibly vEL2-accelerated). Re-open only on a
+nested PMU (§6).
 
-### F. Replay-only macOS tier — folded
+### F. Replay-only macOS — folded, with a sharpened contract
 
-Replay must still answer "when has the guest reached recorded position W?"
-— a position mechanism, which is exactly what A lacked and B/E/C provide.
-A Linux film of `(work, event)` pairs does not make W observable on macOS
-by itself; a PC breakpoint cannot name the k-th visit; a contaminated
-count cannot disambiguate; an async kick can arrive after unbounded work.
-Viable forms, all derivative: E1 reproducing the hardware x86 coordinate
-exactly; C decoding/counting it; or Linux and macOS both running the same
-instrumented image and logging `SW_EDGE_v1`. Precision note: the ticks are
-branch-free `add`s, but the deadline *checks* add a conditional branch per
-site, so an instrumented image's hardware branch counts run deterministically
-higher than an uninstrumented image's — harmless, since films bind to the
-image and units were never comparable across images; both clocks are logged
-at every event and each side lands on its own. Branch-into-new-future additionally requires a record-capable clock
-on macOS — i.e., B.
+Replay still needs "when is recorded position W reached?" — a position
+mechanism (B, E, or C). For **cross-platform portable films** the
+contract is: identical fully instrumented image on both platforms;
+Moments as versioned `(work, site_id, phase)`; **software work
+authoritative for guest-visible V-time on both platforms** — otherwise
+V-time values materialized from a hardware clock on the record side are
+unreproducible on macOS without logging every materialization; the Linux
+PMU serves as accelerator/oracle, not as a guest-visible clock.
+Instrumentation changes hardware counts (checks are retired branches;
+register reservation shifts spills and control flow), so instrumented-
+image hardware baselines are remeasured and **existing uninstrumented
+films are not portable** — replaying those requires E1 (x86) or C-class
+decoding, or a heavyweight per-event cross-index record. Branching into
+new futures on macOS additionally requires a record-capable clock: B.
 
-### G. Adjacent, honestly not macOS: Linux bare metal (Asahi lineage)
+### G. Adjacent, not macOS: Linux bare metal (Asahi lineage)
 
-Would eventually validate the physical PMU event on M3/M4 cores, guest-only
-counting under KVM, PMI delivery/skid, exact debug landing — none of the
-macOS surface. Not ready: Asahi marks M3 PMU TBA / installers WIP, M4 PMU
-TBA / installers unavailable [CITED: Asahi feature-support tables]. When
-testable, the gate is the same 10⁶-window branch/PMI/skid/step experiment,
-with the M3/M4 event resolved from that machine's database — 0x90 is an
-M1/M2 fact, never silently inherited (E4).
+Would validate the physical PMU event and KVM guest-only counting on
+M-cores — none of the macOS surface. Not ready: M3 PMU TBA / installers
+WIP; M4 PMU TBA / installers unavailable [CITED]. Gate when testable:
+the same 10⁶-window branch/PMI/skid/step experiment with the event
+resolved from that machine's database (0x90 is an M1/M2 fact, E4).
 
 ### H. Non-starters
 
 Virtualization.framework (no vCPU surface); unmodified-hvf wall-clock
-injection (violates P2 by definition); private-framework tricks, kexts,
-SIP-off research configs (fail the shipping/posture constraint).
+injection (violates P2); kexts / SIP-off / private-framework postures.
 
 ---
 
@@ -467,281 +451,261 @@ SIP-off research configs (fail the shipping/posture constraint).
 
 | Rank | Design | Tier (planning) | Verdict |
 |---:|---|---|---|
-| 1 | **B** — `SW_EDGE_v1` on direct-EL1 HVF | 1.2–5× | best product candidate; unproven; spike now |
-| 2 | **E1** — x86-64 TCG, exact translated branch clock | 10–100× | credible shipping fallback + film compat; start slow path in parallel |
-| 3 | **E2** — arm64 TCG icount oracle | oracle | adopt, no spike |
-| 4 | **C** — debug stepping | 10²–10⁵× | oracle/slow replay behind gate M-03 |
-| 5 | **A** — kpc/kperf | n/a | strong NO-GO; half-day corrected probe only |
+| 1 | **B0 → B1** — `SW_EDGE_v1` on direct-EL1 HVF | research path; envelope 1.2–5× | best product candidate; B0 first, B1 only after |
+| 2 | **E1** — x86-64 TCG, exact translated branch clock | 10–100× | shipping fallback + only path for existing films; start in parallel |
+| 3 | **E2** — arm64 TCG oracle | oracle | adopt, no spike |
+| 4 | **C** — debug stepping | 10²–10⁵× | oracle / B1 primitive behind M-03 |
+| 5 | **A** — kpc/kperf | n/a | NO-GO; gated half-day RAWPMU probe |
 | 6 | **F** — replay-only | derivative | folds into B/E/C |
 | 7 | **D** — vEL2 sans PMU | n/a | closed by construction |
-| — | **G** — Linux/Asahi on M-series | native-class, not macOS | tracked; M3/M4 PMU TBA |
+| — | **G** — Linux/Asahi | native-class, not macOS | tracked; M3/M4 PMU TBA |
 
-The risk profile that justifies the order: B's principal risk is
-executable-closure *engineering* — entirely under Consonance's control —
-not an absent Apple facility; E1's principal risk is translator-contract
-fidelity, entirely under Consonance's control; everything ranked below
-depends on an Apple behavior that is absent, undocumented, or measured
+Risk shape: B's risks are our engineering (closure, pass correctness,
+kernel patches) plus two narrow Apple gates (carrier, CANCELED
+invisibility); E1's risks are translator fidelity — ours; everything
+below depends on Apple behavior that is absent, undocumented, or measured
 hostile.
 
 ## 5. Spike specifications
 
-### 5.1 Spike B — day one and week one
+### 5.1 Spike B — the gate ladder (in order; each gate falsifiable)
 
-Minimal instrumented EL0+EL1 payload (no Linux; hand-emitted
-instrumentation; both clock carriers behind a build flag): direct,
-conditional, and indirect control flow; calls/returns and repeated PCs;
-SVC/HVC/ERET; page faults and exception returns; masked and unmasked
-pending events; LSE atomics; deterministic idle; deliberate host
-cancellation under load.
+1. **Carrier gate [M-22/M-18].** `BRK #0x5A5A` from EL0 and EL1, ≥10⁶
+   reps under load: EXCEPTION exit, EC 0x3C, correct immediate + PC, no
+   guest-vector execution, exact one-time continuation. Same battery for
+   the `HVC` and `SVC→HVC` fallback (syndrome, marshalling). Pick the
+   carrier on evidence.
+2. **Semantic-preservation gate.** Instrumented vs **uninstrumented
+   semantic oracle** (independent interpreter or uninstrumented native
+   run of the same sources): NZCV-live code, syscalls, faults, ERET,
+   signals, task switches, `rt_sigreturn`, `setcontext`, fork/exec, host
+   cancellations. The pass must change no architectural result other
+   than the clock. Dual-run comparison explicitly does not count here —
+   identical wrongness passes it.
+3. **B0 exact-clock gate.** ≥10⁶ randomized budgets over the §5.1
+   payload (direct/conditional/indirect flow, calls/returns, repeated
+   PCs, SVC/HVC/ERET, faults, masked/unmasked events, LSE, deterministic
+   idle, CANCELED storms [M-11]): zero overshoots, zero skipped traps,
+   zero counter rollbacks, zero canonical-boundary mismatches; exactly
+   one injection per target, none early or late; identical full-state
+   hashes across fresh processes and load; ≥10⁴ snapshot/restore
+   round-trips with identical suffixes; negative tests fail closed
+   (site-free cycle, forbidden encoding, budget-state clobber, W+X page,
+   raw `WFI` — each must be rejected or trip the harness).
+4. **B1 gates (only after 1–3 pass).** Guard-graph verifier proves K;
+   host asserts `work < W` at every armed first-stop (violation = halt);
+   step qualification [M-03] as §3B1(5). One unexplained step kills B1,
+   not B0.
+5. **Performance [M-01].** Full instrumented Linux image (kernel boot +
+   userspace workload mix), not hand loops; report median/p99 vs
+   uninstrumented hvf. >~5× median / ~10× p99 demotes the tier.
 
-For ≥10⁶ randomized deadlines, compare at every doorbell against an
-independent interpreter of the same payload: `SW_EDGE`, next original PC,
-PSTATE, architectural register digest, V-time page, event payload, and
-event-delivery multiplicity.
-
-Acceptance floor:
-
-- zero count/PC/state mismatches; exactly one logical injection at every
-  target, none before or after;
-- identical full-state hashes across fresh processes and host-load
-  conditions;
-- zero divergent suffix hashes over ≥10⁴ snapshot/restore repetitions;
-- CANCELED-pause storms are invisible (M-11);
-- negative tests **fail closed**: an uninstrumented edge, a forbidden
-  counter/RNG/`LDXR` encoding, a reserved-state clobber, a
-  writable+executable page, a raw `WFI` — each must be rejected by the
-  verifier or trip the harness, never pass silently;
-- day-one confirmations logged: HVC syndrome path (M-18), pending-IRQ
-  latch acceptance semantics (M-20), exit round-trip costs (M-15).
-
-Kill condition: the first unexplained landing/state mismatch, or
-demonstrated inability to enforce executable closure. Performance above
-~5× median / ~10× p99 demotes the tier; it never weakens correctness.
+Kill condition for B0 (and with it the fast path): any guest-visible
+divergence between identically seeded runs attributable to hvf itself
+that construction cannot make unreachable; or carrier-gate failure of
+*both* carriers; or demonstrated inability to enforce closure
+(fail-closed becomes fail-open anywhere).
 
 ### 5.2 Spike E1 — slow path first
 
-Implement the branch-budget slow path only (no fast-path codegen tricks).
-Generate cases covering every conditional-branch class, taken/not-taken,
-target-fetch faults, exceptions, interrupts, atomics, MMIO, idle, and
-counter/RNG instructions. For ≥10⁶ randomized deadlines: compare the TCG
-count to an independent x86 decoder/interpreter; differentially compare
-the same code against the supported Intel/KVM PMU backend; require exit
-after the target branch and before the next guest instruction; compare
-full CPU/RAM/device/event hashes across fresh processes; restore ≥10⁴
-snapshots requiring identical suffixes; perturb host RTC, load, and
-arrival ordering requiring unchanged guest state. One unexplained
-retirement/count/landing mismatch kills film compatibility with
-hardware-counter films (a fresh `TCG_INSN_v1` coordinate may still
-proceed); >~100× reclassifies to oracle.
+As v2: branch-budget slow path only; ≥10⁶ randomized deadlines; compare
+to an independent x86 decoder/interpreter; differential vs Intel/KVM
+backend; exit after target branch, before next instruction; full-state
+hashes across fresh processes; ≥10⁴ restores; perturb host RTC/load/
+ordering with unchanged guest state. One unexplained mismatch kills film
+compatibility (fresh coordinate may proceed); >~100× reclassifies to
+oracle.
 
-### 5.3 Probe A — half day, only if a rooted M4 is already available
+### 5.3 Probe A — half day, gated, only on an already-rooted M4
 
-On stock M3/M4/M4 Pro: record model, build, UID, signature, entitlements,
-`csrutil status`, event-database hash, core type. As root:
-`kpc_force_all_ctrs_set(1)` and require readback 1 **before** enumerating
-FIXED/CONFIGURABLE/POWER/RAWPMU config and counts; save/restore all prior
-config on every exit path. Host userspace branch-loop positive control
-(zero errors over ≥10⁶ windows), then analytical guest EL1 loops N ∈
-{0, 10³, 10⁶, 10⁷} requiring exact Δ=N with named privilege filtering.
-Test period/action delivery separately per counter class — the ARM reload
-path appears configurable-only [XNU], so a generic `kpc_set_period`
-success is not fixed-PMI evidence. Require overflow to return
-`hv_vcpu_run` to userspace before the guest passes the target (an
-in-kernel sample with transparent re-entry is useless), then measure loss,
-duplication, skid, and prove an early-arm margin + debug landing never
-overshoots. Kill on any item in §3A's list. Regardless of outcome, B and
-E1 proceed; this probe can only add a lab heuristic or close the file.
+Exactly §3A's ordered list. Outcome cannot change the ranking — it can
+only add a lab accelerator or close the file.
 
 ### 5.4 Standing oracle E2
 
-Same 5.1 payload under `qemu-system-aarch64 -accel tcg -icount
-shift=…,sleep=off`; assert the same architectural trajectory; wire into CI
-as the third opinion for divergence triage.
+§5.1 payload under `qemu-system-aarch64 -accel tcg -icount
+shift=…,sleep=off`; identical architectural trajectory; wired into CI.
 
 ## 6. What Apple would have to ship
 
-**Exists, but gated/private or insufficient:**
+**Exists, gated/private or insufficient:** kpc configurable counting +
+kpep DBs (private, root-owned, and guest-blind as tested — opening access
+alone would not suffice; Apple must also attribute guest events and
+deliver overflow to the owning VMM); kpc period/action (no vCPU-return
+delivery); RAWPMU (private/root; corrected enumeration unmeasured; no
+fixed-`PMCR1` control); `thread_selfcounts` (private, read-only,
+unfilterable); debug trapping (no exact-retirement contract, no
+synchronous-exception injection); GIC opaque state (restore may fail
+across versions); `hv_vm_protect` (accelerator, not a dirty log).
 
-| Facility | Limitation |
-|---|---|
-| `thread_selfcounts` fixed instruction/cycle accounting | private SPI, read-only, unfilterable, includes charged kernel work |
-| kpc configurable counters + kpep event databases | private, root-owned; tested configurable counters **guest-blind** on M4 |
-| kpc period/action sampling | private in-kernel sampling; no documented vCPU-return delivery |
-| RAWPMU configuration class | private/root; corrected enumeration unmeasured; exposed registers exclude fixed `PMCR1` |
-| Public debug-exception trapping | no documented exact one-retired-instruction contract |
-| GIC opaque state save/restore | restore may fail across OS versions by contract |
-| `hv_vm_protect` | snapshot accelerator, not a dirty log |
+**Exists in silicon, absent in software:** precise branch counting with
+any guest visibility (plain-EL1: no PMU; vEL2: `PMCR_EL0.N = 0`);
+FEAT_ECV-class guest counter trapping (silicon presence unknown, M-16).
 
-Note the compound requirement the guest-blind finding exposes: **opening
-kpc access alone would not suffice** — Apple would also have to make the
-counters attribute guest execution and expose overflow to the owning VMM.
+**Does not exist (would have to be designed):** per-vCPU guest-only work
+counter with a stable named-event ABI; host/guest + EL filtering defined
+to include hvf guest execution; absolute counter deadline / run-until-N;
+a dedicated work-counter/PMU-overflow exit reason; documented PMI skid
+and delivery bounds; public counter+overflow state save/restore; nonzero
+nested PMU bank; documented exact single-instruction execution primitive
+across exceptions/IRQs/idle; synchronous-exception injection into guests;
+virtual-counter slope ownership; public dirty log (performance only).
 
-**Exists in silicon, absent in Apple's software:** precise branch counting
-(E4) with any guest visibility — plain-EL1 guests get no PMU; vEL2
-advertises `PMCR_EL0.N = 0` (E1); FEAT_ECV-style guest counter trapping
-(silicon presence itself unknown, M-16).
-
-**Does not exist in the supported surface (would have to be designed):**
-
-- a per-vCPU guest-only programmable work counter with a stable named
-  event ABI;
-- host/guest and EL0/EL1 filtering whose semantics include
-  Hypervisor.framework guest execution;
-- an absolute counter deadline / "run until N guest branches";
-- a dedicated `HV_EXIT_REASON_WORK_COUNTER` / PMU-overflow exit reason;
-- a documented bound on PMI skid and delivery latency;
-- public read/write/save/restore of counter + overflow state;
-- a nonzero nested PMU bank (tested M4: zero);
-- a documented exact single-instruction execution primitive across
-  exceptions, IRQs, and idle;
-- virtual-counter **slope** ownership (offset exists [VERIFIED-DOC]);
-- a public dirty-page log (performance, not correctness).
-
-Minimal fast-path API that would revive the hardware design: configure a
-stable event + guest privilege mask; read/write/serialize the count; arm
-an absolute target; return the vCPU with a dedicated exit reason before
-the next guest instruction. That plus the existing debug trap makes the
-proven PMU-overflow-and-step design credible on macOS.
+Minimal reviving API: configure a stable event + guest privilege mask;
+read/write/serialize the count; arm an absolute target; return the vCPU
+with a dedicated exit reason before the next guest instruction. With the
+existing debug trap, that makes the proven overflow-and-step design
+credible on macOS.
 
 ## 7. Measurement ledger
 
-Resolved since v1:
+Resolved:
 
 | # | Question | Resolution |
 |---|---|---|
-| M-06 | kpc EL-config surface applies to guest counting | **Negative** — configurable bank guest-blind on M4 [REPO-EVID]; filters moot |
-| M-08 | Host-EL0 wrapper constant for an EL0+EL1 clock | **Mooted** by M-06 resolution |
-| M-10 | kpc per-thread attribution exactness | **Mooted** for the architecture; probe-only |
-| M-17 | Asahi M3/M4 KVM+PMU | **Confirmed not ready** (PMU TBA both) [CITED] |
+| M-06 | kpc EL masks give guest counting | **Negative, measured** — guest-blind across EL0/EL1/EL0\|EL1 [REPO-EVID `8501faa1`] |
+| M-08/M-10 | host-EL0 constant / thread attribution | mooted by M-06 |
+| M-17 | Asahi M3/M4 KVM+PMU readiness | **not ready** (PMU TBA) [CITED] |
 
 Open:
 
 | # | Question | Blocking? |
 |---|---|---|
-| M-01 | B end-to-end overhead (both clock carriers) | tier claim only |
-| M-02 | WFI-exit behavior (still relevant as a backstop; baseline compiles WFI out) | no |
-| M-03 | Debug step/BRK exactness: one retirement or classified non-retirement per exit, no loss/duplication, under exceptions/IRQ/idle | gates C and B's landing workflows only (v2) |
-| M-04 | PMU-access trap config behavior (macOS 26 `hv_vm_config.h`) + guest PMU read semantics | P1 audit |
-| M-05 | vEL2 nested trap cost (only if C-under-vEL2 pursued) | no |
-| M-07 | Probe-A environment: SIP posture, Developer Mode | probe only |
-| M-09 | kpc PMI delivery/skid (probe) | probe only |
-| M-11 | CANCELED stop/resume invisibility under storm | **B kill-relevant** |
-| M-12 | `ID_AA64ISAR0.RNDR` under hvf (expect absent; forbidden by audit regardless) | P1 audit |
-| M-13 | MIDR settability | nicety |
-| M-14 | Snapshot state completeness round-trip | B milestone 2 |
-| M-15 | hvf exit round-trip costs (HVC, SVC→HVC path, MMIO, step) | tier math |
-| M-16 | FEAT_ECV presence (silicon + vEL2 emulation) | no |
-| M-18 | HVC syndrome path day-one confirmation (EC, ISS, register marshalling) | **B day-one** |
-| M-19 | `hv_vm_protect` write-fault behavior for COW/dirty tracking | speed only |
-| M-20 | Pending-IRQ latch: acceptance observability + reassert semantics | **B day-one** |
-| M-21 | Clock-carrier A/B: reserved-register vs atomic memory countdown (cost + hazard evidence) | B day-one |
+| M-01 | B overhead on **full instrumented Linux image** (median/p99) | tier claim |
+| M-02 | WFI-exit behavior (backstop; baseline compiles WFI out) | no |
+| M-03 | Step exactness: one retirement or classified non-retirement per exit, across faults/SVC/HVC/ERET/pending/idle/LSE | gates **B1** and C only |
+| M-04 | PMU-access trap config behavior + guest PMU read semantics | P1 audit |
+| M-05 | vEL2 nested trap cost (C-accelerator only) | no |
+| M-07 | Probe-A environment (SIP, Developer Mode) | probe only |
+| M-09 | kpc PMI delivery/skid (probe, only past RAWPMU gate) | probe only |
+| M-11 | CANCELED stop/resume invisibility under storms | **B0 kill-relevant** |
+| M-12 | `ID_AA64ISAR0.RNDR` under hvf (audit-forbidden regardless) | P1 audit |
+| M-13 | MIDR/MPIDR writability via `hv_vcpu_set_sys_reg` (MPIDR settable per GIC doc [VERIFIED-DOC]; MIDR unknown) | nicety — identity handled by fixed contract regardless |
+| M-14 | Snapshot state-completeness round-trip | B milestone 2 |
+| M-15 | hvf exit round-trip costs (BRK, HVC, SVC→HVC, MMIO, step) | tier math |
+| M-16 | FEAT_ECV presence | no |
+| M-18 | HVC/SVC syndrome path confirmation (EC, ISS, marshalling) | **B0 day-one** (fallback carrier) |
+| M-19 | `hv_vm_protect` write-fault behavior for dirty tracking | speed only |
+| M-20 | Hardware IRQ-pin acceptance-point determinism (pin is last-resort; synchronous PV dispatch is baseline) | only if pin used |
+| M-21 | Budget carrier: audited-register vs atomic-memory (cost + hazard evidence; register choice post kernel-audit, not `x28`) | B0 day-one |
+| M-22 | **BRK carrier gate**: EC 0x3C, immediate, PC, no guest-vector execution, exact continuation, EL0+EL1, ≥10⁶ under load | **B0 day-one** |
 
 ## 8. Citations
 
-Apple documentation, fetched 2026-08-06 [VERIFIED-DOC]: as v1 —
-`hv_vm_config_set_el2_enabled` (15.0+), `hv_vcpu_set_trap_debug_exceptions`
-(11.0+, "debug exceptions exit the guest", ≙ `MDCR_EL2.TDE`),
-`hv_exit_reason_t` (4 values), `hv_vcpu_exit_exception_t`
-(syndrome/VA/IPA), `hv_vcpu_set_vtimer_offset` (≙ `CNTVOFF_EL2`),
-`hv_vcpu_set_vtimer_mask`, `hv_vcpu_set_pending_interrupt`, `hv_vm_map` /
-`hv_vm_protect`, `hv_sys_reg_t` contents, `hv_vcpu_config_get_feature_reg`,
-`hv_gic_create`, entitlements `com.apple.security.hypervisor` and
+Apple documentation 2026-08-06 [VERIFIED-DOC]: `hv_vm_config_set_el2_enabled`
+(15.0+); `hv_vcpu_set_trap_debug_exceptions` (11.0+, "debug exceptions
+exit the guest", ≙ `MDCR_EL2.TDE`); `hv_exit_reason_t`;
+`hv_vcpu_exit_exception_t`; `hv_vcpu_set_vtimer_offset` (≙ `CNTVOFF_EL2`);
+`hv_vcpu_set_vtimer_mask`; `hv_vcpu_set_pending_interrupt`;
+`hv_vm_map`/`hv_vm_protect`; `hv_sys_reg_t` (MDSCR, DBGB/W 0–15, CNTKCTL,
+SPSR/ELR_EL1; no PMU regs); `hv_vcpu_config_get_feature_reg`;
+`hv_gic_create`; entitlements `com.apple.security.hypervisor`,
 `com.apple.security.cs.allow-jit`.
 
-macOS 26.4.1 SDK headers [SDK, via cross-review; re-verify in CI]:
-`hv_vcpu_types.h` (exit vocabulary), `hv_vcpu.h` (`hv_vcpus_exit`
-cancellation semantics; `CNTVCT = mach_absolute_time() − offset`;
-pending-interrupt cleared per run; debug-trap surface), `hv_vm.h`
-(map/unmap/protect only), `hv_vm_config.h` (PMU-access trap
-configuration), `hv_gic_state.h` (opaque state; restore may fail across
-versions).
+macOS 26.4.1 SDK [SDK, via cross-review; re-verify in CI]:
+`hv_vcpu_types.h`; `hv_vcpu.h` (kick semantics; `CNTVCT =
+mach_absolute_time() − offset`; per-run pending-interrupt clearing; debug
+traps); `hv_vm.h`; `hv_vm_config.h` (PMU-access trap); `hv_gic_state.h`
+(opaque state, restore may fail); `hv_vcpu_config.h`
+(`hv_vcpu_config_get_feature_reg` is a getter).
 
-XNU at `f6217f89…` [XNU, re-verify against shipping release]:
-`osfmk/arm64/monotonic_arm64.c` (fixed counters all-modes, no filter);
-`osfmk/arm64/kpc.c` (RAWPMU register list excludes fixed `PMCR1`;
-PMI reload path configurable-only); `bsd/kern/kern_kpc.c`,
-`osfmk/kperf/kperfbsd.c`, `bsd/kern/kern_ktrace.c` (root / blessed-PID /
-dev-kernel entitlement gating); `bsd/sys/resource_private.h`
+Arm architecture [ARM]: `BRK` — precise, unmaskable Breakpoint
+Instruction exception, EC 0x3C, immediate in ESR ISS; debug-exception
+routing under `MDCR_EL2.TDE` (Armv8-A self-hosted debug guide).
+
+Linux mainline [LINUX]: `arch/arm64/kernel/entry.S` (`tsk` ≡ `x28`
+alias; entry/exit register handling), `arch/arm64/kernel/signal.c`
+(signal-frame register restore) — basis for the register-carrier audit.
+
+XNU at `f6217f89…` [XNU]: `osfmk/arm64/monotonic_arm64.c` (fixed
+counters all-modes, unfiltered); `osfmk/arm64/kpc.c` (RAWPMU register
+list without fixed `PMCR1`; configurable-only PMI reload);
+`bsd/kern/kern_kpc.c`, `osfmk/kperf/kperfbsd.c`, `bsd/kern/kern_ktrace.c`
+(root/blessed-PID/dev-kernel gating); `bsd/sys/resource_private.h`
 (`thread_selfcounts`).
 
-Consonance repo [REPO-EVID]: `spike/as2h-host-count` @ `500f95d`; bead
-`hm-ssz` (M4 guest-blind configurable counters, contaminated fixed
-counters, flawed RAWPMU H3b probe); `docs/APPLE-SILICON.md` (E1);
-`docs/PARAVIRT-CLOCK.md` (V-time contract); `docs/GLOSSARY.md` (film);
-`docs/MACOS-M3-BACKEND-ALTERNATIVES.md` (pre-existing draft whose
-breakpoint+short-step record/replay proposals are accelerators only —
-superseded by this memo's authoritative-clock designs); bead `hm-dj0`.
+Consonance repo [REPO-EVID]: `spike/as2h-host-count` @ `500f95d`,
+`8501faa1` (H3: configurable guest-blind across EL masks and 0/10⁶/10⁷
+loops; fixed-counter contamination; H3b RAWPMU ordering flaw); bead
+`hm-ssz`; `docs/APPLE-SILICON.md`; `docs/PARAVIRT-CLOCK.md`;
+`docs/GLOSSARY.md`; `docs/MACOS-M3-BACKEND-ALTERNATIVES.md` (breakpoint+
+short-step proposals: accelerators only, superseded); bead `hm-dj0`.
 
-Third-party [CITED]: QEMU `target/arm/hvf/hvf.c` (Apple Silicon support,
-`EC_AA64_HVC` PSCI conduit, WFx handling, sysreg save/restore); QEMU hvf
-gdbstub series (F. Cagnin, Nov 2022, merged 8.x) — debug traps exercised
-in shipping software, exactness still ours to prove (M-03); QEMU
-build-platforms, emulation, icount, and record/replay documentation
-(including icount's MTTCG incompatibility and replay's recorded-host-clock
-model); FFmpeg `libavutil/macos_kperf.c` (root-gated kpc usage pattern);
-rr on M1/M2 under Linux (event 0x90, E4); Asahi Linux M3/M4
-feature-support tables (PMU TBA).
+Third-party [CITED]: QEMU `target/arm/hvf/hvf.c` (`EC_AA64_HVC` conduit,
+WFx, sysreg save/restore); QEMU hvf gdbstub series (Cagnin, merged 8.x —
+debug traps exercised in shipping software; exactness ours to prove);
+QEMU build-platforms / emulation / icount / record-replay docs (MTTCG
+incompatibility; host clocks recorded as inputs); FFmpeg
+`libavutil/macos_kperf.c`; rr on M1/M2 under Linux (event 0x90); Asahi
+M3/M4 feature-support tables.
 
-## 9. Cross-review adjudication (v1 vs the GPT memo)
+## 9. Cross-review adjudication
 
-Accepted from the cross-review (with the evidence that compelled it):
+### Round 1 (v1 → v2) — summary
 
-- **R1. kpc architecture NO-GO** — guest-blind configurable bank,
-  unfilterable fixed bank, release-kernel gating [REPO-EVID][XNU]. v1's
-  Spike A withdrawn; replaced by the half-day corrected probe (their
-  design, adopted nearly verbatim, including the force-all-first fix and
-  the configurable-only PMI-reload caveat).
-- **R2. Correctness carrier off the debug channel.** HVC/SVC doorbells are
-  architecturally guaranteed synchronous traps; v1's BRK-based deadline
-  relied on hvf debug-exception delivery whose exactness is undocumented.
-  Adopted: debug architecture now gates only landing/debug workflows
-  (M-03), not record/replay.
-- **R3. LL/SC exclusion** (exclusive-monitor clearing by host exits/debug
-  ops changes retry paths). A real determinism leak v1 missed; adopted
-  into the closure list and the encoding audit.
-- **R4. Pending-IRQ per-run clearing ⇒ software latch + reassert** [SDK].
-  Adopted into B's injection design and M-20.
-- **R5. WFI/WFE compiled out to idle hypercalls** as baseline (v1's
-  WFE-invisibility analysis retained as defense-in-depth only).
-- **R6. E1 as x86-64 TCG with film compatibility** as the fallback's
-  primary form, including the icount-is-not-the-clock and
-  stock-replay-is-insufficient critiques and the
-  `BR_INST_RETIRED.CONDITIONAL` differential-validation obligation.
-- **R7. Fail-closed negative tests and the demote-don't-relax performance
-  rule** adopted into 5.1/5.2 acceptance floors.
-- **R8. Wishlist upgrades**: "opening kpc alone would not suffice"
-  (attribution + overflow delivery required); the no-documented-single-step
-  contract item; GIC opaque-state restore caveat.
+Accepted: kpc architecture NO-GO [REPO-EVID]; carrier off the debug
+channel (superseded in round 2 by the carrier gate); LL/SC exclusion;
+pending-IRQ latch [SDK]; WFI/WFE compiled out; E1 as x86-64 TCG with
+film-compat obligations; fail-closed negative tests; demote-don't-relax;
+wishlist upgrades. Rejected/corrected: non-atomic memory countdown
+(single-copy-atomic required); breakpoint critique correct in general but
+not against a clock-authoritative landing rule.
 
-Rejected or corrected, with reasons:
+### Round 2 (v2 → v3)
 
-- **R9. The memory-countdown sketch as written has an unnamed hazard.**
-  `ldr/sub/str/cbnz` on a shared per-vCPU cell is not atomic against
-  interposed instrumented exception handlers: the interrupted sequence's
-  write-back deterministically erases handler-accrued work and can clobber
-  a host-installed deadline. Deterministic, but it corrupts the position
-  semantics the host schedules against. v2 requires the update to be
-  single-copy atomic (LSE `ldadd`-class) or provably unpreemptable at
-  every site, and A/Bs this carrier against v1's reserved-register
-  monotonic counter (single-instruction, interrupt-atomic, readable at
-  arbitrary CANCELED stops — which the countdown alone is not without
-  host bookkeeping) [M-21]. Their register-restore-path concern is real
-  and stays a first-class obligation on the register variant.
-- **R10. Their breakpoint critique does not reach v1's landing rule.**
-  Correct that a PC breakpoint cannot name the k-th dynamic visit and
-  that a contaminated hint cannot disambiguate — that argument kills the
-  repo draft's breakpoint+short-step *record* design. v2's landing names
-  points as (W, PC) with W from the authoritative software clock and
-  within-window PC uniqueness by construction; breakpoints appear only as
-  accelerators, consistent with their own conclusion.
-- **R11. Performance envelopes.** Their 1.5–10× for B assumed the heavier
-  memory-carrier instrumentation; v1's 1.1–1.4× assumed the lightest
-  register carrier. v2 brackets 1.2–5× and lets M-01 decide; the
-  difference changes tier labels, not the recommendation.
+Accepted, with the evidence that compelled each:
 
-Independent convergence worth recording: both memos, from different
-evidence bases, ranked the same two spikes first — a guest-resident
-software work clock on public direct-EL1 Hypervisor.framework, and a
-deterministic TCG tier — and both concluded that every hardware-assisted
-path on shipping macOS fails on the same missing property: no Apple
+- **R12. Site-coverage invariant.** v2's (W, PC)-uniqueness claim was
+  false under uninstrumented assembly loops. Adopted: every executable
+  cycle contains a site, mechanically verified; Moments are
+  `(work, site_id, phase)`.
+- **R13. `x28` disqualified.** arm64 Linux aliases `x28` as `tsk` across
+  `entry.S`; `-ffixed-x28` is insufficient by itself [LINUX]. Register
+  carrier only after kernel audit; memory budget is the baseline.
+- **R14. NZCV-neutral default + uninstrumented oracle.** Liveness-based
+  `cmp` is not unsound, but a liveness bug miscompiles deterministically
+  and dual-run comparison cannot detect it. Default sequence is
+  `sub`/`cbnz`/`brk`; the semantic gate compares against uninstrumented
+  semantics.
+- **R15. B0/B1 split** with the arm-early invariant (`work < W` at every
+  first stop, host-asserted) and the guard-graph proof obligation (K over
+  acyclic, interprocedural, recursive, and exceptional paths — backedges
+  alone do not bound it).
+- **R16. kpc history corrected**: the EL-filter leg was run (`8501faa1`)
+  and is guest-blind across masks; "finish the never-run leg" withdrawn.
+  Probe re-ordered: RAWPMU must demonstrate guest counting before any
+  PMI test.
+- **R17. Debug-channel reservation**: with trapping on, *all* guest
+  debug exceptions exit, and no public synchronous-exception injection
+  exists — guest self-debug forbidden initially or VMM-synthesized.
+- **R18. Identity**: `hv_vcpu_config_get_feature_reg` is a getter [SDK];
+  fingerprints refuse, they do not sanitize; the guest compiles in a
+  fixed feature contract and never reads host ID registers.
+- **R19. Portable films need software-authoritative V-time on both
+  platforms**; hardware PMU demoted to accelerator/oracle; uninstrumented
+  films are not portable.
+- **R20. Performance honesty**: no ratio until the full instrumented
+  image is measured; v1's 1.1–1.4× withdrawn.
+
+Corrected back (for the record, without changing the adopted outcome):
+
+- **R21.** Round 2's "blocking flaw 1" reviews an injection rule v1/v2
+  did not propose: injection was specified as *quantized* — "the first
+  check site where x28 ≥ W," a pure function of guest state, identical
+  on record and replay — which is round 2's own sound formulation (2);
+  exact-W landing via arm-early + step was already the stated mechanism
+  for arbitrary recorded points (formulation 3). What round 2 genuinely
+  adds — the mechanized guard-gap proof and the host-checked `work < W`
+  assertion — is adopted in B1 regardless.
+- **R22.** Round 2's carrier position reverses round 1's: round 1 argued
+  the deadline carrier off `BRK` (undocumented debug-delivery contract);
+  round 2 argues `BRK` in (precise, unmaskable, EC 0x3C [ARM]). Neither
+  argument is dispositive without hardware: the carrier is now a day-one
+  gate [M-22] with `HVC`/`SVC→HVC` as the standing fallback, and the
+  clock design is carrier-independent.
+
+Standing convergence across all three reviews: software work counting on
+public direct-EL1 Hypervisor.framework is the only credible fast path on
+macOS; deterministic TCG is the independent fallback; every
+hardware-assisted path fails on the same missing property — no Apple
 surface attributes, filters, or delivers guest work counts to the VMM.
