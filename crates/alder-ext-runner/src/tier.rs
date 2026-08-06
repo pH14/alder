@@ -47,6 +47,44 @@ impl Provider {
     }
 }
 
+/// How much of the filesystem a codex rung's executions may write.
+///
+/// This is a property of the rung, not of a launch: the rung is where an
+/// operator decides how far to trust the executions it starts, and the resume
+/// script must repeat the launch's setting exactly, so both read it from the
+/// same table entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sandbox {
+    /// The execution writes its own worktree and the launching repository's
+    /// `.git`, nothing else. The right setting for workers.
+    #[default]
+    WorkspaceWrite,
+    /// No sandbox at all: the execution writes anywhere the operator can.
+    /// Exists for the executor rung, which must write the shared log through
+    /// the primary checkout and launch nested tool processes.
+    FullAccess,
+}
+
+impl Sandbox {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sandbox::WorkspaceWrite => "workspace-write",
+            Sandbox::FullAccess => "full-access",
+        }
+    }
+
+    pub fn parse(name: &str) -> Result<Self> {
+        [Sandbox::WorkspaceWrite, Sandbox::FullAccess]
+            .into_iter()
+            .find(|sandbox| sandbox.as_str() == name)
+            .ok_or_else(|| {
+                RunnerError::new(format!(
+                    "unknown sandbox `{name}`; the settings are workspace-write and full-access"
+                ))
+            })
+    }
+}
+
 /// One rung of the ladder.
 #[derive(Debug)]
 pub struct Tier {
@@ -59,6 +97,9 @@ pub struct Tier {
     /// The rung of equal standing on the other provider's ladder, used when
     /// this one's provider is rate-limited.
     pub counterpart: &'static str,
+    /// How far this rung's codex executions may write. Meaningless for claude
+    /// rungs, and the config loader refuses a claude rung that names one.
+    pub sandbox: Sandbox,
 }
 
 /// The built-in table: two ladders of three, paired across by standing.
@@ -69,6 +110,7 @@ pub const TIERS: [Tier; 6] = [
         model: "gpt-5.6-luna",
         effort: "high",
         counterpart: "sonnet",
+        sandbox: Sandbox::WorkspaceWrite,
     },
     Tier {
         name: "terra",
@@ -76,6 +118,7 @@ pub const TIERS: [Tier; 6] = [
         model: "gpt-5.6-terra",
         effort: "xhigh",
         counterpart: "opus",
+        sandbox: Sandbox::WorkspaceWrite,
     },
     Tier {
         name: "sol",
@@ -83,6 +126,7 @@ pub const TIERS: [Tier; 6] = [
         model: "gpt-5.6-sol",
         effort: "xhigh",
         counterpart: "fable",
+        sandbox: Sandbox::WorkspaceWrite,
     },
     Tier {
         name: "sonnet",
@@ -90,6 +134,7 @@ pub const TIERS: [Tier; 6] = [
         model: "claude-sonnet-5",
         effort: "high",
         counterpart: "luna",
+        sandbox: Sandbox::WorkspaceWrite,
     },
     Tier {
         name: "opus",
@@ -97,6 +142,7 @@ pub const TIERS: [Tier; 6] = [
         model: "claude-opus-5",
         effort: "xhigh",
         counterpart: "terra",
+        sandbox: Sandbox::WorkspaceWrite,
     },
     Tier {
         name: "fable",
@@ -104,6 +150,7 @@ pub const TIERS: [Tier; 6] = [
         model: "claude-fable-5",
         effort: "xhigh",
         counterpart: "sol",
+        sandbox: Sandbox::WorkspaceWrite,
     },
 ];
 
@@ -139,28 +186,49 @@ impl Tier {
     /// codex execution needs as a second writable root — see [`writable_roots`].
     pub fn command(&self, prompt: &str, git_common_dir: Option<&str>) -> Vec<String> {
         let mut words: Vec<String> = match self.provider {
-            // approval_policy=never and workspace-write let the execution
-            // commit on its branch unattended; network access lets it reach
-            // whatever remotes its work needs.
-            Provider::Codex => [
-                "codex",
-                "exec",
-                "-m",
-                self.model,
-                "-c",
-                &format!("model_reasoning_effort={}", self.effort),
-                "-c",
-                "approval_policy=never",
-                "-c",
-                "sandbox_mode=workspace-write",
-                "-c",
-                "sandbox_workspace_write.network_access=true",
-                "-c",
-                &writable_roots(git_common_dir),
-            ]
-            .iter()
-            .map(|word| (*word).to_owned())
-            .collect(),
+            // approval_policy=never lets the execution act unattended; the
+            // rung's sandbox setting decides how far its writes reach.
+            Provider::Codex => {
+                let mut words: Vec<String> = [
+                    "codex",
+                    "exec",
+                    "-m",
+                    self.model,
+                    "-c",
+                    &format!("model_reasoning_effort={}", self.effort),
+                    "-c",
+                    "approval_policy=never",
+                ]
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect();
+                match self.sandbox {
+                    // workspace-write lets the execution commit on its branch
+                    // and nothing more; network access lets it reach whatever
+                    // remotes its work needs.
+                    Sandbox::WorkspaceWrite => words.extend(
+                        [
+                            "-c",
+                            "sandbox_mode=workspace-write",
+                            "-c",
+                            "sandbox_workspace_write.network_access=true",
+                            "-c",
+                            &writable_roots(git_common_dir),
+                        ]
+                        .iter()
+                        .map(|word| (*word).to_owned()),
+                    ),
+                    // No sandbox, so no sandbox_workspace_write.* keys:
+                    // writable roots are meaningless when nothing confines
+                    // the writes.
+                    Sandbox::FullAccess => words.extend(
+                        ["-c", "sandbox_mode=danger-full-access"]
+                            .iter()
+                            .map(|word| (*word).to_owned()),
+                    ),
+                }
+                words
+            }
             Provider::Claude => [
                 "claude",
                 "--model",
@@ -356,6 +424,14 @@ mod tests {
         for rung in &TIERS {
             assert!(!rung.model.is_empty(), "{} has no model", rung.name);
             assert!(!rung.effort.is_empty(), "{} has no effort", rung.name);
+            // Every built-in rung is a worker rung: full access is granted
+            // only by an operator's own config, never by the default table.
+            assert_eq!(
+                rung.sandbox,
+                Sandbox::WorkspaceWrite,
+                "{} escalates the built-in table",
+                rung.name
+            );
             // The command carries both, so neither can be left to the CLI.
             let command = rung.command("prompt", Some("/projects/alder/.git"));
             assert!(
@@ -471,6 +547,73 @@ mod tests {
                 "do the thing",
             ]
         );
+    }
+
+    #[test]
+    fn a_full_access_rung_drops_the_sandbox_from_launch_and_resume_alike() {
+        let executor = Tier {
+            name: "executor",
+            provider: Provider::Codex,
+            model: "gpt-5.6-terra",
+            effort: "xhigh",
+            counterpart: "opus",
+            sandbox: Sandbox::FullAccess,
+        };
+        // No writable_roots word: that key names roots a sandbox would leave
+        // writable, and there is no sandbox to leave them.
+        assert_eq!(
+            executor.command("do the thing", Some("/projects/alder/.git")),
+            [
+                "codex",
+                "exec",
+                "-m",
+                "gpt-5.6-terra",
+                "-c",
+                "model_reasoning_effort=xhigh",
+                "-c",
+                "approval_policy=never",
+                "-c",
+                "sandbox_mode=danger-full-access",
+                "do the thing",
+            ]
+        );
+        // The resume must continue the session exactly as it was launched: a
+        // full-access execution resumed under workspace-write would fail the
+        // same writes its rung exists to allow.
+        let script = executor
+            .resume_script(Some("/projects/alder/.git"))
+            .expect("codex rungs resume");
+        assert!(
+            script.contains("'sandbox_mode=danger-full-access'"),
+            "{script}"
+        );
+        assert!(script.contains("'approval_policy=never'"), "{script}");
+        for stale in [
+            "writable_roots",
+            "sandbox_workspace_write",
+            "workspace-write",
+        ] {
+            assert!(
+                !script.contains(stale),
+                "the resume smuggles the workspace sandbox back in via `{stale}`: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_settings_round_trip_by_name() {
+        for sandbox in [Sandbox::WorkspaceWrite, Sandbox::FullAccess] {
+            assert_eq!(Sandbox::parse(sandbox.as_str()).unwrap(), sandbox);
+        }
+        assert_eq!(Sandbox::default(), Sandbox::WorkspaceWrite);
+        // The config word is the runner's own name for the setting, never
+        // codex's flag value: accepting `danger-full-access` here would let a
+        // typo of intent pass as the most dangerous setting.
+        for name in ["danger-full-access", "none", "Full-Access", ""] {
+            let error = Sandbox::parse(name).expect_err("unknown sandboxes are rejected");
+            assert!(error.message.contains("workspace-write"), "{error}");
+            assert!(error.message.contains("full-access"), "{error}");
+        }
     }
 
     #[test]
