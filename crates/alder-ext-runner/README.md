@@ -190,6 +190,9 @@ without it the first commit dies on `index.lock`. It does not make the
 repository's working tree writable, which is the part that matters. Claude
 rungs run the interactive `claude` CLI with the model and effort pinned.
 
+A config rung can loosen this with a `sandbox` setting — see below. The
+built-in rungs all keep the workspace sandbox.
+
 ## Configuration
 
 Machine-local, because which models exist and what they cost are properties
@@ -227,10 +230,35 @@ built-in one when present:
 
 `provider` is `codex` or `claude`. Every `counterpart` must exist, sit on the
 other provider's ladder, and pair back; the loader refuses anything else. The
-engine command per provider — how `codex exec` and `claude` are invoked,
-sandboxing included — is code, not configuration: it is the part of a launch
-that has to stay in step with the generated resume script, and both are
-produced from one table on purpose.
+engine command per provider — how `codex exec` and `claude` are invoked — is
+code, not configuration: it is the part of a launch that has to stay in step
+with the generated resume script, and both are produced from one table on
+purpose.
+
+A codex rung may also set `"sandbox"`. It takes one of two values:
+
+- `"workspace-write"` — the default when the field is absent. The execution
+  can write its own worktree and the repository's `.git`, and nothing else.
+  This is the right setting for worker rungs, and it is what every rung did
+  before the field existed.
+- `"full-access"` — no sandbox. The execution can write anywhere the
+  operator's own account can, and can start any program. Approval policy is
+  still `never`, so nothing will ask first.
+
+`full-access` exists for the executor rung: the session that drives the
+loop. The executor has to write the shared Alder log through the primary
+checkout and launch nested tools such as a cross-review, and both of those
+fail inside a workspace sandbox. Workers need neither, so do not give
+`full-access` to a worker rung. The trust model implication, plainly: a
+full-access rung means the model on that rung can do anything you can do on
+this machine, so give it only to a rung you would let sit at your own
+keyboard. The generated `resume` script repeats the same sandbox setting as
+the launch, so a full-access session resumes with full access.
+
+A claude rung cannot set `sandbox` — claude executions are governed by the
+`claude` CLI's own permission mode, not by codex sandboxing — and the loader
+refuses a config that tries, rather than ignoring a setting that would then
+read as granted.
 
 ## Trust model
 

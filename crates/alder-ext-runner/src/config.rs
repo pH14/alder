@@ -26,9 +26,11 @@
 //! ```
 //!
 //! The engine command per provider — how `codex exec` and `claude` are
-//! invoked, sandboxing included — is code, not configuration: it is the part
-//! of a launch that has to stay in step with the resume script, and the two
-//! are generated from one table on purpose.
+//! invoked — is code, not configuration: it is the part of a launch that has
+//! to stay in step with the resume script, and the two are generated from one
+//! table on purpose. The one knob a codex rung gets is `"sandbox"`:
+//! `"workspace-write"` (the default) or `"full-access"`. What each setting
+//! expands to is still code.
 
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
@@ -36,7 +38,7 @@ use serde::Deserialize;
 
 use crate::{
     error::{Result, RunnerError},
-    tier::{Provider, TIERS, Tier},
+    tier::{Provider, Sandbox, TIERS, Tier},
 };
 
 /// Where the config file lives, unless the environment moves it.
@@ -89,6 +91,11 @@ struct TierEntry {
     model: String,
     effort: String,
     counterpart: String,
+    /// `workspace-write` (the default) or `full-access`. Codex rungs only:
+    /// a claude rung naming any sandbox is refused rather than ignored,
+    /// because a silently dropped setting reads as granted.
+    #[serde(default)]
+    sandbox: Option<String>,
 }
 
 /// The active tier table: the config file's, or the built-in one when no file
@@ -129,9 +136,22 @@ fn build_table(entries: BTreeMap<String, TierEntry>) -> Result<&'static [Tier]> 
                 return Err(RunnerError::new(format!("tier `{name}` has no {field}")));
             }
         }
-        table.push(Tier {
-            provider: Provider::parse(&entry.provider)
+        let provider = Provider::parse(&entry.provider)
+            .map_err(|error| RunnerError::new(format!("tier `{name}`: {error}")))?;
+        let sandbox = match entry.sandbox {
+            None => Sandbox::default(),
+            Some(_) if provider == Provider::Claude => {
+                return Err(RunnerError::new(format!(
+                    "tier `{name}` is a claude rung and cannot set a sandbox; \
+                     `sandbox` applies to codex rungs only"
+                )));
+            }
+            Some(value) => Sandbox::parse(&value)
                 .map_err(|error| RunnerError::new(format!("tier `{name}`: {error}")))?,
+        };
+        table.push(Tier {
+            provider,
+            sandbox,
             name: leak(name),
             model: leak(entry.model),
             effort: leak(entry.effort),
@@ -215,6 +235,26 @@ mod tests {
     }
 
     #[test]
+    fn a_rung_carries_its_sandbox_and_defaults_to_workspace_write() {
+        let table = table_from(
+            r#"{"tiers": {
+                "executor": {"provider": "codex", "model": "gpt-x", "effort": "xhigh", "counterpart": "steady", "sandbox": "full-access"},
+                "worker": {"provider": "codex", "model": "gpt-x", "effort": "high", "counterpart": "helper", "sandbox": "workspace-write"},
+                "steady": {"provider": "claude", "model": "claude-y", "effort": "high", "counterpart": "executor"},
+                "helper": {"provider": "claude", "model": "claude-y", "effort": "high", "counterpart": "worker"}
+            }}"#,
+        )
+        .unwrap();
+        let sandbox_of = |name| crate::tier::lookup(table, name).unwrap().sandbox;
+        assert_eq!(sandbox_of("executor"), Sandbox::FullAccess);
+        assert_eq!(sandbox_of("worker"), Sandbox::WorkspaceWrite);
+        // Absent means workspace-write: an existing config keeps exactly the
+        // behavior it had before the field existed.
+        assert_eq!(sandbox_of("steady"), Sandbox::WorkspaceWrite);
+        assert_eq!(sandbox_of("helper"), Sandbox::WorkspaceWrite);
+    }
+
+    #[test]
     fn every_invalid_table_is_rejected_by_name() {
         for (body, complaint) in [
             (r#"{"tiers": {}}"#, "cannot be empty"),
@@ -244,6 +284,25 @@ mod tests {
                     "c": {"provider": "codex", "model": "m", "effort": "e", "counterpart": "b"}
                 }}"#,
                 "names",
+            ),
+            (
+                // The runner's word is `full-access`; codex's flag value is
+                // not a config value, and a typo of intent must not pass as
+                // the most dangerous setting.
+                r#"{"tiers": {
+                    "a": {"provider": "codex", "model": "m", "effort": "e", "counterpart": "b", "sandbox": "danger-full-access"},
+                    "b": {"provider": "claude", "model": "m", "effort": "e", "counterpart": "a"}
+                }}"#,
+                "unknown sandbox",
+            ),
+            (
+                // Refused, not ignored: a claude rung's sandbox setting would
+                // read as granted while doing nothing.
+                r#"{"tiers": {
+                    "a": {"provider": "codex", "model": "m", "effort": "e", "counterpart": "b"},
+                    "b": {"provider": "claude", "model": "m", "effort": "e", "counterpart": "a", "sandbox": "workspace-write"}
+                }}"#,
+                "cannot set a sandbox",
             ),
             (r#"{"unknown": 1}"#, "invalid"),
         ] {
