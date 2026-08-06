@@ -437,10 +437,12 @@ by itself; a PC breakpoint cannot name the k-th visit; a contaminated
 count cannot disambiguate; an async kick can arrive after unbounded work.
 Viable forms, all derivative: E1 reproducing the hardware x86 coordinate
 exactly; C decoding/counting it; or Linux and macOS both running the same
-instrumented image and logging `SW_EDGE_v1` (the increments are
-straight-line and branch-free, so hardware branch counts on the Linux side
-are unperturbed; both clocks logged at every event, each side lands on its
-own). Branch-into-new-future additionally requires a record-capable clock
+instrumented image and logging `SW_EDGE_v1`. Precision note: the ticks are
+branch-free `add`s, but the deadline *checks* add a conditional branch per
+site, so an instrumented image's hardware branch counts run deterministically
+higher than an uninstrumented image's — harmless, since films bind to the
+image and units were never comparable across images; both clocks are logged
+at every event and each side lands on its own. Branch-into-new-future additionally requires a record-capable clock
 on macOS — i.e., B.
 
 ### G. Adjacent, honestly not macOS: Linux bare metal (Asahi lineage)
