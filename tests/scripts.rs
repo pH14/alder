@@ -568,7 +568,11 @@ fn ensure_executor_refreshes_first_and_starts_when_nothing_is_alive() {
     assert!(sandbox.state.join("worktree/.alder/config.json").is_file());
 
     let prompt = sandbox.state_file("prompt");
-    for needed in ["PASS.md", "log,due", "merge --ff-only main"] {
+    for needed in [
+        ".agent/skills/pass/SKILL.md",
+        "log,due",
+        "merge --ff-only main",
+    ] {
         assert!(
             prompt.contains(needed),
             "prompt lacks `{needed}`:\n{prompt}"
@@ -602,7 +606,7 @@ fn ensure_executor_sends_the_triggers_to_a_young_live_executor() {
         "sent line lacks the triggers: {sent}"
     );
     assert!(
-        sent.contains("PASS.md"),
+        sent.contains(".agent/skills/pass/SKILL.md"),
         "sent line lacks the brief: {sent}"
     );
 }

@@ -39,7 +39,8 @@
 # that worktree (main stays checked out in the primary checkout, and git
 # allows a branch in only one worktree), so the executor performs them in
 # the primary checkout with `git -C <primary-root>`, and pushes main from
-# there; PASS.md states the same rule from the executor's side.
+# there; .agent/skills/pass/SKILL.md states the same rule from the executor's
+# side.
 #
 # Tunables, all environment: ALDER_EXECUTOR_TIER (default `fable`),
 # ALDER_EXECUTOR_BRANCH (default `executor`),
@@ -119,7 +120,7 @@ note() { # note <handle> <honored-rotate-seq>
 
 deliver() { # deliver <handle> — one line naming the triggers
   printf '%s\n' \
-    "Read the current Alder state and act on it. Your brief is PASS.md. Triggers this wake: $triggers." \
+    "Read the current Alder state and act on it. Your brief is .agent/skills/pass/SKILL.md. Triggers this wake: $triggers." \
     >"$scratch/wake"
   "$runner" send "$1" --file "$scratch/wake"
 }
@@ -167,7 +168,7 @@ start_fresh() { # start_fresh <note-seq> <adopt|no-adopt>
   printf '%s\n' \
     "You are the alder executor. First fast-forward this worktree to current" \
     "main: git merge --ff-only main (your seat branch $branch carries no commits" \
-    "of its own). Then build the CLI (cargo build) and read PASS.md at the" \
+    "of its own). Then build the CLI (cargo build) and read .agent/skills/pass/SKILL.md at the" \
     "worktree root — it is your entire brief. Read the current Alder state and" \
     "act on it. Triggers this wake: $triggers." \
     >"$scratch/prompt"
