@@ -1,33 +1,27 @@
-//! Launch one execution: a prompt, a model at some effort, a branch to leave
-//! the result on, and a handle to reach it by.
+//! Start one model run and print the handle used to manage it.
 //!
-//! The whole start is one command: cut or adopt a worktree on the given
-//! branch, start a tmux session running the tier's engine on the prompt, and
-//! print the handle. The runner knows nothing about what the prompt says or
-//! what the result means — the branch is where the result lives, and that is
-//! the whole contract.
+//! One command prepares or reuses a worktree on the requested branch, starts
+//! the tier's model command in tmux, and prints the handle. The runner does not
+//! interpret the prompt or the result. Whatever the model leaves on the branch
+//! is the result.
 //!
-//! **The prompt is argv, never keystrokes.** The prompt file's contents are
-//! handed to the engine as its final argument. Nothing is typed into the
-//! pane, so nothing waits for the engine to boot, nothing can be read as a
-//! key name, and a prompt containing quotes or semicolons is just a string.
-//! There is no sleep anywhere on this path. Three tests below hold that, and
-//! all three are titled for it: one counts the questions a start puts to the
-//! world, and two read the source for a duration or a clock it could wait on
-//! — this module's own half, and the two halves of [`crate::host::Host`] the
-//! start runs in.
+//! The prompt is a command-line argument, not simulated keyboard input. Its
+//! contents are passed as the model command's final argument. Quotes,
+//! semicolons, and tmux key names remain ordinary text. The runner does not
+//! wait for the model to become ready, and there is no sleep in this path.
+//! Tests below check the number of external operations and inspect this module
+//! and [`crate::host::Host`] for code that could wait.
 //!
-//! **The pane outlives the engine.** The command ends `; exec bash`, so a
-//! one-shot engine that finishes its turn leaves a live session behind. The
-//! handle stays observable (`status` says `done` rather than `dead`), and a
-//! later message can still be delivered with `send`.
+//! The tmux pane stays open after the model exits. The command ends with
+//! `; exec bash`, so `status` can report `done` instead of `dead` and
+//! `send` can resume a model command that exits after one response.
 //!
-//! **Repair adopts its own residue.** A worktree is accepted only on the
-//! expected branch, an unregistered directory left by a torn `git worktree
-//! add` is swept before a retry, and a session is stamped with its identity
-//! as it is created. A live engine under the same handle is refused; an
-//! exited pane is replaced, because `start` means "run this prompt" and an
-//! exited pane already ran its own.
+//! If an earlier start stopped partway through, the next start checks what it
+//! left behind. It reuses a worktree only when Git says it is on the requested
+//! branch, removes an unregistered directory left by an interrupted
+//! `git worktree add`, and records a session's identity when creating it. A
+//! live model under the same handle is refused. A pane whose model has exited
+//! is replaced because it belongs to an earlier prompt.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -40,29 +34,29 @@ use crate::{
     tier::Tier,
 };
 
-/// Replaces the whole engine invocation, so a test can start a stub instead
-/// of a model. The value is split on whitespace — no shell quoting — and the
+/// Replaces the complete model command so a test can start a stub. The value
+/// is split on whitespace — no shell quoting — and the
 /// prompt is still appended as the final argument. An empty or
 /// whitespace-only value is a hard error at start, never a silent fallback.
 pub const RUNNER_CMD_ENV: &str = "ALDER_EXT_RUNNER_CMD";
 
-/// The session environment the runner stamps at creation, and reads back for
-/// adoption, `status`, and `send`. These are the runner's own names: the
-/// runner stamps nothing of anyone else's into a session.
+/// Environment variables the runner records in a new session and later reads
+/// for `start`, `status`, and `send`. The runner adds only its own names to a
+/// session.
 pub(crate) const HANDLE_ENV: &str = "ALDER_EXT_RUNNER_HANDLE";
 pub(crate) const ENGINE_ENV: &str = "ALDER_EXT_RUNNER_ENGINE";
 pub(crate) const TIER_ENV: &str = "ALDER_EXT_RUNNER_TIER";
-/// The provider the start resolved, stamped so `send` routes delivery by what
-/// actually launched rather than by whatever the tier table says later.
+/// The provider selected by `start`. `send` reads this value instead of a
+/// tier table that may have changed since the run started.
 pub(crate) const PROVIDER_ENV: &str = "ALDER_EXT_RUNNER_PROVIDER";
 pub(crate) const WORKTREE_ENV: &str = "ALDER_EXT_RUNNER_WORKTREE";
-/// Stamped by `send` when a delivery tore between paste and Enter, so the
-/// pane refuses further sends until a human (or `--force`) resolves it.
+/// Recorded when `send` pasted text but could not submit it with Enter. Later
+/// sends refuse the pane until a person resolves it or uses `--force`.
 pub(crate) const TORN_ENV: &str = "ALDER_EXT_RUNNER_TORN";
 pub(crate) const ENGINE_RUNNING: &str = "running";
 pub(crate) const ENGINE_EXITED: &str = "exited";
 
-/// One file to copy into the worktree before the engine starts:
+/// One file to copy into the worktree before the model starts:
 /// `--seed <source>:<relative destination>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seed {
@@ -103,7 +97,7 @@ impl Seed {
     }
 }
 
-/// One started execution.
+/// The run created or found by `start`.
 #[derive(Debug, Clone)]
 pub struct Started {
     /// The opaque handle `status`, `send`, and `kill` take. It is also the
@@ -114,7 +108,7 @@ pub struct Started {
     pub effort: &'static str,
     pub branch: String,
     pub worktree: PathBuf,
-    /// Whether an existing worktree on the branch was adopted rather than cut.
+    /// Whether `start` reused a worktree that already existed on the branch.
     pub adopted_worktree: bool,
 }
 
@@ -137,8 +131,8 @@ impl Started {
     }
 }
 
-/// The handle for one branch: deterministic, so a crashed start re-run against
-/// the same branch converges on the same session instead of doubling it.
+/// The handle for one branch. Repeating `start` after a crash uses the same
+/// handle, so it cannot silently create a second session for that branch.
 ///
 /// Known, accepted risk: the slug is lossy (`work/al-1` and `work_al_1` both
 /// become `alder-ext-work-al-1`), so two colliding branches share a handle,
@@ -160,12 +154,11 @@ pub fn handle_for_branch(branch: &str) -> String {
     format!("alder-ext-{slug}")
 }
 
-/// Pick the rung a start actually runs on.
+/// Choose the tier that `start` will actually run.
 ///
-/// A rung whose provider is rate-limited right now is served by the rung of
-/// equal standing on the other ladder. If both providers are limited there is
-/// nothing better to do than the thing that was asked for, so the requested
-/// rung stands and the caller is told why.
+/// If the requested tier's provider is rate-limited, use that tier's
+/// configured counterpart on the other provider. If both providers are
+/// limited, keep the requested tier and tell the caller why.
 pub fn dispatch_tier<'table>(
     table: &'table [Tier],
     requested: &'table Tier,
@@ -197,14 +190,13 @@ pub fn dispatch_tier<'table>(
     )
 }
 
-/// The command the pane runs: the engine, on the prompt, ending in a shell.
+/// Build the shell command that runs the model on the prompt.
 ///
-/// Every word is quoted, so the prompt reaches the engine as one argument
-/// however it is spelled, and `exec bash` replaces the engine when it exits so
-/// the session — and therefore the handle — survives a one-shot run. A Codex
-/// launch starts its session-ID watcher before the engine; that watcher is
-/// independent of the model's first tool call and returns immediately rather
-/// than waiting for Codex to boot.
+/// Every word is quoted, so the complete prompt reaches the model as one
+/// argument. When the model exits, `exec bash` keeps the session and handle
+/// alive. A Codex launch starts its session-ID watcher before the model. The
+/// watcher does not depend on the model's first tool call and returns without
+/// waiting for Codex to start.
 ///
 /// Nothing wraps the engine to keep the host awake: keeping a machine awake
 /// is the host's business — a launchd or systemd unit, or the machine's own
@@ -236,8 +228,8 @@ pub fn pane_command(
     )
 }
 
-/// The engine invocation, before the prompt is appended: the tier's own
-/// command, or whatever [`RUNNER_CMD_ENV`] replaced it with.
+/// The model command before the prompt is appended: the tier's command, or
+/// the command supplied through [`RUNNER_CMD_ENV`].
 pub fn engine_command(
     tier: &Tier,
     git_common_dir: Option<&str>,
@@ -253,10 +245,10 @@ pub fn engine_command(
     }
 }
 
-/// The launching repository's `.git`, which an execution's linked worktree
-/// keeps its index, objects and branch ref inside. Absolute, because it is
-/// handed to a sandbox that has no idea what the execution's working
-/// directory is.
+/// Return the launching repository's `.git` directory as an absolute path.
+/// A linked worktree keeps its index, objects, and branch ref there. The
+/// sandbox needs the absolute path because it does not know the run's working
+/// directory.
 ///
 /// Falling back to `<repo>/.git` if git cannot answer is deliberate: an
 /// execution that cannot commit is useless, and the fallback is right for
@@ -276,7 +268,7 @@ fn git_common_dir(host: &impl RunnerHost) -> String {
     }
 }
 
-/// Everything one start is asked for.
+/// Arguments needed to start one run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Request<'a> {
     pub branch: &'a str,
@@ -285,11 +277,11 @@ pub struct Request<'a> {
     /// Cut a NEW branch from this ref instead of the repository's current
     /// `HEAD`. An existing branch is reused unchanged, exactly as without it.
     pub from: Option<&'a str>,
-    /// Files to copy into the worktree before the engine starts.
+    /// Files to copy into the worktree before the model starts.
     pub seeds: &'a [Seed],
 }
 
-/// One start, whole.
+/// Start one run.
 pub fn start(
     host: &impl RunnerHost,
     tier: &'static Tier,
@@ -408,14 +400,13 @@ pub fn start(
     }
 }
 
-/// Remove the expected worktree path only when Git has no record of it.
+/// Remove the expected worktree path only when Git does not list it.
 ///
 /// `git worktree add` creates the directory before its admin entry, so a
 /// process killed in that window leaves a path that is neither a worktree nor
 /// safe for a later `worktree add`. The inverse can happen if `worktree
-/// remove` loses its files after unregistering it. Git's registry is the
-/// authority here: a listed worktree is never removed, even if it otherwise
-/// looks stale.
+/// remove` deletes the registration before all files are gone. A listed
+/// worktree is never removed, even if it otherwise looks stale.
 fn sweep_unregistered_worktree(
     host: &impl RunnerHost,
     worktree_parent: &Path,
@@ -604,12 +595,12 @@ fn launch(
     Ok(())
 }
 
-/// Copy each `--seed` file into the worktree, refusing symlinked ground.
+/// Copy each `--seed` file into the worktree without following symlinks.
 ///
-/// The destination and every parent of it inside the worktree must be a real
-/// directory or absent: a symlink anywhere on the path would let a crafted
-/// worktree (worktrees are execution-writable across restarts) aim the copy
-/// outside itself, so the walk refuses rather than follows.
+/// The destination and every parent inside the worktree must be a real
+/// directory or missing. The model can change the worktree between starts, so
+/// a symlink could point the copy outside it. This check refuses the path
+/// instead of following the link.
 fn seed_worktree(host: &impl RunnerHost, worktree: &Path, seeds: &[Seed]) -> Result<()> {
     for seed in seeds {
         let mut prefix = worktree.to_path_buf();
@@ -638,11 +629,11 @@ fn seed_worktree(host: &impl RunnerHost, worktree: &Path, seeds: &[Seed]) -> Res
     Ok(())
 }
 
-/// Undo what this run made, best effort and loudly. An adopted worktree is
-/// never removed: it existed before this start and may hold work. A worktree
-/// this run did cut is still only removed if no session answers to the handle
-/// at undo time — a session that exists (however it got there) may be using
-/// the worktree, and a worktree is never pulled out from under a live pane.
+/// Clean up what this call created, report failures, and leave earlier files
+/// alone. A worktree that existed before this call is never removed because
+/// it may contain work. A worktree created by this call is removed only when
+/// no session answers to the handle; an existing session may still be using
+/// it.
 fn undo(
     host: &impl RunnerHost,
     made: &Made,
@@ -1206,21 +1197,14 @@ mod tests {
         assert!(!host.called("send-keys"));
     }
 
-    /// A start asks the world a fixed set of questions and never asks again.
+    /// Check that `start` makes a fixed set of observations exactly once.
     ///
-    /// A wait is an observation made again in the hope of a different answer,
-    /// so the two are the same claim seen from either end. What a caller can
-    /// observe about whether a start waited is exactly which questions went
-    /// out and how many times, and every question this path puts to the world
-    /// goes through the host — so the log below is that observation, not a
-    /// note about a double's internals. A loop that waited for the engine to
-    /// come up — sleeping between looks or spinning — would appear here as
-    /// another observation, and would appear whatever else the machine was
-    /// doing.
+    /// A readiness loop would ask for the same state again. The fake host
+    /// records every observation, so repeated checks appear in its call log
+    /// whether the loop sleeps or spins.
     ///
-    /// This is the start's half. `Host` runs no code here, so what the real
-    /// commands do once they leave is checked where they really run, in
-    /// `tests/start_host.rs`.
+    /// This test covers the start logic. `tests/start_host.rs` covers the real
+    /// Git and tmux commands.
     #[test]
     fn the_start_asks_the_world_a_fixed_set_of_questions_and_never_asks_again() {
         let host = Fake::new();
@@ -1270,29 +1254,20 @@ mod tests {
         );
     }
 
-    /// This module itself cannot wait in process, whatever it is asked to do.
+    /// Check that this module contains no code that sleeps or polls.
     ///
-    /// The counts above are about the questions that reach the world. A
-    /// `thread::sleep` here reaches nothing and so shows in no ledger, and
-    /// elapsed time cannot show it either: this path's cost is process
-    /// creation — `git`, `tmux` — so on a loaded machine a clock reports the
-    /// machine rather than the code. What no load can make untrue is the
-    /// source. Waiting in process needs a duration or a clock to wait on, and
-    /// this module's start half names neither, nor the thread facilities that
-    /// would wait on one.
+    /// The call-count test cannot detect a local `thread::sleep`, and a timing
+    /// test would be unreliable on a loaded machine. Inspecting the source
+    /// catches clocks, durations, and thread operations that could implement a
+    /// wait.
     ///
-    /// Only this module, and deliberately. A bounded timeout on a command
-    /// that can hang is a limit rather than a wait; but it is a limit on a
-    /// *command*, and nothing here runs one. Every command goes out through
-    /// `host::Host`, which is where such a timeout would belong and where
-    /// this test would be wrong to forbid it. The host is read by the test
-    /// after this one, which allows it exactly that and nothing else; what
-    /// the host's commands do once they leave is checked where they really
-    /// run, in `tests/start_host.rs`.
+    /// This scan covers only the start logic. Bounded timeouts for Git or tmux
+    /// belong in `host::Host` and may use `Duration`. The following test scans
+    /// that code separately.
     ///
-    /// `DateTime` is exempt below by naming its uses: `dispatch_tier` takes
-    /// the caller's `now` to compare against a recorded rate-limit deadline,
-    /// which reads no clock and waits on nothing.
+    /// `DateTime` is allowed because `dispatch_tier` receives a time from its
+    /// caller and compares it with a rate-limit deadline; it does not read a
+    /// clock or wait.
     #[test]
     fn this_modules_start_half_can_name_no_clock_and_no_sleep() {
         let code = without_comments(before_the_tests(include_str!("start.rs")));
@@ -1320,27 +1295,17 @@ mod tests {
         }
     }
 
-    /// The host the start runs in cannot wait for an engine either.
+    /// Check that the real host does not wait for a model to become ready.
     ///
-    /// The test above reads this module; this one reads the other half of the
-    /// same path, `host::Host` — its inherent block, where every command is
-    /// built and run, and its `RunnerHost` block, the only host code a start
-    /// reaches. A readiness sleep put there would reach no tmux command, so
-    /// it would show in no ledger and in no call list; the source is again
-    /// what no load can make untrue.
+    /// This test scans the `Host` methods that run commands and its
+    /// `RunnerHost` implementation. A call-log test would not detect a sleep
+    /// inside those methods.
     ///
-    /// `Duration` is permitted here and banned above, and that difference is
-    /// the whole point of scanning the two halves separately. This half runs
-    /// commands, so a bounded timeout on one that can hang is a limit, and a
-    /// limit needs a duration. What a limit does not need is a way to stand
-    /// still, a clock to stand still by, or another thread to stand still
-    /// until — so two families are refused. Standing still: `sleep`, `park`,
-    /// `yield_now`, `spin_loop`, and the `Instant`/`elapsed` pair a
-    /// hand-rolled deadline reads. Standing still until another thread says
-    /// when: `recv` in every spelling, `Condvar`, `Barrier`.
+    /// `Duration` is allowed here for a bounded external-command timeout.
+    /// Sleep, polling, clocks used for a hand-written wait, and thread
+    /// synchronization primitives are not allowed.
     ///
-    /// The scan is lexical and block-scoped, which is its limit: it holds for
-    /// the code these two blocks contain, not for something they call out to.
+    /// The scan checks only the text inside these two implementation blocks.
     #[test]
     fn the_hosts_start_facing_halves_can_name_no_sleep_and_no_clock() {
         let source = include_str!("host.rs");
@@ -1383,8 +1348,8 @@ mod tests {
         }
     }
 
-    /// The host effects a start only reads the world with. A wait has to
-    /// repeat one of these; the ones that change the world it has no use for.
+    /// Host operations that read state during `start`. A readiness loop would
+    /// repeat one of these calls.
     const OBSERVING_EFFECTS: [&str; 6] = [
         "tmux observe",
         "exists ",
@@ -1394,7 +1359,7 @@ mod tests {
         "git worktree list",
     ];
 
-    /// Everything in a module ahead of its own tests.
+    /// Return the part of a module before its test module.
     fn before_the_tests(source: &str) -> &str {
         source
             .split_once("\n#[cfg(test)]\n")
@@ -1402,12 +1367,11 @@ mod tests {
             .0
     }
 
-    /// The body of one top-level `impl` block, its header line excluded.
+    /// Return the body of one top-level `impl` block without its header.
     ///
-    /// A rustfmt'd block is the text between its header and the first line
-    /// that closes at column zero. Both ends are required to be there, so
-    /// renaming or reshaping a block fails this loudly rather than quietly
-    /// scanning an empty string.
+    /// In rustfmt output, the first closing brace at column zero ends the
+    /// block. Missing boundaries fail the test instead of returning an empty
+    /// string.
     fn impl_block<'a>(source: &'a str, header: &str) -> &'a str {
         let opened = source
             .split_once(&format!("\n{header}\n"))
@@ -1419,8 +1383,7 @@ mod tests {
             .0
     }
 
-    /// Source with its whole-line comments dropped, so that prose about
-    /// waiting is not mistaken for code that waits.
+    /// Remove whole-line comments before scanning source for waiting code.
     fn without_comments(source: &str) -> String {
         source
             .lines()

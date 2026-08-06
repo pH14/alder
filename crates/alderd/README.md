@@ -1,69 +1,87 @@
 # alderd
 
-`alderd` decides *when* to run the executor, and nothing else. It never
-decides *what* the executor should do, and — since the execution extraction —
-it no longer knows *how* the executor runs: no tmux, no engines, no sessions,
-no panes. When a trigger fires it runs one configured shell command; whatever
-that command drives is its own business.
+`alderd` decides when to run one configured command. In the standard Alder
+setup, that command wakes the **executor**, the agent that reads current
+project state and decides what work to do. The daemon does not make those
+decisions itself.
 
-The daemon holds no API token, links no model client, and reads no work,
-attempt, or question state. It shells out to the `alder` CLI for everything it
-knows about the log. Its complete read surface is one command:
+The daemon also does not know how the executor runs. It has no model client,
+API token, tmux logic, engine names, sessions, or panes. When it is time to
+act, it runs the shell command from `.alder/driver.json` and waits for that
+command to finish.
 
-1. `alder status --json` — the head, and the loop section's paused flag,
-   nudge sequence, and review deadlines. Everything else in the document is
-   ignored.
+## What the daemon reads and writes
 
-And it appends **nothing**: the log never mentions its own readers. The wake
-rule is one comparison — the head has moved past the last head this daemon
-acted on — where the baseline is the daemon's machine-local notes,
-`.alder/alderd-notes.json` (the last head acted on, and when). Losing the
-notes is harmless: the daemon runs the command once more than it needed to,
-the executor behind the command reads the fold, finds nothing new, and idles.
+The daemon learns about the shared log by running exactly one Alder command:
 
-The loop runs no Git command and no tmux command.
+~~~text
+alder status --json
+~~~
 
-Anything that requires judgment — which work to start, whether an attempt is
-stale, what a report means — belongs to the executor. Anything mechanical
-about running one — sessions, engines, rotation — belongs to the configured
-command (and, underneath it, to tools like `alder-ext-runner`, which alderd
-knows nothing about).
+From that document it reads the current **head**, which is the sequence number
+of the latest log event, and three fields from the loop section: whether the
+loop is paused, the sequence of the latest nudge, and the review deadlines. A
+**nudge** is a request made with `alder loop nudge` to run the command as soon
+as possible. The daemon ignores work items, attempts, questions, and every
+other field.
 
-The boundary runs one way: Alder never calls `alderd`, `alderd` reaches the
-log only through the `alder` CLI, and it links no Alder crate.
+The daemon never appends to the Alder log. Wakes are not project facts, so the
+log does not record that the daemon ran or that an executor read it. The only
+state the daemon writes is `.alder/alderd-notes.json`. That local file records
+the last log head for which this daemon successfully ran the command and the
+time it made that decision.
 
-See [`docs/v0/LOOP.md`](../../docs/v0/LOOP.md) for the durable model behind
-this: the loop controls, deferrals, and why a missed or duplicated wake is
-harmless.
+Losing the notes file is safe. The daemon may run the command one extra time,
+but the executor reads the current state again and has nothing to do if
+nothing needs attention. A missed wake is also safe because a later poll sees
+the head mismatch. Running the command is called a **wake** in this document.
+
+The daemon runs no Git or tmux commands. Anything that needs judgment belongs
+to the executor. Anything that starts or manages the executor belongs to the
+configured command and tools that command uses, such as
+`alder-ext-runner`.
+
+The dependency boundary goes one way: Alder never calls `alderd`, and
+`alderd` reaches the log only by running the `alder` CLI. The daemon does not
+link any Alder crate.
+
+See [`docs/v0/LOOP.md`](../../docs/v0/LOOP.md) for the log rules behind this
+design.
 
 ## Running it
 
-```text
+~~~text
 alderd [--root <project>]
-```
+~~~
 
-The project must already be initialized (`alder init`), and `.alder/driver.json`
-must exist. `alderd` reads the store remote and ref from `.alder/config.json`
-so it watches exactly the ref Alder writes.
+The project must already have been initialized with `alder init`, and
+`.alder/driver.json` must exist. The daemon reads the store remote and ref
+from `.alder/config.json` so it watches the same log that Alder writes.
 
-The daemon runs on macOS and Linux. It needs the `alder` binary on PATH (or
-named in the config), `/bin/sh` for the command, and nothing else.
+The daemon supports macOS and Linux. It needs the `alder` binary on `PATH`,
+unless the config names a different path, and it needs `/bin/sh` to run the
+configured command.
 
-Logs go to standard error; the command's own output passes through to the
-same place. Supervision is supplied for launchd only. To opt in for this
-checkout, run `scripts/alderd-install.sh`; it renders
-`contrib/com.alder.alderd.plist` into `~/Library/LaunchAgents/` and loads it.
-Run `scripts/alderd-uninstall.sh` to unload and remove it. Re-running install
-adopts the existing label and converges to the current checkout paths. On
-Linux there is no equivalent yet; run the loop under a supervisor of your own.
+Logs go to standard error. The configured command's output goes there too.
+
+The repository includes launchd support for macOS:
+
+- `scripts/alderd-install.sh` writes
+  `~/Library/LaunchAgents/com.alder.alderd.plist` for the current checkout
+  and loads it.
+- `scripts/alderd-uninstall.sh` unloads and removes that file.
+- Running the install script again updates the existing launchd job to use
+  the current checkout paths.
+
+Linux supervision is not included. Run `alderd` under a supervisor of your
+choice.
 
 ## Configuration
 
-`.alder/driver.json`. The `.alder/` directory is gitignored, so this file is
-machine-local by design: what command runs the executor and how aggressively
-to poll are properties of the box, not durable project facts.
+`.alder/driver.json` is ignored by Git because its command and timing settings
+belong to one machine, not to the shared project log.
 
-```json
+~~~json
 {
   "command": "scripts/ensure-executor",
   "pollSeconds": 60,
@@ -74,119 +92,143 @@ to poll are properties of the box, not durable project facts.
   "notify": "terminal-notifier -title alder -message",
   "alder": "alder"
 }
-```
+~~~
 
-That `command` is this repository's standard wiring: `scripts/ensure-executor`
-keeps one resident executor session alive through `alder-ext-runner`, rotates
-it on age or on a durable rotation request, runs the observation sweep
-(`alder refresh`) at the top of every wake, and delivers the trigger names to
-the session. The 600-second `commandTimeoutSeconds` bounds one wake
-comfortably: the command starts or messages a session and exits without
-waiting on the executor's work. For the sweep to see runner-launched
-executions, the project's observer manifest (`.alder/config.json`) carries
-the execution probe:
+`scripts/ensure-executor` is this repository's standard command. On every
+wake it first runs `alder refresh` to update observations. It then uses
+`alder-ext-runner` to keep one executor session available, replace an old
+session or honor a rotation request, and send the trigger names to the
+session. The command starts or messages the executor and returns; it does not
+wait for the executor to finish its work.
 
-```json
+For `alder refresh` to observe runs started by the runner,
+`.alder/config.json` includes this execution probe:
+
+~~~json
 {"observer": "runner", "probe": "scripts/observe-runner.sh \"$1\""}
-```
+~~~
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `command` | required | The shell command a wake runs, via `/bin/sh -c` in the project root with stdin closed. It receives the trigger names in `ALDERD_TRIGGERS`. |
-| `pollSeconds` | 60 | Poll interval. |
-| `hintPollSeconds` | 1 | How often to stat the local append marker between full polls. |
-| `debounceSeconds` | 20 | How long a fire condition must hold before running. |
-| `maxIntervalSeconds` | 1800 | Ceiling between runs. It also overrides the debounce, and it is the backstop for a deferral deadline the executor has not yet reviewed. |
-| `commandTimeoutSeconds` | 600 | Bound on one command run. A command still running at the bound is killed and the wake fails: nothing is noted, and the next poll retries it. A hung executor must not wedge the daemon. |
-| `notify` | none | Shell command invoked with one message argument, on a repeated store outage or an unreadable status. A standing condition is reported once, not once per poll. |
-| `alder` | `alder` | Path to the `alder` binary. The daemon's own `alder status` read carries a fixed 60-second bound; a CLI that hangs past it is killed and counted as an outage. |
+| `command` | required | Shell command run for each wake. The daemon runs `/bin/sh -c` in the project root, closes standard input, and puts the comma-separated trigger names in `ALDERD_TRIGGERS`. |
+| `pollSeconds` | 60 | Time between full status reads. |
+| `hintPollSeconds` | 1 | Time between checks of the local `.alder/last-append` file. A changed file causes an early full status read. |
+| `debounceSeconds` | 20 | Time a fire condition must remain present before the command runs. This combines a burst of log writes into one wake. |
+| `maxIntervalSeconds` | 1800 | Longest allowed time between successful wakes. Reaching this limit ignores the debounce delay and also makes a missed review deadline run again. |
+| `commandTimeoutSeconds` | 600 | Maximum time for one command run. At the limit, the daemon kills the command, does not update its notes, and retries on a later poll. |
+| `notify` | none | Shell command called with one message argument after repeated store failures or unreadable status documents. One continuing problem is reported once, not on every poll. |
+| `alder` | `alder` | Path to the Alder CLI. Every `alder status` call has its own fixed 60-second timeout. |
 
-**Migrating an older config.** `driver.json` rejects unknown fields. A config
-written before the execution extraction must delete `engines`, `passDoc`,
-`tmuxSession`, and `maxSessionAgeSeconds` — the engine table and the session
-craft now live behind the configured `command` (see `crates/alder-ext-runner`
-for the tool that took them) — and must add `command`, which is now the one
-required field. Older configs still carrying `passTimeoutSeconds` or
-`maxPassesPerSession` (from before session rotation replaced pass counting)
-delete those too. Until then the daemon refuses to start with:
+### Updating an old config
 
-```text
+Unknown fields are errors. A config from before executor startup moved out of
+the daemon must remove `engines`, `passDoc`, `tmuxSession`, and
+`maxSessionAgeSeconds`, then add the required `command` field. Still older
+configs must also remove `passTimeoutSeconds` and `maxPassesPerSession`.
+
+Until those fields are removed, startup reports an error such as:
+
+~~~text
 invalid driver config `.alder/driver.json`: unknown field `engines`, expected
 one of `command`, `pollSeconds`, `hintPollSeconds`, `debounceSeconds`,
 `maxIntervalSeconds`, `commandTimeoutSeconds`, `notify`, `alder` at line 2
 column 12
-```
+~~~
 
-## What one poll does
+## What happens during one poll
 
-1. Read the head and the loop fold, bounded at 60 seconds — a hung `alder`
-   is killed and counted as an outage. A `store_unavailable` result, a
-   timeout, or a status document the wake rule cannot be decided from (no
-   head, or a loop section without `paused` — never read as unpaused) is
-   retried silently and notified after three consecutive polls.
-2. If the loop is paused, idle.
-3. Compute the trigger kinds that hold:
-   `manual` (a nudge request is later in the log than the noted head),
-   `log` (the head differs from the noted head), and
-   `due` (a deferral deadline — any entry in the loop section's
-   `review_deadlines` — arrived and no run has been delivered since it
-   passed, or `maxIntervalSeconds` elapsed since the last run).
-4. Decide: idle if nothing holds, hold if the debounce has not settled (the
-   ceiling and a pending nudge override it), fire otherwise.
+First the daemon runs `alder status --json`, with a 60-second timeout, and
+checks that the result has enough information to make a safe decision.
 
-Firing is strictly ordered:
+These results count as a failed read:
 
-1. **Run the command.** `/bin/sh -c <command>` in the project root, with
-   `ALDERD_TRIGGERS=<kinds>` (for example `log,due`) in its environment, and
-   wait for it, at most `commandTimeoutSeconds`. A non-zero exit — or a
-   command killed at the bound — is a failed poll: nothing is noted, and the
-   next poll runs the same wake again.
-2. **Note.** Write the head this run acted on, and the decision instant —
-   the time the trigger was judged, before the command ran, so a deadline
-   that passes while the command runs still earns its wake on the next poll
-   — to `.alder/alderd-notes.json`. The note comes last on purpose: a crash
-   before it re-runs the wake next poll, and a duplicate run is harmless —
-   the executor reads the fold, and nothing durable records wakes. A note
-   whose time sits in the future (the clock rolled back) is clamped to now
-   with a logged warning.
+- Alder reports `store_unavailable`.
+- The command reaches its timeout.
+- The status document has no head.
+- The loop section has no `paused` value. A missing value is not treated as
+  `false`.
 
-Nothing else. The command exits; whatever it caused to be appended moves the
-head, and the next poll sees it. Two daemons pointed at one log at worst run
-duplicate wakes, and a duplicate wake is safe because the runner's `start`
-serializes per handle behind an exclusive lock and refuses while an execution
-is live — the second wake refuses rather than doubling or disturbing the
-first.
+The daemon retries failed reads without running the configured command. After
+three consecutive failed polls, it calls the configured notification command.
+It does not repeat the same notification on every later poll.
 
-Trigger kinds are provenance, never scope: a command run for `due` still has
-to read the complete state, because the driver cannot know what else changed
-and is not allowed to guess.
+If the loop is paused, the daemon does nothing else during that poll.
 
-The rotation request in the loop section is deliberately not a daemon
-trigger anymore. Its append moves the head, which wakes the command like any
-other write; honoring the rotation — ending whatever session era the command
-maintains — is the command's job, by reading status itself.
+Otherwise it determines which of these **triggers** are present. A trigger is
+a reason to run the command:
 
-## Local hint
+- `manual`: the latest nudge was appended after the head in this daemon's
+  notes.
+- `log`: the current head differs from the head in the notes.
+- `due`: a review deadline has arrived and this daemon has not run since that
+  deadline passed, or `maxIntervalSeconds` has elapsed since the last run.
 
-Every confirmed append by the `alder` CLI touches `.alder/last-append`.
-Between full polls the driver stats that marker every `hintPollSeconds` and
-runs its next full poll as soon as the mtime moves past its last read, so an
-append made on this machine is noticed in about a second rather than up to
-`pollSeconds`. The hint has zero correctness weight: it only ever causes a
-status read that would have happened anyway, appends from other machines still
-ride the ordinary poll, and a missing or stale marker changes nothing. The
-notes file is the same idea generalized — not "something was appended" but
-"the last head I acted on" — and carries the same zero project-durable
-weight.
+If no trigger is present, the poll ends. If a trigger has been present for
+less than `debounceSeconds`, the daemon normally waits for another poll. A
+manual trigger or the `maxIntervalSeconds` limit skips that delay.
+
+### Running and then recording a wake
+
+When the daemon decides to run, it performs two steps in this order:
+
+1. It runs `/bin/sh -c <command>` in the project root, with standard input
+   closed and `ALDERD_TRIGGERS=<kinds>` in the environment. For example,
+   `ALDERD_TRIGGERS=log,due` reports both reasons. The daemon waits no longer
+   than `commandTimeoutSeconds`.
+2. Only after the command exits successfully, it writes the current head and
+   the decision time to `.alder/alderd-notes.json`.
+
+The recorded time is when the daemon decided to run, before the command
+started. If a review deadline passes while the command is running, the next
+poll still sees that the daemon has not run for that deadline.
+
+If the command exits with a nonzero status, reaches its timeout, or the daemon
+stops before writing the notes, the notes remain unchanged. The next poll
+runs the same wake again. The command and executor must therefore be safe to
+run more than once for the same head.
+
+If the system clock moves backward and a recorded time appears to be in the
+future, the daemon reports a warning and uses the current time instead.
+
+The command may append new events. Those events move the log head, so the next
+poll sees them. Two daemons can watch the same log and both run their
+commands. In the standard setup this can cause an extra wake, but not a second
+worker: the runner locks each handle and refuses to start another live run.
+
+Trigger names explain why the daemon ran; they do not limit what the executor
+should inspect. A command invoked for `due` must still read all current state.
+The daemon cannot know what else changed.
+
+The daemon does not treat a rotation request as a separate trigger. Appending
+the request changes the head and causes the ordinary `log` trigger. The
+configured command reads current status and decides how to replace the
+executor session.
+
+## Faster local notices
+
+After a successful append, the `alder` CLI updates
+`.alder/last-append`. Between full polls, the daemon checks that file every
+`hintPollSeconds`. If its modification time changes, the daemon performs the
+next full status read early, often within a second of a local append.
+
+This file is only a speed hint. The daemon never uses its contents to make a
+decision. An append from another machine, a missing file, or a stale
+modification time is still handled by the regular full poll.
+
+`.alder/alderd-notes.json` is also local, but it has a separate narrow job:
+it records which head this daemon last ran for. It never changes the project
+log or what the executor decides.
 
 ## Testing
 
-Decision logic lives in `src/decide.rs` as pure functions over a snapshot and
-is unit tested without a shell or Git. `tests/driver.rs` runs the
-orchestration against a fake world that serves the loop fold, so the ordering
-rules — command success before the notes write, duplicate runs harmless, no
-`alder` call beyond the one read — are checked rather than asserted.
-`tests/host_alder.rs` runs the real shell-outs against stub binaries.
-`tests/sim_crash.rs` tears every effect of the wake lifecycle every way its
-footprint allows and proves recovery converges, against the real driver over
-a real in-memory CAS log.
+`src/decide.rs` contains pure decision functions that accept a status
+snapshot. Unit tests cover those functions without running Git or a shell.
+
+`tests/driver.rs` runs the daemon against a fake status source and checks
+observable ordering: the command must succeed before the notes change,
+repeating a wake is safe, and one poll makes only one Alder read.
+
+`tests/host_alder.rs` checks real subprocess behavior with stub commands.
+`tests/sim_crash.rs` interrupts the wake at every external step and verifies
+that another poll reaches the expected state using a real driver and an
+in-memory log that rejects writes based on stale state.
