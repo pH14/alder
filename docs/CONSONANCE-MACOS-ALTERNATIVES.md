@@ -146,6 +146,23 @@ Binding constraints: bit-identical never relaxed; cooperative guest (owned
 kernel, userspace, toolchain) allowed; shipping Apple software only,
 privilege posture stated per design; "unsupported" is a result.
 
+Terminology — **film** (defined here; not established project vocabulary):
+the complete durable record of one deterministic run, sufficient to
+reproduce and branch it: (a) the guest image identity (hash) and platform
+fingerprint; (b) the initial state (seed or snapshot); (c) the totally
+ordered log of injected events, each stamped with its exact work-clock
+coordinate (its Moment), plus any external input payloads. Replay
+re-executes from (b) injecting (c) at the recorded coordinates; branching
+replays to a Moment and diverges with a new future. Two contract
+consequences used throughout: a film is bound to the exact guest image and
+to the named clock unit of its coordinates (a hardware-`BR_RETIRED` film
+and a `SW_EDGE_v1` film are different artifacts, never converted), and
+same-seed independent runs must produce identical films. The word entered
+this memo from the cross-review, which used it undefined; v2 wrongly
+attributed it to the repo glossary — this session has never had the
+Consonance repo, and no such attribution should be trusted. If the project
+prefers "recording," substitute freely; the definition is what binds.
+
 Established facts:
 
 - E1. vEL2 on M4/macOS 26.5: `PMCR_EL0.N = 0`, no `PMICNTR`
