@@ -1,215 +1,261 @@
 # alder-ext-runner
 
-Give a prompt to a model at some effort that runs somewhere; get a handle.
+`alder-ext-runner` starts one model run and gives the caller a name for
+managing it. That name is the **handle**. The caller can use the handle to
+check the run, send it more input, or stop it.
 
-That is the whole of it. The runner launches one execution — a git worktree
-on a branch you name, a tmux session running a model CLI with your prompt as
-its final argument — and gives you back an opaque handle. You ask the handle
-how it is doing, send it more input, or kill it. The result's location is the
-branch you gave at start; the runner never reads or interprets it.
+Each run gets its own Git worktree and branch. The runner starts a model
+command in a detached tmux session and passes the prompt as the command's last
+argument. It does not interpret the prompt or judge the result. The branch
+contains whatever the model leaves behind.
 
-## The contract
+## Commands
 
-```text
+~~~text
 alder-ext-runner start --repo <path> --branch <name> --tier <name> --prompt-file <path>
                        [--from <ref>] [--seed <src>:<relpath>]...
 alder-ext-runner status <handle>
 alder-ext-runner send <handle> --file <path> [--force]
 alder-ext-runner kill <handle>
-```
+~~~
 
-**`start`** cuts (or adopts) a worktree beside the repository on the given
-branch — a new branch is cut from the repository's current `HEAD`, or from
-the ref `--from` names; an existing branch is reused unchanged either way —
-writes the runner's own resume machinery into its per-handle state directory
-(`<state dir>/<handle>/`, never into the worktree; see the trust model
-below), copies each `--seed <src>:<relpath>` file to `<relpath>` inside the
-worktree **before** the engine starts (refusing if the destination or any
-parent inside the worktree is a symlink — a worktree is execution-writable
-across restarts, and a planted link could aim the copy outside it), stamps
-the session with the resolved provider, and starts a detached tmux session
-running the tier's engine with the prompt file's contents (verbatim) as the
-engine's final argument. Stdout is the machine contract: the handle on the
-first line and `tier <served>` on the second — rate-limit substitution (see
-`limit` below) can serve a different rung than requested, and the caller
-records the truth. It does not wait for the engine to boot; there is no
-sleep anywhere on the path, and the tests read the source for one.
+### `start`
 
-The handle is deterministic per branch (it is derived from the branch name),
-so a crashed or repeated `start` on the same branch converges on the same
-execution instead of doubling it: a live engine under the handle is refused,
-an exited pane is replaced (its result is already safe on the branch), an
-existing worktree is adopted only after git proves it is on the expected
-branch, and residue from a torn `git worktree add`/`remove` is swept using
-git's registry as the authority. *Concurrent* starts of one branch serialize
-too: the whole sequence runs under an exclusive per-handle file lock (in the
-runner's state directory), so of two simultaneous starts one wins and the
-other refuses — either immediately on lock contention, or because it then
-sees the winner's live session — and never removes a worktree the winner is
-using.
+`start` prepares a worktree beside the repository. If the branch does not
+exist, the runner creates it from the repository's current `HEAD`, or from the
+ref named by `--from`. If the branch already exists, the runner uses it
+unchanged; `--from` does not reset an existing branch.
 
-**`status`** prints one word:
+Before the model starts, every `--seed <src>:<relpath>` argument copies one
+file into the worktree. The destination must be relative to the worktree. The
+runner refuses a destination if it or any parent directory inside the
+worktree is a symbolic link. A model can change its worktree between starts,
+so following such a link could copy a file outside the worktree.
 
-- `running` — the engine process is still going;
-- `done` — best effort, venue-specific. For tmux it means the engine process
-  exited and its holding shell remains (the pane command ends `; exec bash`,
-  so a one-shot engine leaves a live session behind). It says nothing about
-  whether the run *succeeded* — the branch holds whatever the run left, and
-  judging that is the caller's business;
-- `dead` — nothing answers to the handle.
+The runner then starts the tier's model command in a detached tmux session.
+A **provider** is a supported model CLI, currently Codex or Claude. A
+**tier** is a named configuration that selects a provider, model, and
+reasoning effort. The prompt file's contents are passed unchanged as the
+model command's final argument. Nothing is typed into the tmux pane, and the
+runner does not wait for the model to become ready. There is no sleep in the
+start path.
 
-An optional second line carries detail (the served tier, the worktree). A
-session that exists but carries no runner marker reads `running`, because a
-session of unknown provenance must never be presumed finished.
+On success, standard output has exactly two lines:
+
+~~~text
+<handle>
+tier <served>
+~~~
+
+The served tier can differ from the requested tier when one provider is
+temporarily rate-limited. The caller must record the served value.
+
+The handle is derived from the branch name, so repeated starts for the same
+branch use the same handle. The runner takes an exclusive file lock for that
+handle before changing its worktree or session. Two starts for the same
+branch therefore cannot create two runs:
+
+- If the handle already has a live model process, `start` refuses it.
+- If the tmux pane remains but the model process has exited, `start` replaces
+  the pane. The earlier run has already left its files on the branch.
+- If a tmux session exists but the runner cannot prove that its model exited,
+  `start` refuses to replace it.
+- If the expected worktree already exists, the runner uses it only after Git
+  confirms that it belongs to the requested branch.
+- If an interrupted `git worktree add` or `git worktree remove` left an
+  unregistered directory at the expected path, the runner removes that
+  directory before trying again. It never removes a worktree that Git still
+  lists.
+
+The lock and all files needed to resume a run live under
+`<state-dir>/<handle>/`, outside the worktree. This keeps a model from
+changing files that the runner will later trust or execute.
+
+### `status`
+
+`status` prints one word:
+
+- `running` means the model process is still running.
+- `done` means the model process has exited but its holding shell remains in
+  tmux. This is only a process-state report; it does not mean the model
+  succeeded. The branch contains the result.
+- `dead` means no tmux session answers to the handle.
+
+A second line may report details such as the served tier or worktree. If a
+tmux session exists but has no model-state marker from the runner, `status`
+reports `running`. The runner will not assume an unfamiliar session is
+finished.
 
 ### Exit codes
 
-Refusals are machine-readable, because callers converge on them — adopting a
-live execution, treating a lock loss as already-served, rotating a dead
-engine — and prose parsed by `sed` is not a contract:
+Callers should use exit codes and the documented standard-output shapes
+instead of parsing error messages.
 
-| code | meaning |
+| Code | Meaning |
 | --- | --- |
-| 0 | done. For `start`, stdout is `<handle>` then `tier <served>`. |
-| 1 | failure with no better classification. |
-| 3 | `start`: the handle is already running a live engine. Stdout carries exactly `handle <h>`, so the caller can adopt the execution without parsing prose. |
-| 4 | another operation on this handle holds its lock. A `send` caller should treat the message as already served by the lock winner — never kill the session over it. |
-| 5 | `start`: a session exists but cannot prove its engine exited. `send`: the execution cannot receive the delivery (the engine exited, nothing answers to the handle, the pane holds a torn send, or the codex session cannot be resumed) — the caller may rotate. |
+| 0 | The command completed. For `start`, standard output is the handle followed by `tier <served>`. |
+| 1 | The command failed and no more specific code applies. |
+| 3 | `start` found a live model under the handle. Standard output is exactly `handle <h>` so the caller can use that existing run. |
+| 4 | Another `start`, `send`, or `kill` operation holds this handle's lock. A `send` caller should treat the message as already handled by the lock winner and must not kill the session because of this code. |
+| 5 | `start` found a session whose model cannot be proved finished. For `send`, the run cannot receive the message: the model exited, no session answers to the handle, an earlier send stopped halfway, or a Codex session cannot be resumed. The caller may replace the run. |
 
-These codes and both stdout shapes are pinned in `tests/contract.rs` and
-`tests/send_stub.rs`.
+These codes and the two `start` output shapes are tested in
+`tests/contract.rs` and `tests/send_stub.rs`.
 
-**`send`** delivers a local file's contents as input to the execution. The
-route is decided by the provider **stamped into the session at start**,
-never by the current tier table: reclassifying a tier in the config after a
-start cannot change a live session's delivery protocol. The mechanics are
-internal and invisible in the contract: an interactive engine (claude) gets
-the file loaded into a tmux buffer and pasted raw, so no byte of it can
-become shell syntax or a key name; an exited interactive engine is refused
-rather than typed at, and so is a session that cannot *prove* an engine is
-running (no engine marker) — the runner never pastes at a pane of unknown
-provenance. A one-shot engine (codex) gets the bytes base64-armored into a
-command that resumes the recorded codex session through the generated
-`resume` script in the per-handle state directory — queued in the pane while
-the engine still runs, executed by the holding shell once it exits. `codex
-exec resume` inherits nothing from the session it resumes, so the resume
-script repeats the model, effort and sandbox exactly as the launch pinned
-them; it requires the exact session ID (recorded by a launcher-owned sidecar
-into the state directory's `codex-session` marker, and validated as a
-lowercase UUID before it reaches any command line) and never guesses from
-`--last`.
+### `send`
 
-A send file larger than **64 KiB** is refused by name: the armored route
-rides tmux argv, which has a hard ceiling, and past it the delivery
-mechanics stop being trustworthy. Deliver a pointer to the file instead.
-Concurrent sends to one handle serialize on the same per-handle lock as
-`start`; the loser refuses (for symmetry with `start`) rather than queueing,
-so two sends can never interleave their paste and Enter in one pane.
+`send` reads a local file and delivers its contents to the run. The runner
+records the provider in the tmux session when `start` runs, and `send` uses
+that recorded value. Changing the tier configuration later cannot change how
+an existing session receives input.
 
-Delivery is **at-least-once** and the runner never reads the pane afterwards
-— with one deliberate exception. The pane sets its engine-exited marker
-*before* it `exec`s the holding shell, and the interactive route re-checks
-that marker between the paste and the Enter: if the engine died in that
-window, the pasted bytes are sitting at (or ahead of) a shell where Enter
-would *execute* them, so `send` clears the pasted text (`C-u`), refuses
-loudly naming the session, and submits nothing. A residual window remains —
-the engine can still die between that re-check and the Enter a few
-milliseconds later — and is accepted honestly: closing it entirely would
-require the pane to prove receipt, which no engine offers; the marker-first
-pane ordering plus the re-check reduce the exposure to that sliver.
+For an interactive Claude run, `send` loads the file into a tmux buffer and
+pastes it as raw text. This prevents the contents from becoming shell syntax
+or tmux key names. The runner refuses to paste if the model has exited or if
+the session has no marker proving that a model is running.
 
-A delivery has two effects — paste, then one submitting Enter — and can tear
-between them, leaving pasted text sitting unsubmitted. When Enter fails,
-`send` retries it once immediately; if that also fails it stamps the session
-with a torn marker and reports loudly. From then on the pane refuses every
-further send — pasting more text at unsubmitted residue would mix two
-messages — until a human kills or submits the pane, or a send with `--force`
-delivers anyway (its Enter submits the residue along with the new message and
-clears the marker).
+The Codex CLI exits after one response. For a Codex run, `send`
+base64-encodes the text into a shell command. That command runs after the
+current model command exits and resumes the exact Codex session through a
+generated script in the handle's state directory.
+The script repeats the launch's model, effort, and sandbox settings because
+`codex exec resume` does not inherit them. A launcher-owned helper records
+the Codex session ID in the state directory. The runner accepts only a
+lowercase UUID and never guesses with `--last`.
 
-**`kill`** ends the session, under the same per-handle lock, and **verifies**
-it: the exit status of `tmux kill-session` is checked, and success is
-reported only once no session answers to the handle. Killing a handle
-nothing answers to is not an error — the caller kills to be sure — but it is
-a distinct message (`nothing to kill`), so "I ended it" and "there was
-nothing" read apart. The worktree and branch remain — they are the result.
+The largest accepted send file is 64 KiB. The encoded Codex command travels
+through tmux's argument list, which has a fixed size limit. Larger files are
+refused instead of risking truncation; send a path or another short pointer
+to the file instead.
 
-There is deliberately **no ensure/residency verb**: keeping an execution
-alive, rotating it, or restarting it on a schedule is the caller's policy,
-not the runner's.
+The Codex route carries text, not arbitrary bytes. Shell command substitution
+removes trailing newlines, and it cannot carry NUL bytes. Binary files and
+messages whose final newlines matter are outside this command's contract.
 
-Two auxiliary verbs ride along because they are about the same machine-local
-model accounts the tiers name:
+All sends for one handle use the same exclusive lock as `start` and `kill`.
+If another operation holds the lock, `send` exits with code 4 instead of
+waiting. This prevents two messages from interleaving in one pane.
 
-```text
+The runner does not wait for the model to acknowledge a message. If a process
+stops after submission but before the caller receives success, the caller
+cannot tell whether delivery happened. Retrying may deliver the message
+twice, so callers must make duplicate delivery harmless.
+
+An interactive send normally has two steps: paste the text, then send one
+Enter key to submit it. The pane records that the model exited before it
+starts the holding shell. After pasting and before pressing Enter, `send`
+checks that record again. If the model died in that interval, Enter could run
+the pasted text as a shell command. The runner clears the pasted text with
+`C-u`, reports the failure, and does not press Enter.
+
+The model can still exit in the few milliseconds between that final check and
+Enter. Removing that remaining risk would require the model to confirm
+receipt, and no supported model provides such a confirmation.
+
+#### If a send stops halfway
+
+Enter can fail after the text was pasted. The runner immediately retries
+Enter once. If the retry also fails, it records a **torn-send marker**, which
+means that unsubmitted text may remain in the pane, and returns an error that
+names the session.
+
+Later sends refuse that pane because adding another message could mix the two
+messages. A person can stop the session or inspect and submit the existing
+text. Alternatively, `send --force` pastes the new message despite the
+marker; when its Enter succeeds, that Enter submits any old text together
+with the new text and the runner clears the marker.
+
+### `kill`
+
+`kill` takes the handle's lock, runs `tmux kill-session`, and then checks that
+the session is gone. It reports success only after no session answers to the
+handle. If another process removed the session first, the final check still
+allows `kill` to succeed.
+
+Killing an already missing handle is not an error, but the output says
+`nothing to kill` so callers can distinguish it from a session that this
+command stopped. The worktree and branch remain because they contain the
+result.
+
+There is no command that keeps a run alive. Deciding when to restart or
+replace a run belongs to the caller.
+
+## Rate limits and token budgets
+
+Two more commands report machine-local information about the provider
+accounts used by the tiers:
+
+~~~text
 alder-ext-runner limit <provider> [--minutes <n>] [--clear] [--why <text>]
 alder-ext-runner budget [--hours <n>] [--json]
-```
+~~~
 
-`limit` records that a provider is rate-limited (the entry expires on its
-own); until then `start` serves that provider's rungs from the counterpart
-rung on the other ladder, and says so on stderr. The rate-limit file is
-updated under an exclusive lock and written via an atomic rename, so
-concurrent `limit` commands cannot drop each other's entries; a corrupt file
-**fails open** — complained about loudly, treated as empty, rewritten whole —
-because limits are hygiene, not authority. `budget` reads trailing-window
-token spend per provider off the transcripts the CLIs already write
-(`CODEX_HOME`, `CLAUDE_CONFIG_DIR` move where it looks).
+`limit` records that a provider is temporarily rate-limited. A tier's
+**counterpart** is the tier to use on the other provider during such a limit.
+Until the entry expires, `start` uses that counterpart and reports the
+substitution on standard error. If both providers are limited, it uses the
+requested tier and explains why.
 
-`ALDER_EXT_RUNNER_CMD` replaces the whole engine invocation, which is how the
-tests start a stub instead of a model; the prompt is still appended as the
-final argument and the tier is still what the session records. The value is
-**split on whitespace** — there is no shell quoting, so a path with spaces
-cannot be expressed — and a set-but-empty value is a hard error at start,
-never a silent fallback.
+The rate-limit file is protected by its own lock and replaced atomically, so
+simultaneous updates do not lose entries. If the file is corrupt, the runner
+prints an error, treats the file as empty, and replaces it on the next write.
+Rate limits affect convenience, not the truth of a run.
+
+`budget` reads recent token use for each provider from the transcript files
+that the model CLIs already write. `CODEX_HOME` and `CLAUDE_CONFIG_DIR`
+change where it looks.
+
+Setting `ALDER_EXT_RUNNER_CMD` replaces the complete model command. Tests use
+this to run a stub instead of a model. The runner still appends the prompt as
+the final argument and still records the served tier. The value is split on
+whitespace; shell quoting is not supported, so it cannot express a path with
+spaces. An empty or whitespace-only value is an error, not a request to use
+the default command.
 
 ## Tiers
 
-A tier pins a provider, a model, and a reasoning effort in one table, so
-"which model did this run on" is answered by the launch rather than by
-whatever the CLI's own default happened to be that week. An unknown tier is a
-hard error before anything exists, never a fall-through to a CLI default.
+Every tier names its provider, full model name, and reasoning effort. The
+runner passes all three explicitly. It never relies on a model CLI default,
+and an unknown tier fails before a worktree or session is created.
 
-The built-in table:
+The built-in tiers are:
 
-| rung | provider | model | effort | falls back to |
+| Tier | Provider | Model | Effort | Counterpart |
 | --- | --- | --- | --- | --- |
-| `luna` | codex | `gpt-5.6-luna` | high | `sonnet` |
-| `terra` | codex | `gpt-5.6-terra` | xhigh | `opus` |
-| `sol` | codex | `gpt-5.6-sol` | xhigh | `fable` |
-| `sonnet` | claude | `claude-sonnet-5` | high | `luna` |
-| `opus` | claude | `claude-opus-5` | xhigh | `terra` |
-| `fable` | claude | `claude-fable-5` | xhigh | `sol` |
+| `luna` | Codex | `gpt-5.6-luna` | high | `sonnet` |
+| `terra` | Codex | `gpt-5.6-terra` | xhigh | `opus` |
+| `sol` | Codex | `gpt-5.6-sol` | xhigh | `fable` |
+| `sonnet` | Claude | `claude-sonnet-5` | high | `luna` |
+| `opus` | Claude | `claude-opus-5` | xhigh | `terra` |
+| `fable` | Claude | `claude-fable-5` | xhigh | `sol` |
 
-Codex rungs run `codex exec` with `approval_policy=never`,
-`sandbox_mode=workspace-write`, network access on, and one extra writable
-root: the launching repository's `.git`. That last one is not optional. An
-execution lives in a *linked* worktree, whose index, objects and branch ref
-all live in the repository's `.git`, outside the sandbox's workspace;
-without it the first commit dies on `index.lock`. It does not make the
-repository's working tree writable, which is the part that matters. Claude
-rungs run the interactive `claude` CLI with the model and effort pinned.
+Codex tiers run `codex exec` with approval policy `never`, network access
+enabled, and either the `workspace-write` or `full-access` sandbox described
+below. The built-in tiers use `workspace-write`. That sandbox can write the
+run's worktree and the launching repository's `.git` directory. A linked
+worktree keeps its index, objects, and branch ref inside that `.git`
+directory, so the model could not commit without this extra writable path.
+The repository's main working tree does not become writable.
 
-A config rung can loosen this with a `sandbox` setting — see below. The
-built-in rungs all keep the workspace sandbox.
+Claude tiers run the interactive `claude` CLI with the model and effort
+specified.
 
 ## Configuration
 
-Machine-local, because which models exist and what they cost are properties
-of the box, not of any repository:
+Tier configuration is machine-local because available models and account
+costs depend on the machine:
 
-- config file: `$ALDER_EXT_RUNNER_CONFIG`, or
-  `~/.config/alder-ext-runner/config.json`. Missing file = the built-in
-  table.
-- state: `$ALDER_EXT_RUNNER_STATE_DIR`, or `~/.local/state/alder-ext-runner/`
-  — the rate-limit file, the per-handle locks, and one `<handle>/` directory
-  per execution holding the codex resume script, the `codex-session` marker,
-  and the session watcher's log.
+- The config file is `$ALDER_EXT_RUNNER_CONFIG`, or
+  `~/.config/alder-ext-runner/config.json` by default. If it is missing, the
+  built-in tiers are used.
+- State lives at `$ALDER_EXT_RUNNER_STATE_DIR`, or
+  `~/.local/state/alder-ext-runner/` by default. It contains the rate-limit
+  file, per-handle locks, and one directory per handle with the Codex resume
+  script, session ID, and watcher log.
 
-The config file's whole format is the tier table, which **replaces** the
-built-in one when present:
+When a config file exists, its `tiers` table replaces the built-in table:
 
-```json
+~~~json
 {
   "tiers": {
     "luna": {
@@ -226,106 +272,87 @@ built-in one when present:
     }
   }
 }
-```
+~~~
 
-`provider` is `codex` or `claude`. Every `counterpart` must exist, sit on the
-other provider's ladder, and pair back; the loader refuses anything else. The
-engine command per provider — how `codex exec` and `claude` are invoked — is
-code, not configuration: it is the part of a launch that has to stay in step
-with the generated resume script, and both are produced from one table on
-purpose.
+`provider` must be `codex` or `claude`. Every `counterpart` must name an
+existing tier on the other provider, and the two tiers must name each other.
+The runner rejects any other arrangement.
 
-A codex rung may also set `"sandbox"`. It takes one of two values:
+The commands used to start Codex and Claude are part of the program, not the
+config file. A Codex start command and its generated resume script must change
+together, so both come from the same code.
 
-- `"workspace-write"` — the default when the field is absent. The execution
-  can write its own worktree and the repository's `.git`, and nothing else.
-  This is the right setting for worker rungs, and it is what every rung did
-  before the field existed.
-- `"full-access"` — no sandbox. The execution can write anywhere the
-  operator's own account can, and can start any program. Approval policy is
-  still `never`, so nothing will ask first.
+A Codex tier may set `"sandbox"`:
 
-`full-access` exists for the executor rung: the session that drives the
-loop. The executor has to write the shared Alder log through the primary
-checkout and launch nested tools such as a cross-review, and both of those
-fail inside a workspace sandbox. Workers need neither, so do not give
-`full-access` to a worker rung. The trust model implication, plainly: a
-full-access rung means the model on that rung can do anything you can do on
-this machine, so give it only to a rung you would let sit at your own
-keyboard. The generated `resume` script repeats the same sandbox setting as
-the launch, so a full-access session resumes with full access.
+- `"workspace-write"` is the default when the field is absent. The run can
+  write its worktree and the repository's `.git` directory, but not other
+  paths. Worker tiers should use this setting.
+- `"full-access"` disables the filesystem sandbox. The run can write anywhere
+  the operator's account can write and can start any program. The approval
+  policy remains `never`, so the CLI will not ask first.
 
-A claude rung cannot set `sandbox` — claude executions are governed by the
-`claude` CLI's own permission mode, not by codex sandboxing — and the loader
-refuses a config that tries, rather than ignoring a setting that would then
-read as granted.
+`full-access` is intended for an executor that must append to the shared Alder
+log through the main checkout and start other tools such as a review run.
+Workers do not need those permissions. Configure a full-access tier only for
+a model you would allow to use your account directly. The generated resume
+script repeats the sandbox setting, so a full-access run resumes with the same
+access.
 
-## Trust model
+Claude tiers cannot set `sandbox` because the Claude CLI controls its own
+permissions. The config loader reports this as an error instead of ignoring
+the setting.
 
-The runner trusts its host user. Session environment variables and the tmux
-server are same-user surfaces: any process running as the operator can
-rewrite the markers the runner stamps, take its locks, or type at its panes.
-The runner's defenses — provider stamps, engine markers, torn markers,
-per-handle locks, the paste-then-re-check ordering — are aimed at
-**staleness and accidents**: crashed starts, dead engines, concurrent
-invocations of the runner itself, config drift. They are not, and cannot be,
-a defense against a hostile local user, and nothing here pretends otherwise.
+## What the runner trusts
 
-What the runner does *not* trust is the worktree. The worktree is written by
-the execution — a model, running whatever the prompt made of it — so
-everything the runner later trusts or executes (the codex resume script, the
-`codex-session` marker) lives in the runner-owned per-handle state directory
-instead, and the runner never executes anything from a worktree. The session
-carries only the handle name; everything trusted is resolved from the state
-directory by that name.
+The runner trusts every process running as the same operating-system user.
+Such a process can change tmux session variables, modify runner state files,
+take runner locks, or type into panes. The provider and model markers, locks,
+and send checks protect against crashes, stale state, configuration changes,
+and simultaneous runner commands. They do not protect against a hostile local
+process running under the operator's account.
 
-The codex delivery route is a **text contract**: the message is armored
-through `base64` into a shell command substitution, which strips trailing
-newlines and cannot carry NUL bytes. A message is text; binary payloads and
-trailing-newline-significant content are outside the contract, and the 64 KiB
-ceiling above bounds the armored command's size.
+The runner does not trust the model's worktree. A model can write any file
+there. Files that the runner later reads as trusted state or executes, such
+as the Codex resume script and session ID, therefore live in the runner's
+state directory. The runner never executes a file from the worktree. A tmux
+session stores only the handle; the runner uses that handle to find its own
+state directory.
 
-## What the runner is not
+## Project boundary
 
-The runner knows nothing about any caller's domain. It was extracted from a
-daemon that had welded execution to one project's workflow, and the
-extraction is only worth having if the boundary holds:
+The runner does not know about Alder work items, attempts, logs, or prompts.
+It only starts model commands and manages them by handle.
 
-- it depends on **no other crate in this workspace**, and nothing in this
-  workspace depends on it — `tests/boundary.rs` asserts both directions
-  against `cargo metadata` for *every* workspace member (after proving each
-  expected package is actually present, so a rename cannot silently drop it
-  from coverage) and sweeps every file in this crate for alder's log ref
-  namespaces, loudly;
-- it stamps only its own names into sessions (`ALDER_EXT_RUNNER_HANDLE`,
-  `ALDER_EXT_RUNNER_ENGINE`, `ALDER_EXT_RUNNER_TIER`,
-  `ALDER_EXT_RUNNER_PROVIDER`, `ALDER_EXT_RUNNER_WORKTREE`) and writes
-  nothing at all into a worktree — its own machinery lives in its state
-  directory;
-- it composes no prompts, records no attempts, and never decides whether a
-  result is good.
+- The crate depends on no other crate in this workspace, and no workspace
+  crate depends on it. `tests/boundary.rs` checks both directions with
+  `cargo metadata`. It also checks every file in this crate for Alder log ref
+  names.
+- The runner writes only its own environment variable names into tmux:
+  `ALDER_EXT_RUNNER_HANDLE`, `ALDER_EXT_RUNNER_ENGINE`,
+  `ALDER_EXT_RUNNER_TIER`, `ALDER_EXT_RUNNER_PROVIDER`, and
+  `ALDER_EXT_RUNNER_WORKTREE`. It writes no runner state into the worktree.
+- It does not build prompts, record attempts, or decide whether a run's result
+  is acceptable.
 
-Because nothing reaches into it and it reaches into nothing, this crate is
-**trivially movable to its own repository**: copy the directory, and
-everything except the boundary test's counterpart list still passes. That
-test then fails loudly — deliberately, rather than passing vacuously — and
-deleting the workspace counterpart list along with the workspace is the one
-conscious edit the move requires. Its tmux sandbox teardown is a crate-local
-copy (`scripts/tmux-sandbox.sh`) for exactly that reason.
+The crate can be moved to its own repository by copying its directory. After
+such a move, the boundary test intentionally fails until its list of Alder
+workspace crates is removed. The crate keeps its own tmux cleanup helper at
+`scripts/tmux-sandbox.sh` for the same reason.
 
 ## Testing
 
-The ordering rules — sweep, verify, cut, launch; refusal of a live engine;
-convergence after a crash at every effect — are unit tested in `src/start.rs`
-against a fake host. `tests/send_stub.rs` holds `send` to the old relay
-craft's claims against a stub tmux that records its argv. The parts only the
-world can answer run in `tests/start_host.rs` against a real git repository
-and a real tmux server that is nobody else's: a `tmux` shim first on PATH
-aims every call at a private socket (`$TMUX` unset — `TMUX_TMPDIR` alone
-isolates nothing inside a tmux pane), and teardown kills one session, by
-exact name, only after proving the sandbox server holds nothing else.
+Unit tests in `src/start.rs` check the required order: remove an unregistered
+leftover directory, verify or create the worktree, then start the model. They
+also cover live-model refusal and recovery after an interruption at every
+external step.
 
-`scripts/verify-start.sh` runs the same ground end to end against the built
-binary: an unknown tier refused before anything exists, the prompt as one
-argv element, `status` walking running → done → dead, and the real tmux
-server provably untouched.
+`tests/send_stub.rs` checks `send` against a tmux stub that records its
+arguments. `tests/start_host.rs` uses a real Git repository and a private tmux
+server. A shim unsets `TMUX` and directs every tmux command to a private
+socket; cleanup stops one named session only after confirming that no other
+session uses that socket.
+
+`scripts/verify-start.sh` runs an end-to-end check against the built binary.
+It verifies that an unknown tier fails before creating anything, the complete
+prompt arrives as one argument, `status` moves from `running` to `done` to
+`dead`, and the user's normal tmux server remains untouched.

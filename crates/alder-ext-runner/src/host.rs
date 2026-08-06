@@ -1,10 +1,8 @@
-//! Everything the runner does to the world, behind one thin trait.
+//! Operating-system operations used by the runner.
 //!
-//! The runner holds no git library and no tmux library. It cuts worktrees by
-//! running `git`, and it drives sessions by running `tmux`. The trait exists
-//! for the same reason the start logic is pure over it: the ordering rules in
-//! [`crate::start`] are the interesting part, and they are worth testing
-//! without a tmux server, a git checkout, or a model.
+//! The runner uses the `git` and `tmux` commands instead of linking Git or
+//! tmux libraries. The [`Host`] trait lets [`crate::start`] test the order of
+//! those operations without a real repository, tmux server, or model.
 
 use std::{
     os::unix::fs::PermissionsExt,
@@ -19,39 +17,37 @@ use crate::{
     },
 };
 
-/// What the engine marker on a session proves. A missing or unrecognized
-/// marker proves nothing, and nothing is the fail-safe reading on both sides:
-/// an unproven engine is never pasted at (it cannot prove anything is
-/// listening) and its pane is never replaced (it cannot prove its work is
-/// done).
+/// What the model-state marker in a session says. A missing or unrecognized
+/// marker gives the runner no safe answer: it will not paste into the pane
+/// because no model is known to be listening, and it will not replace the pane
+/// because the model is not known to be finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EngineMarker {
-    /// The session is stamped `running`: an engine is provably going.
+    /// The session records `running`: the model is known to be running.
     Running,
-    /// The session is stamped `exited`: the engine provably finished and its
-    /// holding shell remains.
+    /// The session records `exited`: the model finished and its holding shell
+    /// remains.
     Exited,
-    /// No marker, or a marker this runner never stamps: a session of unknown
-    /// provenance, live for no purpose.
+    /// No marker, or an unrecognized value. The runner cannot safely decide
+    /// whether the model is running.
     #[default]
     Unproven,
 }
 
-/// The identity and engine state observable on an existing tmux session, read
-/// back from the environment the runner stamped at creation.
+/// Identity and model state read from the environment recorded in a tmux
+/// session when it was created.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ObservedSession {
     pub handle: Option<String>,
     pub tier: Option<String>,
-    /// The provider `start` resolved and stamped. `send` routes delivery by
-    /// this stamp alone, so reclassifying a tier in the config after a start
-    /// can never change a live session's protocol.
+    /// The provider selected by `start`. `send` uses this value so a later
+    /// tier configuration change cannot change how the session receives input.
     pub provider: Option<String>,
     pub worktree: Option<PathBuf>,
     pub engine: EngineMarker,
 }
 
-/// What a shell-out did, once it ran at all.
+/// Output from one completed external command.
 #[derive(Debug, Clone)]
 pub struct Run {
     pub ok: bool,
@@ -59,29 +55,27 @@ pub struct Run {
     pub stderr: String,
 }
 
-/// An exclusive per-handle lock, released when dropped. `start`, `send`, and
-/// `kill` all take it, so two concurrent operations on one handle serialize
-/// instead of racing each other's worktree, session, and pane-input effects.
+/// An exclusive lock for one handle, released when dropped. `start`, `send`,
+/// and `kill` all take it so that two commands cannot change the same
+/// worktree, session, or pane input at the same time.
 #[derive(Debug)]
 pub struct StartLock {
     _file: Option<std::fs::File>,
 }
 
 impl StartLock {
-    /// A lock that guards nothing, for hosts that are not the real world.
+    /// A lock that guards nothing, for tests that use a fake host.
     #[cfg(test)]
     pub(crate) fn unlocked_for_tests() -> Self {
         Self { _file: None }
     }
 }
 
-/// Take an exclusive advisory lock on `path`, refusing immediately if another
-/// process (or another handle to the same file) already holds it. Refusing is
-/// the point, for every verb: the loser of a double start must not stand in
-/// line behind the winner and then re-run the same prompt, and the loser of a
-/// double send must not queue behind the winner and interleave a second
-/// paste/Enter into the same pane — it reports the contention and the caller
-/// retries once the winner is done.
+/// Try to take an exclusive advisory lock on `path` and return immediately if
+/// another process already holds it. Waiting would let a second `start` run
+/// the same prompt after the first one, or let a second `send` add another
+/// paste and Enter to the same pane. The caller can decide whether to retry
+/// after the lock holder finishes.
 pub(crate) fn acquire_start_lock(path: &Path, handle: &str) -> Result<StartLock> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
@@ -109,17 +103,16 @@ pub(crate) fn acquire_start_lock(path: &Path, handle: &str) -> Result<StartLock>
     }
 }
 
-/// Everything a start does to the world.
+/// External operations needed by `start`.
 pub trait RunnerHost {
-    /// The repository executions are launched from.
+    /// The repository where runs are started.
     fn repo(&self) -> &Path;
-    /// Take the exclusive per-handle lock, held (by the caller keeping the
-    /// returned guard alive) across a whole `start`, `send`, or `kill`.
+    /// Take the exclusive lock for a handle. The caller keeps the returned
+    /// guard alive until `start`, `send`, or `kill` finishes.
     fn lock_handle(&self, handle: &str) -> Result<StartLock>;
-    /// The runner-owned machine-local directory for one handle's state. Never
-    /// inside the worktree: the worktree is worker-writable, and nothing the
-    /// runner later trusts or executes may live where the worker can rewrite
-    /// it.
+    /// Return the runner-owned state directory for one handle. It must remain
+    /// outside the model-writable worktree because the runner later trusts or
+    /// executes files from this directory.
     fn handle_state_dir(&self, handle: &str) -> PathBuf;
     /// Run `git <args>` in the repository. An error means git could not be
     /// run at all; a git command that ran and failed comes back as `Run`.
@@ -134,24 +127,22 @@ pub trait RunnerHost {
     ) -> Result<()>;
     fn tmux_kill_session(&self, session: &str) -> Result<()>;
     fn path_exists(&self, path: &Path) -> bool;
-    /// Resolve a path before comparing it with Git's canonical worktree
-    /// registry entries.
+    /// Resolve a path before comparing it with paths reported by Git.
     fn canonical_path(&self, path: &Path) -> Result<PathBuf>;
-    /// Remove one unregistered worktree residue. Implementations must remove
-    /// a symlink itself rather than following it.
+    /// Remove one unregistered worktree path. If it is a symlink, remove the
+    /// link itself instead of following it.
     fn remove_path(&self, path: &Path) -> Result<()>;
     fn create_dir_all(&self, path: &Path) -> Result<()>;
     fn write_executable(&self, path: &Path, body: &str) -> Result<()>;
     /// Whether `path` is itself a symlink (never following it). Absent paths
     /// answer `false`.
     fn is_symlink(&self, path: &Path) -> bool;
-    /// Copy one local file, used by `--seed` to provision a worktree before
-    /// its engine starts.
+    /// Copy one local file into a worktree before its model starts.
     fn copy_file(&self, source: &Path, destination: &Path) -> Result<()>;
     fn log(&self, message: &str);
 }
 
-/// The real world: a working directory, git, and tmux.
+/// The implementation that runs Git and tmux from a working directory.
 pub struct Host {
     repo: PathBuf,
 }
@@ -233,8 +224,8 @@ impl Host {
         let _ = self.run("tmux", &["delete-buffer", "-b", buffer]);
     }
 
-    /// Stamp one variable into a session's environment after creation. Used
-    /// for the torn-send marker only; identity is stamped at `new-session`.
+    /// Record one variable in a session after creation. Only the incomplete
+    /// send marker uses this method; identity is recorded by `new-session`.
     pub fn tmux_set_session_environment(
         &self,
         session: &str,
@@ -269,10 +260,9 @@ impl Host {
     }
 }
 
-/// This block and the inherent one above are the host code a start reaches,
-/// and neither may wait for an engine to come up. `start`'s tests read both
-/// for the words that can only mean waiting; a bounded timeout on a command
-/// that can hang is still allowed, spelled with a `Duration`.
+/// Neither this implementation nor the methods above may wait for a model to
+/// become ready. `start` tests both blocks for code that could wait. A
+/// `Duration` used to limit an external command is still allowed.
 impl RunnerHost for Host {
     fn repo(&self) -> &Path {
         &self.repo
@@ -436,11 +426,11 @@ impl RunnerHost for Host {
     }
 }
 
-/// Remove a worktree residue after inspecting its file kind.
+/// Remove an unregistered worktree path after checking its file type.
 ///
-/// The path can disappear in either filesystem call: another repair may win
-/// that race, which is already the desired state. Keeping those two operations
-/// injectable makes both convergence cases deterministic to test.
+/// The path can disappear during either filesystem call if another process
+/// removes it first. That is already the desired result. Keeping the two
+/// operations replaceable in tests makes both cases deterministic.
 fn remove_residue(
     path: &Path,
     inspect: impl FnOnce() -> std::io::Result<bool>,

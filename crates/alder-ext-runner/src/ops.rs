@@ -1,9 +1,8 @@
-//! The handle verbs: `status`, `send`, `kill`.
+//! Check, message, or stop a run by its handle.
 //!
-//! A handle is the tmux session name `start` printed, and everything these
-//! verbs know about the execution they name is read back from the session's
-//! own environment — the tier, the worktree, and whether the engine is still
-//! running. Nothing here consults any other system.
+//! A handle is the tmux session name printed by `start`. These operations read
+//! the tier, worktree, and model state from the environment that the runner
+//! recorded in that session. They do not look up the run anywhere else.
 
 use std::path::Path;
 
@@ -14,10 +13,9 @@ use crate::{
     tier::Provider,
 };
 
-/// The largest file `send` will deliver. The armored codex route places the
-/// whole payload in tmux argv, which has a hard ceiling; past this size the
-/// delivery mechanics stop being trustworthy, so the runner refuses loudly
-/// instead of truncating quietly.
+/// The largest file `send` will deliver. A Codex send puts the base64-encoded
+/// text in tmux's argument list, which has a fixed size limit. The runner
+/// refuses larger files instead of risking truncation.
 pub const MAX_SEND_BYTES: u64 = 64 * 1024;
 
 /// What `status <handle>` prints: one word, plus an optional detail line.
@@ -30,13 +28,11 @@ pub struct Status {
 
 /// One word about one handle.
 ///
-/// `dead` means no session answers to the handle. `done` is venue-specific
-/// best effort: for tmux it means the engine process exited and its holding
-/// shell remains — it says nothing about whether the run succeeded, only that
-/// nothing is still running. The result, either way, is whatever the branch
-/// holds. A session that exists but carries no engine marker is reported
-/// `running`, because a session of unknown provenance must never be presumed
-/// finished.
+/// `dead` means no session answers to the handle. For tmux, `done` means the
+/// model process exited and its holding shell remains. It says nothing about
+/// whether the run succeeded; the branch contains the result. A session with
+/// no model-state marker is reported as `running` because the runner cannot
+/// safely assume that an unfamiliar session is finished.
 pub fn status(host: &Host, handle: &str) -> Result<Status> {
     use crate::host::RunnerHost;
     let Some(observed) = host.tmux_session(handle)? else {
@@ -74,13 +70,12 @@ pub enum Killed {
     AlreadyDead,
 }
 
-/// End one execution, under the per-handle lock, and verify it ended.
+/// Stop one run while holding its lock, then verify that it stopped.
 ///
-/// The verification is the authority: `kill` reports success only once no
-/// session answers to the handle. The tmux exit status is consulted when the
-/// session persists, to say why; a kill whose command failed but whose
-/// session is nonetheless gone (someone else got there first) is converged
-/// and reported as such.
+/// `kill` reports success only after checking that no session answers to the
+/// handle. If the session remains, the tmux exit status explains the failure.
+/// If the tmux command fails but another process has already removed the
+/// session, the final check still reports success.
 pub fn kill(host: &Host, handle: &str) -> Result<Killed> {
     use crate::host::RunnerHost;
     let _lock = host.lock_handle(handle)?;
@@ -99,39 +94,34 @@ pub fn kill(host: &Host, handle: &str) -> Result<Killed> {
     Ok(Killed::Killed)
 }
 
-/// Deliver a local file's contents as input to the running execution.
+/// Deliver a local file's contents as input to the run.
 ///
-/// This is the old relay craft, internal to the runner: for an interactive
-/// engine (claude) the file is loaded into a tmux buffer and pasted, so no
-/// byte of it can become shell syntax or a key name; for a one-shot engine
-/// (codex) the bytes are base64-armored into a command that resumes the
-/// recorded codex session through the generated resume script, since a
-/// one-shot engine has no prompt to paste at. In neither route does the
-/// runner inspect the pane or synchronize on the execution's progress:
-/// delivery is at-least-once and reports exactly one accepted send.
+/// For an interactive Claude run, the file is loaded into a tmux buffer and
+/// pasted as text, so its bytes cannot become shell syntax or tmux key names.
+/// For a one-shot Codex run, the text is base64-encoded into a command that
+/// uses the generated resume script to resume the recorded session. The
+/// runner does not inspect the pane or wait for the model to acknowledge the
+/// message. It reports one accepted send after submitting the message.
 ///
-/// **The torn-send contract.** A delivery has two effects — paste, then one
-/// submitting Enter — and can tear between them, leaving pasted text sitting
-/// unsubmitted in the pane. When Enter fails, `send` retries it once
-/// immediately; if that also fails it stamps the session with a torn marker
-/// and reports loudly that unsubmitted text sits in the pane. Every later
-/// `send` sees the marker and refuses — the pane is dirty, and pasting more
-/// text at it would corrupt whatever a human or the engine makes of the
-/// residue — until someone resolves it: kill or submit the pane by hand, or
-/// pass `force`, which delivers anyway and clears the marker once its own
-/// Enter lands.
+/// A send can stop between pasting the text and pressing Enter, leaving
+/// unsubmitted text in the pane. If Enter fails, `send` retries it once. If
+/// the retry fails, it records a torn-send marker and reports the incomplete
+/// send. Later sends refuse the pane because another paste could mix two
+/// messages. A person can stop the pane or submit its text, or pass `force`
+/// to send anyway. A forced send clears the marker after its own Enter
+/// succeeds.
 ///
-/// **Routing is by the start's stamp.** The provider was resolved at start
-/// and stamped into the session; `send` reads it back and never consults the
-/// current tier table, so reclassifying a tier in the config cannot change a
-/// live session's delivery protocol.
+/// `start` records the selected provider in the session. `send` uses that
+/// value instead of the current tier table, so a later configuration change
+/// cannot change how a live session receives messages.
 ///
-/// **Exit codes are the contract.** 0 is one accepted delivery. 4 means
+/// Exit code 0 means one accepted delivery. Code 4 means
 /// another operation holds the handle's lock — the caller should treat the
 /// message as already served by the lock winner, never kill the session over
-/// it. 5 means the execution cannot receive this delivery — nothing answers
-/// to the handle, the engine exited, the pane is torn, or the codex session
-/// cannot be resumed — and the caller may rotate. Everything else is 1.
+/// it. Code 5 means the run cannot receive this delivery — nothing answers to
+/// the handle, the model exited, an earlier send was incomplete, or the Codex
+/// session cannot be resumed — and the caller may replace the run. Every
+/// other failure uses code 1.
 pub fn send(host: &Host, handle: &str, file: &Path, force: bool) -> Result<()> {
     use crate::host::RunnerHost;
     if !file.is_file() {
@@ -336,10 +326,9 @@ pub fn send(host: &Host, handle: &str, file: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Whether `id` is a lowercase UUID — the exact shape the codex session
-/// stamp sidecar records. Not "looks safe enough": the producer's contract
-/// is the validator, so an option-like string, uppercase hex, or any other
-/// almost-ID is refused whole.
+/// Return true only for the lowercase UUID format written by the Codex
+/// session-ID helper. Options, uppercase hexadecimal digits, and other
+/// near-matches are rejected.
 fn is_codex_session_id(id: &str) -> bool {
     let bytes = id.as_bytes();
     if bytes.len() != 36 {
