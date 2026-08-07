@@ -360,6 +360,25 @@ state; input-log cursor; canonical hash. Dirty tracking via
 different injected future (B is record-capable, so branching works on
 macOS).
 
+#### What this demands of the system under test
+
+Stated plainly, because it is the tier's real product constraint: unlike
+the hardware-clock backends — which need only the owned kernel and can run
+arbitrary userspace binaries under it — this tier requires **every
+executable component** of the guest (kernel, libc, every binary and
+library) to be produced by the instrumenting toolchain, or to pass the
+same post-link verifier. Three boundaries soften it: data is untouched
+(files, databases, network inputs, configuration — no rebuild);
+interpreted and bytecode programs are data once their runtime is
+instrumented and JIT-less (an instrumented CPython runs uninstrumented
+Python scripts; same for shells); and inputs to the workload are always
+free. What cannot run on this tier initially is binary-only software with
+no rebuild path — its routes are the E1 emulation tier today, an
+instrumented in-guest emulator, or a future load-time binary rewriter
+sitting behind the same verifier. Note the regime was already
+image-bound: films bind to an exact image hash on every backend; the new
+demand is that this image be *ours to build*, not merely ours to hash.
+
 #### Posture, tier, risks, fragility
 
 Entitlement only; no root/SIP. Tier: research path until M-01 measures
