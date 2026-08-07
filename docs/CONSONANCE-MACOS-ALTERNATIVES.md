@@ -381,6 +381,17 @@ demand is that this image be *ours to build*, not merely ours to hash.
 
 #### Posture, tier, risks, fragility
 
+Hardware floor: **any Apple-silicon generation, M1 up** — B runs the
+guest at plain EL1 and uses no nested-virtualization feature. The
+M3+/macOS 15 requirement belonged to the dead virtual-EL2 program and
+survives only in closed or optional paths (D; the vEL2-accelerated
+stepping variant of C; a hypothetical future nested PMU). The API surface
+B uses dates to macOS 11.0; the practical OS floor is whichever releases
+the determinism gate is qualified on (the macOS 26 PMU-trap knob is
+optional hardening, not a dependency). Films stay platform-fingerprint-
+bound; cross-chip replay is plausible precisely because the guest never
+consults host identity, but remains refused until demonstrated.
+
 Entitlement only; no root/SIP. Tier: research path until M-01 measures
 the **full instrumented Linux image** (hand loops over-represent
 instrumentation); envelope 1.2–5×, demote-don't-relax. Risks: hvf-side
